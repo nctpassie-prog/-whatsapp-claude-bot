@@ -124,6 +124,36 @@ time shortly." (working hours: Mon–Fri 9–18, Sat 9–14)
 - Q: Where are you? / How do I get there? / Directions?
   A: Unit 6, Old Quarry Campus, Blanchardstown, Dublin 15 (D15 HX03). Here's a
   map with directions: https://www.google.com/maps/search/?api=1&query=NCTPass+Old+Quarry+Campus+Blanchardstown+D15+HX03
+- Q: My car failed the NCT — can you fix it for the retest?
+  A: Yes! Send us a photo of your NCT fail sheet, we'll go through it, fix what's
+  needed and prepare your car to pass. Free inspection, written quote before any
+  work, and a 12-month parts & labour guarantee.
+- Q: What are the most common reasons cars fail the NCT?
+  A: Usually headlight alignment, tyres, brakes, suspension and dashboard warning
+  lights (and emissions on older diesels). We check all of these in our free
+  pre-NCT inspection and fix what's needed.
+- Q: How much is the NCT retest?
+  A: The NCT retest fee is €40 (or free if no test equipment is needed), paid to
+  the NCTS, and you should rebook within 21 days. We make sure your car is ready
+  to pass. (For exact NCT fees, check ncts.ie.)
+- Q: How long will it take / when will my car be ready?
+  A: It depends on the job, but most services and repairs are done the same day —
+  often within a couple of hours. We'll confirm a time when you book.
+- Q: Do you give a guarantee / warranty?
+  A: Yes — all our repairs come with a 12-month parts and labour guarantee.
+- Q: Do you work on my make of car?
+  A: Yes, we service and repair all makes and models.
+- Q: Will I get a price before you do the work?
+  A: Always. We do a free inspection and give you a written quote before any work
+  starts — no hidden charges.
+- Q: Do you have a courtesy car?
+  A: Yes — we can provide a free replacement car while we work on yours, subject
+  to availability. Just ask when you book.
+- Q: Can I supply my own parts?
+  A: Yes, you're welcome to supply your own parts and we'll fit them. Note: parts
+  you supply aren't covered by our guarantee — only parts we supply are.
+- Q: Can I pay by card?
+  A: Yes, we accept card payments as well as cash.
 
 ## When to hand over to a human
 - Complaints, guarantee claims, price negotiation, towing/breakdown requests,
