@@ -27,8 +27,10 @@ import re
 import sqlite3
 import time
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Query, Request, Response
@@ -53,12 +55,24 @@ GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 BASE_DIR = Path(__file__).parent
 
+def now_local() -> datetime:
+    """Current time in Ireland, falling back to server time if tz data is missing."""
+    try:
+        return datetime.now(ZoneInfo("Europe/Dublin"))
+    except Exception:
+        return datetime.now()
+
 # ---------------------------------------------------------------- knowledge base
 def load_system_prompt() -> str:
     kb_file = BASE_DIR / "business_info.md"
     kb = kb_file.read_text(encoding="utf-8") if kb_file.exists() else ""
+    today = now_local().strftime("%A, %d %B %Y")
     return f"""You are a friendly, professional customer-support assistant answering \
 WhatsApp messages on behalf of the business described below.
+
+Today's date is {today} (Ireland). Use it to understand any day/time the customer \
+mentions (for example, work out the real calendar date they mean by "Thursday" or \
+"tomorrow").
 
 RULES:
 - Always answer in the same language the customer writes in.
@@ -77,10 +91,13 @@ When you have collected ALL of these details for a booking — customer name, ph
 number, car make/model/year, car registration, what they need, and preferred day/time \
 — give your normal confirmation reply, then add ONE final line, on its own line at the \
 very very end, in EXACTLY this format:
-<<<BOOKING|name=NAME|phone=PHONE|car=MAKE MODEL YEAR|reg=REGISTRATION|need=WHAT THEY NEED|time=PREFERRED DAY AND TIME>>>
-Only output this line once, only when every field above is known, and put nothing after \
-it. If any field is still missing, do NOT output the line — ask for the missing detail \
-instead. The customer must never see or hear about this line.
+<<<BOOKING|name=NAME|phone=PHONE|car=MAKE MODEL YEAR|reg=REGISTRATION|need=WHAT THEY NEED|time=PREFERRED DAY AND TIME|date=YYYY-MM-DD>>>
+For the date field, work out the actual calendar date the customer means from their \
+preferred day/time and today's date, and write it as YYYY-MM-DD. If they were vague and \
+you truly cannot tell the date, use date=unknown. Only output this line once, only when \
+every field above is known, and put nothing after it. If any field is still missing, do \
+NOT output the line — ask for the missing detail instead. The customer must never see or \
+hear about this line.
 
 BUSINESS INFORMATION:
 {kb}
@@ -164,7 +181,44 @@ def db() -> sqlite3.Connection:
     )
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bookings ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " name TEXT, phone TEXT, car TEXT, reg TEXT, need TEXT,"
+        " time_text TEXT, date TEXT, created_ts REAL)"
+    )
     return conn
+
+def save_booking(fields: dict) -> None:
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, created_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fields.get("name", ""), fields.get("phone", ""), fields.get("car", ""),
+                fields.get("reg", ""), fields.get("need", ""), fields.get("time", ""),
+                fields.get("date", ""), time.time(),
+            ),
+        )
+
+def bookings_for(day: str) -> str:
+    """day = 'today' or 'tomorrow'. Returns a formatted list for the owner."""
+    target = now_local().date() + (timedelta(days=1) if day == "tomorrow" else timedelta())
+    target_iso = target.isoformat()
+    pretty = target.strftime("%a %d %b")
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT car, reg, need, time_text, name, phone FROM bookings"
+            " WHERE date = ? ORDER BY id",
+            (target_iso,),
+        ).fetchall()
+    if not rows:
+        return f"No bookings on record for {day} ({pretty})."
+    lines = [f"\U0001F4CB Bookings for {day} ({pretty}) — {len(rows)}:", ""]
+    for i, (car, reg, need, tt, name, phone) in enumerate(rows, 1):
+        lines.append(f"{i}. {car} ({reg}) — {need}")
+        lines.append(f"   {tt} · {name} {phone}")
+    return "\n".join(lines)
 
 def already_seen(msg_id: str) -> bool:
     with closing(db()) as conn, conn:
@@ -242,6 +296,10 @@ def _finish_reply(user: str, answer: str) -> str:
     """Strip any hidden booking marker, notify the owner, store and return the reply."""
     answer, booking = process_booking(answer)
     if booking:
+        try:
+            save_booking(booking)
+        except Exception:
+            log.exception("Failed to save booking")
         try:
             notify_owner_booking(booking)
         except Exception:
@@ -345,6 +403,10 @@ def handle_message(sender: str, text: str) -> None:
         log.info("Sender %s is on the blocklist; not replying", sender)
         return
     lowered = text.strip().lower()
+    # Owner-only commands: "today" / "tomorrow" list that day's bookings.
+    if OWNER_WHATSAPP and sender == OWNER_WHATSAPP and lowered.lstrip("#/ ") in ("today", "tomorrow"):
+        send_whatsapp(sender, bookings_for(lowered.lstrip("#/ ")))
+        return
     if lowered == PAUSE_KEYWORD:
         set_paused(sender, True)
         return
