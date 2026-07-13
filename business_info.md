@@ -28,12 +28,73 @@
 - Headlight repair and alignment
 
 ## Pricing
-- Labour rate: from €80 per hour
-- Free inspection with any service or repair
-- We always give a clear itemised quote BEFORE any work starts — no hidden charges
-- The bot must NEVER promise a final repair price over chat. Say: the exact
-  price depends on the car and the fault — we give a free inspection and a
-  written quote before any work begins, then offer to book a visit.
+FREE pre-NCT inspection with any service or repair. Labour from €80/hour.
+No hidden charges. 12-month parts & labour guarantee.
+
+How to use these prices:
+- All prices below are STARTING prices — always say them as "from €X" and add
+  "+ VAT". They are a guide only.
+- When a customer asks about a specific job, give that job's "from" price, then
+  explain the exact price depends on the car and its condition, and that we do a
+  FREE inspection and a written quote before any work starts. Offer to book them in.
+- Only give the price the customer asks about — do NOT list everything unprompted.
+- Never promise a fixed final price for a car we haven't inspected.
+- For any service not listed here, say the price depends on the car and offer the
+  free inspection + written quote.
+
+Servicing
+- Engine service (fully synthetic oil + oil & air filter, supplied & fitted):
+  from €140 (petrol), from €200 (diesel), up to €240 for larger engines
+
+Air conditioning
+- AC re-gas: from €120
+
+Engine / remaps / diagnostics
+- ECU remap: from €250
+- Flaps remap: from €250
+- DPF removal: from €350
+- EGR block: from €50
+- Exhaust back-pressure pipe clean: from €50
+- Glow plugs: from €80 plus labour
+- Spark plugs (iridium): from €70 plus labour
+- Injector replacement: from €250
+- Injector learning: from €80
+- Timing belt + water pump: from €250 labour plus parts
+- Alternator: from €360 plus labour
+- Throttle clean: from €30
+- Key programming: from €250
+- Lane assist repair: from €50
+
+Brakes
+- Brake line repair: from €100
+- Front brake pads + labour: from €100
+- Rear brake pads + labour: from €100
+- Front brake pads + discs fitted: from €240
+- Rear brake pads + discs fitted: from €220
+
+Suspension / steering
+- Shocks (pair): from €200 plus labour from €120
+- Control arm bushes (pair): from €100 plus labour from €150
+- Track rod: from €30
+- Tie rod: from €30
+- Bump stop: from €20
+- Lower engine mount: from €110
+- Wheel alignment: from €50
+- Rear wheel balance: from €40
+
+Tyres
+- New tyres (supplied & fitted): from €100
+
+Electrical / sensors
+- Tyre pressure sensor: from €50 plus fit from €40
+- NCT check + headlight alignment: from €40
+
+Headlight repair (specialist)
+- Headlight lens including cleaning & re-sealing: from €250 per light
+- DRL chips: from €75
+- DRL tubes: from €100
+- Headlight removal: from €75
+- Full headlight jobs: from €400
 
 ## Guarantee
 - All repairs backed by a 12-month parts and labour guarantee
