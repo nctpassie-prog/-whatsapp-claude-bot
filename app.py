@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -50,6 +51,10 @@ PAUSE_KEYWORD = os.environ.get("PAUSE_KEYWORD", "#stop").lower()
 RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
 # Where completed bookings are sent (owner's WhatsApp number, digits only).
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
+# Appointment reminder (sent to the customer 1 day before, via an approved template).
+REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
+REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")
+REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "1") == "1"
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -187,6 +192,11 @@ def db() -> sqlite3.Connection:
         " name TEXT, phone TEXT, car TEXT, reg TEXT, need TEXT,"
         " time_text TEXT, date TEXT, created_ts REAL)"
     )
+    # 'reminded' tracks whether the 1-day-before reminder has been sent (added later).
+    try:
+        conn.execute("ALTER TABLE bookings ADD COLUMN reminded INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     return conn
 
 def save_booking(fields: dict) -> None:
@@ -375,8 +385,73 @@ def send_whatsapp(to: str, text: str) -> None:
     except Exception:
         log.exception("Failed to send WhatsApp message to %s", to)
 
+# ---------------------------------------------------------------- reminders
+def send_reminder_template(to: str, name: str, car: str, reg: str, when: str) -> bool:
+    """Send the appointment reminder as an approved WhatsApp template. Returns success."""
+    params = [name or "there", car or "car", reg or "-", when or "your appointment time"]
+    try:
+        r = httpx.post(
+            GRAPH_URL,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "template",
+                "template": {
+                    "name": REMINDER_TEMPLATE,
+                    "language": {"code": REMINDER_LANG},
+                    "components": [
+                        {"type": "body",
+                         "parameters": [{"type": "text", "text": p} for p in params]},
+                    ],
+                },
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.warning("Reminder template send to %s failed: %s %s", to, r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("Failed to send reminder template to %s", to)
+        return False
+
+def send_due_reminders() -> None:
+    """Send reminders for appointments happening tomorrow (once each, during daytime)."""
+    if not REMINDER_ENABLED:
+        return
+    now = now_local()
+    if not (9 <= now.hour < 20):  # only send during reasonable daytime hours
+        return
+    tomorrow = (now.date() + timedelta(days=1)).isoformat()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, name, phone, car, reg, time_text FROM bookings"
+            " WHERE date = ? AND COALESCE(reminded, 0) = 0",
+            (tomorrow,),
+        ).fetchall()
+    for bid, name, phone, car, reg, tt in rows:
+        if phone and send_reminder_template(phone, name, car, reg, tt):
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            log.info("Sent appointment reminder for booking %s to %s", bid, phone)
+
+def reminder_loop() -> None:
+    while True:
+        try:
+            send_due_reminders()
+        except Exception:
+            log.exception("Reminder loop error")
+        time.sleep(3600)  # check hourly
+
 # ---------------------------------------------------------------- webhook
 app = FastAPI(title="WhatsApp Claude Bot")
+
+@app.on_event("startup")
+def _start_reminder_thread() -> None:
+    threading.Thread(target=reminder_loop, daemon=True).start()
+    log.info("Reminder scheduler started (template=%s, lang=%s, enabled=%s)",
+             REMINDER_TEMPLATE, REMINDER_LANG, REMINDER_ENABLED)
 
 @app.get("/")
 def health() -> dict:
