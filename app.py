@@ -22,10 +22,12 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Query, Request, Response
@@ -43,6 +45,8 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 PAUSE_KEYWORD = os.environ.get("PAUSE_KEYWORD", "#stop").lower()
 RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
+# Where completed bookings are sent (owner's WhatsApp number, digits only).
+OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -66,6 +70,16 @@ to a colleague and that they will reply soon — do NOT invent prices, dates or 
 will contact them.
 - If the customer asks to speak to a human, confirm politely that a colleague will \
 answer them personally.
+
+BOOKING CAPTURE (internal — never mention or show any of this to the customer):
+When you have collected ALL of these details for a booking — customer name, phone \
+number, car make/model/year, car registration, what they need, and preferred day/time \
+— give your normal confirmation reply, then add ONE final line, on its own line at the \
+very very end, in EXACTLY this format:
+<<<BOOKING|name=NAME|phone=PHONE|car=MAKE MODEL YEAR|reg=REGISTRATION|need=WHAT THEY NEED|time=PREFERRED DAY AND TIME>>>
+Only output this line once, only when every field above is known, and put nothing after \
+it. If any field is still missing, do NOT output the line — ask for the missing detail \
+instead. The customer must never see or hear about this line.
 
 BUSINESS INFORMATION:
 {kb}
@@ -92,6 +106,52 @@ def load_blocklist() -> set[str]:
 def is_blocked(sender: str) -> bool:
     digits = "".join(ch for ch in sender if ch.isdigit())
     return bool(digits) and digits in load_blocklist()
+
+# ---------------------------------------------------------------- bookings
+BOOKING_RE = re.compile(r"<<<BOOKING\|(.*?)>>>", re.DOTALL)
+
+def process_booking(answer: str):
+    """Pull the hidden booking marker out of Claude's reply.
+
+    Returns (clean_reply_for_customer, booking_fields_or_None).
+    """
+    m = BOOKING_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = BOOKING_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    return clean, fields
+
+def notify_owner_booking(fields: dict) -> None:
+    """Send the owner a booking summary on WhatsApp with a Google Calendar link."""
+    if not OWNER_WHATSAPP:
+        log.info("Booking captured but OWNER_WHATSAPP not set; not notifying owner")
+        return
+    car = fields.get("car", "")
+    reg = fields.get("reg", "")
+    need = fields.get("need", "")
+    when = fields.get("time", "")
+    name = fields.get("name", "")
+    phone = fields.get("phone", "")
+    summary = (
+        f"Car: {car}\n"
+        f"Reg: {reg}\n"
+        f"Need: {need}\n"
+        f"Preferred: {when}\n"
+        f"Name: {name}\n"
+        f"Phone: {phone}"
+    )
+    title = f"NCTPass booking: {car} {reg}".strip()
+    cal_link = (
+        "https://calendar.google.com/calendar/render?action=TEMPLATE"
+        f"&text={quote(title)}&details={quote(summary)}"
+    )
+    send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
+                  "\n\nAdd to Google Calendar:\n" + cal_link)
 
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
@@ -171,6 +231,12 @@ def ask_claude(user: str, text: str) -> str:
             "Sorry, I couldn't process your message right now. "
             "A colleague will get back to you shortly."
         )
+    answer, booking = process_booking(answer)
+    if booking:
+        try:
+            notify_owner_booking(booking)
+        except Exception:
+            log.exception("Failed to notify owner of booking")
     save_message(user, "assistant", answer)
     return answer
 
