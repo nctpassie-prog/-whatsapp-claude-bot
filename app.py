@@ -55,6 +55,10 @@ OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
 REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "1") == "1"
+# Post-visit review request (feedback funnel).
+REVIEW_TEMPLATE = os.environ.get("REVIEW_TEMPLATE", "review_request")
+REVIEW_ENABLED = os.environ.get("REVIEW_ENABLED", "1") == "1"
+REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after appointment
 # Template language versions that exist/are approved (Moldovan = Romanian = ro).
 REMINDER_LANGS = {"en", "ru", "lt", "ro"}
 
@@ -184,6 +188,34 @@ def notify_owner_booking(fields: dict) -> None:
     send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
                   "\n\nAdd to Google Calendar:\n" + cal_link)
 
+FEEDBACK_RE = re.compile(r"<<<FEEDBACK\|(.*?)>>>", re.DOTALL)
+
+def process_feedback(answer: str):
+    """Pull the hidden negative-feedback marker out of Claude's reply."""
+    m = FEEDBACK_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = FEEDBACK_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    return clean, fields
+
+def notify_owner_feedback(fields: dict) -> None:
+    """Alert the owner about an unhappy customer so they can put it right."""
+    if not OWNER_WHATSAPP:
+        return
+    send_whatsapp(
+        OWNER_WHATSAPP,
+        "⚠️ Customer feedback needs attention\n\n"
+        f"Rating: {fields.get('rating', '?')}\n"
+        f"Name: {fields.get('name', '')}\n"
+        f"Phone: {fields.get('phone', '')}\n"
+        f"Said: {fields.get('comment', '')}",
+    )
+
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -201,7 +233,8 @@ def db() -> sqlite3.Connection:
         " time_text TEXT, date TEXT, created_ts REAL)"
     )
     # Columns added after the table already existed in the persistent DB.
-    for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''")):
+    for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''"),
+                     ("review_sent", "review_sent INTEGER DEFAULT 0")):
         try:
             conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -347,7 +380,7 @@ def _call_claude(messages: list, system_prompt: str) -> str:
         )
 
 def _finish_reply(user: str, answer: str) -> str:
-    """Strip any hidden booking marker, notify the owner, store and return the reply."""
+    """Strip hidden markers, notify the owner, store and return the customer reply."""
     answer, booking = process_booking(answer)
     if booking:
         try:
@@ -358,6 +391,12 @@ def _finish_reply(user: str, answer: str) -> str:
             notify_owner_booking(booking)
         except Exception:
             log.exception("Failed to notify owner of booking")
+    answer, feedback = process_feedback(answer)
+    if feedback:
+        try:
+            notify_owner_feedback(feedback)
+        except Exception:
+            log.exception("Failed to notify owner of feedback")
     save_message(user, "assistant", answer)
     return answer
 
@@ -488,12 +527,73 @@ def send_due_reminders() -> None:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
             log.info("Sent appointment reminder for booking %s to %s", bid, phone)
 
+def _send_review_in(to: str, params: list, lang_code: str) -> bool:
+    try:
+        r = httpx.post(
+            GRAPH_URL,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "template",
+                "template": {
+                    "name": REVIEW_TEMPLATE,
+                    "language": {"code": lang_code},
+                    "components": [
+                        {"type": "body",
+                         "parameters": [{"type": "text", "text": p} for p in params]},
+                    ],
+                },
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.warning("Review (%s) to %s failed: %s %s", lang_code, to, r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("Failed to send review template to %s", to)
+        return False
+
+def send_review_template(to: str, name: str, car: str, lang: str = "") -> bool:
+    params = [name or "there", car or "your car"]
+    code = reminder_lang_code(lang)
+    if _send_review_in(to, params, code):
+        return True
+    if code != REMINDER_LANG:
+        return _send_review_in(to, params, REMINDER_LANG)
+    return False
+
+def send_due_reviews() -> None:
+    """A couple of days after a visit, ask the customer how it went (feedback funnel)."""
+    if not REVIEW_ENABLED:
+        return
+    now = now_local()
+    if not (10 <= now.hour < 20):
+        return
+    target = (now.date() - timedelta(days=REVIEW_DELAY_DAYS)).isoformat()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, name, phone, car, COALESCE(lang, '') FROM bookings"
+            " WHERE date = ? AND COALESCE(review_sent, 0) = 0",
+            (target,),
+        ).fetchall()
+    for bid, name, phone, car, lang in rows:
+        if phone and send_review_template(phone, name, car, lang):
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET review_sent = 1 WHERE id = ?", (bid,))
+            log.info("Sent review request for booking %s to %s", bid, phone)
+
 def reminder_loop() -> None:
     while True:
         try:
             send_due_reminders()
         except Exception:
             log.exception("Reminder loop error")
+        try:
+            send_due_reviews()
+        except Exception:
+            log.exception("Review loop error")
         time.sleep(3600)  # check hourly
 
 # ---------------------------------------------------------------- webhook
