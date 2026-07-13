@@ -53,8 +53,14 @@ RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
-REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")
+REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
 REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "1") == "1"
+# Template language versions that exist/are approved (Moldovan = Romanian = ro).
+REMINDER_LANGS = {"en", "ru", "lt", "ro"}
+
+def reminder_lang_code(code: str) -> str:
+    code = (code or "").strip().lower()[:2]
+    return code if code in REMINDER_LANGS else REMINDER_LANG
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -96,10 +102,12 @@ When you have collected ALL of these details for a booking — customer name, ph
 number, car make/model/year, car registration, what they need, and preferred day/time \
 — give your normal confirmation reply, then add ONE final line, on its own line at the \
 very very end, in EXACTLY this format:
-<<<BOOKING|name=NAME|phone=PHONE|car=MAKE MODEL YEAR|reg=REGISTRATION|need=WHAT THEY NEED|time=PREFERRED DAY AND TIME|date=YYYY-MM-DD>>>
+<<<BOOKING|name=NAME|phone=PHONE|car=MAKE MODEL YEAR|reg=REGISTRATION|need=WHAT THEY NEED|time=PREFERRED DAY AND TIME|date=YYYY-MM-DD|lang=LANG>>>
 For the date field, work out the actual calendar date the customer means from their \
 preferred day/time and today's date, and write it as YYYY-MM-DD. If they were vague and \
-you truly cannot tell the date, use date=unknown. Only output this line once, only when \
+you truly cannot tell the date, use date=unknown. For the lang field, put the customer's \
+language as a two-letter code: en (English), ru (Russian), lt (Lithuanian) or ro (Romanian \
+or Moldovan). If unsure, use en. Only output this line once, only when \
 every field above is known, and put nothing after it. If any field is still missing, do \
 NOT output the line — ask for the missing detail instead. The customer must never see or \
 hear about this line.
@@ -192,22 +200,23 @@ def db() -> sqlite3.Connection:
         " name TEXT, phone TEXT, car TEXT, reg TEXT, need TEXT,"
         " time_text TEXT, date TEXT, created_ts REAL)"
     )
-    # 'reminded' tracks whether the 1-day-before reminder has been sent (added later).
-    try:
-        conn.execute("ALTER TABLE bookings ADD COLUMN reminded INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # Columns added after the table already existed in the persistent DB.
+    for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''")):
+        try:
+            conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 def save_booking(fields: dict) -> None:
     with closing(db()) as conn, conn:
         conn.execute(
-            "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, created_ts)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang, created_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fields.get("name", ""), fields.get("phone", ""), fields.get("car", ""),
                 fields.get("reg", ""), fields.get("need", ""), fields.get("time", ""),
-                fields.get("date", ""), time.time(),
+                fields.get("date", ""), fields.get("lang", ""), time.time(),
             ),
         )
 
@@ -386,9 +395,7 @@ def send_whatsapp(to: str, text: str) -> None:
         log.exception("Failed to send WhatsApp message to %s", to)
 
 # ---------------------------------------------------------------- reminders
-def send_reminder_template(to: str, name: str, car: str, reg: str, when: str) -> bool:
-    """Send the appointment reminder as an approved WhatsApp template. Returns success."""
-    params = [name or "there", car or "car", reg or "-", when or "your appointment time"]
+def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
     try:
         r = httpx.post(
             GRAPH_URL,
@@ -399,7 +406,7 @@ def send_reminder_template(to: str, name: str, car: str, reg: str, when: str) ->
                 "type": "template",
                 "template": {
                     "name": REMINDER_TEMPLATE,
-                    "language": {"code": REMINDER_LANG},
+                    "language": {"code": lang_code},
                     "components": [
                         {"type": "body",
                          "parameters": [{"type": "text", "text": p} for p in params]},
@@ -409,12 +416,22 @@ def send_reminder_template(to: str, name: str, car: str, reg: str, when: str) ->
             timeout=30,
         )
         if r.status_code != 200:
-            log.warning("Reminder template send to %s failed: %s %s", to, r.status_code, r.text[:300])
+            log.warning("Reminder (%s) to %s failed: %s %s", lang_code, to, r.status_code, r.text[:300])
             return False
         return True
     except Exception:
         log.exception("Failed to send reminder template to %s", to)
         return False
+
+def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> bool:
+    """Send the appointment reminder in the customer's language, falling back to the default."""
+    params = [name or "there", car or "car", reg or "-", when or "your appointment time"]
+    code = reminder_lang_code(lang)
+    if _send_reminder_in(to, params, code):
+        return True
+    if code != REMINDER_LANG:  # customer-language version may not be approved yet
+        return _send_reminder_in(to, params, REMINDER_LANG)
+    return False
 
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
@@ -426,12 +443,12 @@ def send_due_reminders() -> None:
     tomorrow = (now.date() + timedelta(days=1)).isoformat()
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT id, name, phone, car, reg, time_text FROM bookings"
+            "SELECT id, name, phone, car, reg, time_text, COALESCE(lang, '') FROM bookings"
             " WHERE date = ? AND COALESCE(reminded, 0) = 0",
             (tomorrow,),
         ).fetchall()
-    for bid, name, phone, car, reg, tt in rows:
-        if phone and send_reminder_template(phone, name, car, reg, tt):
+    for bid, name, phone, car, reg, tt, lang in rows:
+        if phone and send_reminder_template(phone, name, car, reg, tt, lang):
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
             log.info("Sent appointment reminder for booking %s to %s", bid, phone)
