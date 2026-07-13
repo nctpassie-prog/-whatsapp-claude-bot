@@ -71,6 +71,28 @@ BUSINESS INFORMATION:
 {kb}
 """
 
+# ---------------------------------------------------------------- blocklist
+def load_blocklist() -> set[str]:
+    """Phone numbers the bot must NEVER auto-reply to (suppliers, friends, family).
+
+    Reads blocklist.txt (one number per line, full international format).
+    '+', spaces and dashes are ignored; '#' starts a comment.
+    """
+    f = BASE_DIR / "blocklist.txt"
+    if not f.exists():
+        return set()
+    numbers = set()
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0]
+        digits = "".join(ch for ch in line if ch.isdigit())
+        if digits:
+            numbers.add(digits)
+    return numbers
+
+def is_blocked(sender: str) -> bool:
+    digits = "".join(ch for ch in sender if ch.isdigit())
+    return bool(digits) and digits in load_blocklist()
+
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -194,6 +216,9 @@ def valid_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature or "")
 
 def handle_message(sender: str, text: str) -> None:
+    if is_blocked(sender):
+        log.info("Sender %s is on the blocklist; not replying", sender)
+        return
     lowered = text.strip().lower()
     if lowered == PAUSE_KEYWORD:
         set_paused(sender, True)
