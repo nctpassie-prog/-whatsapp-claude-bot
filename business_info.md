@@ -60,6 +60,7 @@ Engine / remaps / diagnostics
 - Injector replacement: from €250
 - Injector learning: from €80
 - Timing belt + water pump: from €250 labour plus parts
+- Gearbox removal: labour from €350 plus parts
 - Alternator: from €360 plus labour
 - Throttle clean: from €30
 - Key programming: from €250
