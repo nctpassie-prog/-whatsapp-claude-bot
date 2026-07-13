@@ -17,6 +17,7 @@ Optional:
   RESUME_KEYWORD        - resume word (default: #start)
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -202,17 +203,14 @@ def set_paused(user: str, paused: bool) -> None:
             conn.execute("DELETE FROM paused WHERE wa_user = ?", (user,))
 
 # ---------------------------------------------------------------- Claude
-def ask_claude(user: str, text: str) -> str:
-    save_message(user, "user", text)
-    messages = get_history(user)
-    system_prompt = load_system_prompt()
-    if len(messages) <= 1:  # first message we've ever seen from this customer
-        system_prompt += (
-            "\n\nThis is the customer's FIRST message to us. Open your reply with a short, "
-            "warm welcome that briefly introduces NCTPass (pre-NCT checks and car repairs in "
-            "Blanchardstown, Dublin 15) in one or two friendly sentences, then answer their "
-            "message. Keep it natural and in the customer's own language."
-        )
+WELCOME_HINT = (
+    "\n\nThis is the customer's FIRST message to us. Open your reply with a short, "
+    "warm welcome that briefly introduces NCTPass (pre-NCT checks and car repairs in "
+    "Blanchardstown, Dublin 15) in one or two friendly sentences, then answer their "
+    "message. Keep it natural and in the customer's own language."
+)
+
+def _call_claude(messages: list, system_prompt: str) -> str:
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -227,18 +225,21 @@ def ask_claude(user: str, text: str) -> str:
                 "system": system_prompt,
                 "messages": messages,
             },
-            timeout=60,
+            timeout=90,
         )
         resp.raise_for_status()
-        answer = "".join(
+        return "".join(
             b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"
         ).strip()
     except Exception:
         log.exception("Claude API call failed")
-        answer = (
+        return (
             "Sorry, I couldn't process your message right now. "
             "A colleague will get back to you shortly."
         )
+
+def _finish_reply(user: str, answer: str) -> str:
+    """Strip any hidden booking marker, notify the owner, store and return the reply."""
     answer, booking = process_booking(answer)
     if booking:
         try:
@@ -247,6 +248,56 @@ def ask_claude(user: str, text: str) -> str:
             log.exception("Failed to notify owner of booking")
     save_message(user, "assistant", answer)
     return answer
+
+def ask_claude(user: str, text: str) -> str:
+    save_message(user, "user", text)
+    messages = get_history(user)
+    system_prompt = load_system_prompt()
+    if len(messages) <= 1:  # first message we've ever seen from this customer
+        system_prompt += WELCOME_HINT
+    return _finish_reply(user, _call_claude(messages, system_prompt))
+
+def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
+    note = (caption or "").strip()
+    save_message(user, "user", ("[Customer sent a photo] " + note).strip())
+    history = get_history(user)
+    system_prompt = load_system_prompt()
+    if len(history) <= 1:
+        system_prompt += WELCOME_HINT
+    prompt_text = note or (
+        "The customer sent this photo — it is most likely an NCT fail sheet or a photo of a "
+        "car fault/damage. Read it carefully and reply helpfully: for a fail sheet, list the "
+        "failed items in plain words and reassure them we can fix it (free inspection, written "
+        "quote before any work). Never invent prices. If the photo is unrelated or unclear, "
+        "politely ask them to describe what they need."
+    )
+    messages = history[:-1] + [{
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": image_b64}},
+            {"type": "text", "text": prompt_text},
+        ],
+    }]
+    return _finish_reply(user, _call_claude(messages, system_prompt))
+
+# ---------------------------------------------------------------- WhatsApp media
+_CLAUDE_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+def get_media(media_id: str):
+    """Download a WhatsApp media file. Returns (base64_data, mime_type)."""
+    meta = httpx.get(
+        f"https://graph.facebook.com/v21.0/{media_id}",
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        timeout=30,
+    )
+    meta.raise_for_status()
+    url = meta.json()["url"]
+    blob = httpx.get(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=60)
+    blob.raise_for_status()
+    mime = blob.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+    if mime not in _CLAUDE_IMAGE_MIMES:
+        mime = "image/jpeg"
+    return base64.b64encode(blob.content).decode(), mime
 
 # ---------------------------------------------------------------- WhatsApp send
 def send_whatsapp(to: str, text: str) -> None:
@@ -307,6 +358,27 @@ def handle_message(sender: str, text: str) -> None:
     answer = ask_claude(sender, text)
     send_whatsapp(sender, answer)
 
+def handle_image_message(sender: str, media_id: str, caption: str) -> None:
+    if is_blocked(sender):
+        log.info("Sender %s is on the blocklist; not replying", sender)
+        return
+    if is_paused(sender):
+        log.info("Chat with %s is paused; skipping photo auto-reply", sender)
+        save_message(sender, "user", "[Customer sent a photo]")
+        return
+    try:
+        image_b64, mime = get_media(media_id)
+    except Exception:
+        log.exception("Failed to download WhatsApp media %s", media_id)
+        send_whatsapp(
+            sender,
+            "Sorry, I couldn't open that photo. Please try sending it again, "
+            "or type out what you need and we'll help.",
+        )
+        return
+    answer = ask_claude_image(sender, image_b64, mime, caption)
+    send_whatsapp(sender, answer)
+
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
@@ -327,14 +399,22 @@ async def receive(request: Request, background: BackgroundTasks):
                 if msg_id and already_seen(msg_id):
                     continue  # Meta retries webhooks; don't answer twice
                 sender = msg.get("from", "")
-                if msg.get("type") == "text":
+                mtype = msg.get("type")
+                if mtype == "text":
                     text = msg.get("text", {}).get("body", "")
+                    if sender and text:
+                        background.add_task(handle_message, sender, text)
+                elif mtype == "image":
+                    media_id = msg.get("image", {}).get("id", "")
+                    caption = msg.get("image", {}).get("caption", "")
+                    if sender and media_id:
+                        background.add_task(handle_image_message, sender, media_id, caption)
                 else:
                     text = (
                         "[Customer sent a non-text message "
-                        f"({msg.get('type')}). Politely say you can only read text here "
+                        f"({mtype}). Politely say you can only read text or photos here "
                         "and a colleague will check the attachment.]"
                     )
-                if sender and text:
-                    background.add_task(handle_message, sender, text)
+                    if sender:
+                        background.add_task(handle_message, sender, text)
     return {"status": "ok"}
