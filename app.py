@@ -239,6 +239,41 @@ def bookings_for(day: str) -> str:
         lines.append(f"   {tt} · {name} {phone}")
     return "\n".join(lines)
 
+# ---------------------------------------------------------------- capacity
+def day_capacity(d) -> int:
+    """Max bookings for a given date: 9 Mon-Fri, 4 Saturday, 0 (closed) Sunday."""
+    wd = d.weekday()  # Mon=0 .. Sun=6
+    if wd == 5:
+        return 4
+    if wd == 6:
+        return 0
+    return 9
+
+def availability_block() -> str:
+    """Real-time availability for the next 2 weeks, to inject into the prompt."""
+    today = now_local().date()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT date, COUNT(*) FROM bookings WHERE date >= ? GROUP BY date",
+            (today.isoformat(),),
+        ).fetchall()
+    taken = {d: c for d, c in rows}
+    lines = []
+    for i in range(14):
+        d = today + timedelta(days=i)
+        cap = day_capacity(d)
+        if cap == 0:
+            continue  # closed Sundays
+        left = max(0, cap - taken.get(d.isoformat(), 0))
+        lines.append(f"{d.strftime('%a %d %b')}: " + ("FULL" if left == 0 else f"{left} slot(s) left"))
+    return (
+        "\n\nBOOKING AVAILABILITY — capacity is 9 jobs Mon-Fri, 4 on Saturday, closed Sunday. "
+        "Slots already booked are counted. Next 2 weeks:\n" + "\n".join(lines) +
+        "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
+        "slots left. If the customer asks for a day marked FULL, or a Sunday, DO NOT confirm — "
+        "tell them that day is fully booked and kindly offer the nearest day that still has space."
+    )
+
 def already_seen(msg_id: str) -> bool:
     with closing(db()) as conn, conn:
         cur = conn.execute("SELECT 1 FROM seen WHERE msg_id = ?", (msg_id,))
@@ -329,7 +364,7 @@ def _finish_reply(user: str, answer: str) -> str:
 def ask_claude(user: str, text: str) -> str:
     save_message(user, "user", text)
     messages = get_history(user)
-    system_prompt = load_system_prompt()
+    system_prompt = load_system_prompt() + availability_block()
     if len(messages) <= 1:  # first message we've ever seen from this customer
         system_prompt += WELCOME_HINT
     return _finish_reply(user, _call_claude(messages, system_prompt))
@@ -338,7 +373,7 @@ def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
     note = (caption or "").strip()
     save_message(user, "user", ("[Customer sent a photo] " + note).strip())
     history = get_history(user)
-    system_prompt = load_system_prompt()
+    system_prompt = load_system_prompt() + availability_block()
     if len(history) <= 1:
         system_prompt += WELCOME_HINT
     prompt_text = note or (
