@@ -205,6 +205,14 @@ def set_paused(user: str, paused: bool) -> None:
 def ask_claude(user: str, text: str) -> str:
     save_message(user, "user", text)
     messages = get_history(user)
+    system_prompt = load_system_prompt()
+    if len(messages) <= 1:  # first message we've ever seen from this customer
+        system_prompt += (
+            "\n\nThis is the customer's FIRST message to us. Open your reply with a short, "
+            "warm welcome that briefly introduces NCTPass (pre-NCT checks and car repairs in "
+            "Blanchardstown, Dublin 15) in one or two friendly sentences, then answer their "
+            "message. Keep it natural and in the customer's own language."
+        )
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -216,7 +224,7 @@ def ask_claude(user: str, text: str) -> str:
             json={
                 "model": ANTHROPIC_MODEL,
                 "max_tokens": 500,
-                "system": load_system_prompt(),
+                "system": system_prompt,
                 "messages": messages,
             },
             timeout=60,
