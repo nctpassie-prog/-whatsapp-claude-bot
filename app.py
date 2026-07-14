@@ -351,6 +351,17 @@ WELCOME_HINT = (
     "message. Keep it natural and in the customer's own language."
 )
 
+OWNER_HINT = (
+    "\n\nIMPORTANT: THIS MESSAGE IS FROM THE SHOP OWNER, not a customer. Do not treat "
+    "them as a customer or give them prices/marketing. The owner can log a booking they "
+    "took themselves (e.g. by phone or in person) so it counts toward the day's capacity. "
+    "When the owner adds a booking, reply briefly (e.g. 'Added ✅ for <day>') and output "
+    "the hidden <<<BOOKING|...>>> line with whatever details they gave — leave any unknown "
+    "fields blank, and still work out the date=YYYY-MM-DD from the day they mention. The "
+    "owner may give minimal info (just car + job + day); that is fine. Count it toward "
+    "capacity like any booking."
+)
+
 def _call_claude(messages: list, system_prompt: str) -> str:
     try:
         resp = httpx.post(
@@ -404,7 +415,9 @@ def ask_claude(user: str, text: str) -> str:
     save_message(user, "user", text)
     messages = get_history(user)
     system_prompt = load_system_prompt() + availability_block()
-    if len(messages) <= 1:  # first message we've ever seen from this customer
+    if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
+        system_prompt += OWNER_HINT
+    elif len(messages) <= 1:  # first message we've ever seen from this customer
         system_prompt += WELCOME_HINT
     return _finish_reply(user, _call_claude(messages, system_prompt))
 
