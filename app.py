@@ -253,7 +253,7 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
         return False
     now = time.time()
     name = (name or "").strip()
-    reg = (reg or "").strip()
+    reg = (reg or "").strip().replace(" ", "").upper()
     with closing(db()) as conn, conn:
         row = conn.execute("SELECT name, reg FROM customers WHERE wa_number = ?", (number,)).fetchone()
         if row is None:
@@ -287,18 +287,19 @@ def customers_list(limit: int = 20) -> str:
     return "\n".join(lines)
 
 def save_booking(fields: dict) -> None:
+    reg = fields.get("reg", "").strip().replace(" ", "").upper()  # store reg without spaces
     with closing(db()) as conn, conn:
         conn.execute(
             "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang, created_ts)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fields.get("name", ""), fields.get("phone", ""), fields.get("car", ""),
-                fields.get("reg", ""), fields.get("need", ""), fields.get("time", ""),
+                reg, fields.get("need", ""), fields.get("time", ""),
                 fields.get("date", ""), fields.get("lang", ""), time.time(),
             ),
         )
     # Save/enrich the customer contact record (name + number + reg).
-    record_customer(fields.get("phone", ""), fields.get("name", ""), fields.get("reg", ""))
+    record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
 
 def bookings_for(day: str) -> str:
     """day = 'today' or 'tomorrow'. Returns a formatted list for the owner."""
