@@ -300,11 +300,14 @@ def availability_block() -> str:
         left = max(0, cap - taken.get(d.isoformat(), 0))
         lines.append(f"{d.strftime('%a %d %b')}: " + ("FULL" if left == 0 else f"{left} slot(s) left"))
     return (
-        "\n\nBOOKING AVAILABILITY — capacity is 9 jobs Mon-Fri, 4 on Saturday, closed Sunday. "
-        "Slots already booked are counted. Next 2 weeks:\n" + "\n".join(lines) +
+        "\n\nBOOKING AVAILABILITY — capacity is 9 jobs Mon-Fri; Saturday is GENERAL SERVICES "
+        "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
+        "counted. Next 2 weeks:\n" + "\n".join(lines) +
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
         "slots left. If the customer asks for a day marked FULL, or a Sunday, DO NOT confirm — "
-        "tell them that day is fully booked and kindly offer the nearest day that still has space."
+        "tell them it's fully booked and offer the nearest day with space. On SATURDAY only book "
+        "general services — if they want a repair (brakes, NCT-fail, wheel bearing, AC, diagnostics) "
+        "on a Saturday, do NOT book it; explain Saturday is services-only and offer a weekday."
     )
 
 def already_seen(msg_id: str) -> bool:
