@@ -367,6 +367,15 @@ OWNER_HINT = (
     "capacity like any booking."
 )
 
+def contact_hint(user: str) -> str:
+    return (
+        f"\n\nThe customer is messaging from WhatsApp number +{user}. Use THIS as their "
+        "contact number for any booking (it is guaranteed correct), unless they clearly ask "
+        "to be contacted on a different number. When taking a booking, read the phone number "
+        "back to the customer and ask them to confirm it is correct before you finalise — "
+        "this avoids wrong numbers. Put the confirmed number in the booking's phone field."
+    )
+
 def _call_claude(messages: list, system_prompt: str) -> str:
     try:
         resp = httpx.post(
@@ -422,15 +431,17 @@ def ask_claude(user: str, text: str) -> str:
     system_prompt = load_system_prompt() + availability_block()
     if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
         system_prompt += OWNER_HINT
-    elif len(messages) <= 1:  # first message we've ever seen from this customer
-        system_prompt += WELCOME_HINT
+    else:
+        system_prompt += contact_hint(user)
+        if len(messages) <= 1:  # first message we've ever seen from this customer
+            system_prompt += WELCOME_HINT
     return _finish_reply(user, _call_claude(messages, system_prompt))
 
 def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
     note = (caption or "").strip()
     save_message(user, "user", ("[Customer sent a photo] " + note).strip())
     history = get_history(user)
-    system_prompt = load_system_prompt() + availability_block()
+    system_prompt = load_system_prompt() + availability_block() + contact_hint(user)
     if len(history) <= 1:
         system_prompt += WELCOME_HINT
     prompt_text = note or (
