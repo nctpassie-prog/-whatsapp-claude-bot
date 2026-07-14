@@ -239,7 +239,52 @@ def db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS customers ("
+        " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
+        " first_ts REAL, last_ts REAL)"
+    )
     return conn
+
+def record_customer(number: str, name: str = "", reg: str = "") -> bool:
+    """Save/enrich a customer (WhatsApp number + name + car reg). Returns True if brand new."""
+    number = "".join(ch for ch in str(number) if ch.isdigit())
+    if not number:
+        return False
+    now = time.time()
+    name = (name or "").strip()
+    reg = (reg or "").strip()
+    with closing(db()) as conn, conn:
+        row = conn.execute("SELECT name, reg FROM customers WHERE wa_number = ?", (number,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO customers (wa_number, name, reg, first_ts, last_ts) VALUES (?,?,?,?,?)",
+                (number, name, reg, now, now),
+            )
+            return True
+        conn.execute(
+            "UPDATE customers SET name = ?, reg = ?, last_ts = ? WHERE wa_number = ?",
+            (name or row[0], reg or row[1], now, number),
+        )
+        return False
+
+def customers_list(limit: int = 20) -> str:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_number, name, reg FROM customers ORDER BY last_ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return "No customers saved yet."
+    lines = [f"\U0001F4C7 Recent customers ({len(rows)}):", ""]
+    for i, (num, name, reg) in enumerate(rows, 1):
+        bits = [f"+{num}"]
+        if name:
+            bits.append(name)
+        if reg:
+            bits.append(reg)
+        lines.append(f"{i}. " + " · ".join(bits))
+    return "\n".join(lines)
 
 def save_booking(fields: dict) -> None:
     with closing(db()) as conn, conn:
@@ -252,6 +297,8 @@ def save_booking(fields: dict) -> None:
                 fields.get("date", ""), fields.get("lang", ""), time.time(),
             ),
         )
+    # Save/enrich the customer contact record (name + number + reg).
+    record_customer(fields.get("phone", ""), fields.get("name", ""), fields.get("reg", ""))
 
 def bookings_for(day: str) -> str:
     """day = 'today' or 'tomorrow'. Returns a formatted list for the owner."""
@@ -659,9 +706,13 @@ def handle_message(sender: str, text: str) -> None:
         log.info("Sender %s is on the blocklist; not replying", sender)
         return
     lowered = text.strip().lower()
-    # Owner-only commands: "today" / "tomorrow" list that day's bookings.
-    if OWNER_WHATSAPP and sender == OWNER_WHATSAPP and lowered.lstrip("#/ ") in ("today", "tomorrow"):
+    is_owner = bool(OWNER_WHATSAPP) and sender == OWNER_WHATSAPP
+    # Owner-only commands.
+    if is_owner and lowered.lstrip("#/ ") in ("today", "tomorrow"):
         send_whatsapp(sender, bookings_for(lowered.lstrip("#/ ")))
+        return
+    if is_owner and lowered.lstrip("#/ ") in ("customers", "customer"):
+        send_whatsapp(sender, customers_list())
         return
     if lowered == PAUSE_KEYWORD:
         set_paused(sender, True)
@@ -673,6 +724,12 @@ def handle_message(sender: str, text: str) -> None:
         log.info("Chat with %s is paused; skipping auto-reply", sender)
         save_message(sender, "user", text)
         return
+    if not is_owner:  # remember the customer; alert the owner about brand-new ones
+        try:
+            if record_customer(sender) and OWNER_WHATSAPP:
+                send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
+        except Exception:
+            log.exception("Failed to record customer %s", sender)
     answer = ask_claude(sender, text)
     send_whatsapp(sender, answer)
 
@@ -684,6 +741,12 @@ def handle_image_message(sender: str, media_id: str, caption: str) -> None:
         log.info("Chat with %s is paused; skipping photo auto-reply", sender)
         save_message(sender, "user", "[Customer sent a photo]")
         return
+    if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP):
+        try:
+            if record_customer(sender) and OWNER_WHATSAPP:
+                send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
+        except Exception:
+            log.exception("Failed to record customer %s", sender)
     try:
         image_b64, mime = get_media(media_id)
     except Exception:
