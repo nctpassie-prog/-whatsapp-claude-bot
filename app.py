@@ -216,6 +216,33 @@ def notify_owner_feedback(fields: dict) -> None:
         f"Said: {fields.get('comment', '')}",
     )
 
+HANDOVER_RE = re.compile(r"<<<HANDOVER\|(.*?)>>>", re.DOTALL)
+
+def process_handover(answer: str):
+    """Pull the hidden handover marker (bot deferred to a human) out of the reply."""
+    m = HANDOVER_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = HANDOVER_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    return clean, fields
+
+def notify_owner_handover(number: str, fields: dict) -> None:
+    """Ping the owner when the bot defers something to a human, so they can follow up."""
+    if not OWNER_WHATSAPP:
+        return
+    number = "".join(ch for ch in str(number) if ch.isdigit())
+    send_whatsapp(
+        OWNER_WHATSAPP,
+        "🙋 A customer needs you to follow up\n\n"
+        f"From: +{number}\n"
+        f"About: {fields.get('reason', 'a question the bot could not answer')}",
+    )
+
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -470,6 +497,12 @@ def _finish_reply(user: str, answer: str) -> str:
             notify_owner_feedback(feedback)
         except Exception:
             log.exception("Failed to notify owner of feedback")
+    answer, handover = process_handover(answer)
+    if handover and not (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
+        try:
+            notify_owner_handover(user, handover)
+        except Exception:
+            log.exception("Failed to notify owner of handover")
     save_message(user, "assistant", answer)
     return answer
 
