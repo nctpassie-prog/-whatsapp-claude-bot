@@ -357,6 +357,28 @@ def day_capacity(d) -> int:
         return 0
     return 9
 
+def day_is_full(date_str: str) -> bool:
+    """True if the given YYYY-MM-DD date already has no free slots."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return False  # unknown/vague date -> let the owner sort the exact day
+    with closing(db()) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?", (date_str,)).fetchone()[0]
+    return n >= day_capacity(d)
+
+# Templated "that day is full" message, per language (used when a booking hits a full day).
+FULL_DAY_MSG = {
+    "en": "Sorry, that day is now fully booked. \U0001F64f Could we do a different day? "
+          "Just tell me another day that suits and I'll sort it.",
+    "ru": "К сожалению, этот день уже полностью занят. \U0001F64f Можем предложить другой день? "
+          "Напишите, какой день вам удобен, и я всё устрою.",
+    "lt": "Atsiprašome, ta diena jau visiškai užimta. \U0001F64f Gal galime pasiūlyti kitą dieną? "
+          "Parašykite, kuri diena jums tinka, ir aš viską suderinsiu.",
+    "ro": "Ne pare rău, ziua respectivă este deja complet ocupată. \U0001F64f Putem stabili altă zi? "
+          "Spuneți-mi o altă zi potrivită și rezolv eu.",
+}
+
 def availability_block() -> str:
     """Real-time availability for the next 2 weeks, to inject into the prompt."""
     today = now_local().date()
@@ -382,7 +404,10 @@ def availability_block() -> str:
         "slots left. If the customer asks for a day marked FULL, or a Sunday, DO NOT confirm — "
         "tell them it's fully booked and offer the nearest day with space. On SATURDAY only book "
         "general services — if they want a repair (brakes, NCT-fail, wheel bearing, AC, diagnostics) "
-        "on a Saturday, do NOT book it; explain Saturday is services-only and offer a weekday."
+        "on a Saturday, do NOT book it; explain Saturday is services-only and offer a weekday. "
+        "BE CONSISTENT: never offer or confirm a day and then later tell the same customer it is "
+        "full. Check availability BEFORE offering a day. Once you have taken a booking for a day, "
+        "that customer has their slot — do not tell them afterwards that the day is full."
     )
 
 def already_seen(msg_id: str) -> bool:
@@ -482,7 +507,15 @@ def _call_claude(messages: list, system_prompt: str) -> str:
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     answer, booking = process_booking(answer)
+    is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     if booking:
+        # Hard safety net: never confirm a booking on a day that is already full.
+        # (Owner can override capacity when logging their own manual bookings.)
+        if not is_owner and day_is_full(booking.get("date", "")):
+            log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
+            answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
+            save_message(user, "assistant", answer)
+            return answer
         try:
             save_booking(booking)
         except Exception:
@@ -718,6 +751,42 @@ def _start_reminder_thread() -> None:
 @app.get("/")
 def health() -> dict:
     return {"status": "ok"}
+
+@app.get("/admin")
+def admin(token: str = Query(""), action: str = Query("status"), date: str = Query("")):
+    """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all."""
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return Response(status_code=403)
+    if action == "clear":
+        with closing(db()) as conn, conn:
+            if date == "all":
+                n = conn.execute("DELETE FROM bookings").rowcount
+            elif date:
+                n = conn.execute("DELETE FROM bookings WHERE date = ?", (date,)).rowcount
+            else:
+                return {"error": "provide date=YYYY-MM-DD or date=all"}
+        return {"cleared": n, "date": date}
+    # status
+    today = now_local().date()
+    with closing(db()) as conn:
+        by_date = conn.execute(
+            "SELECT date, COUNT(*) FROM bookings GROUP BY date ORDER BY date"
+        ).fetchall()
+        total_bookings = conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+        total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+    days = []
+    for i in range(14):
+        d = today + timedelta(days=i)
+        iso = d.isoformat()
+        used = dict(by_date).get(iso, 0)
+        days.append({"date": iso, "day": d.strftime("%a"), "used": used, "capacity": day_capacity(d)})
+    return {
+        "today": today.isoformat(),
+        "total_bookings": total_bookings,
+        "total_customers": total_customers,
+        "all_booking_dates": [{"date": dt, "count": c} for dt, c in by_date],
+        "next_14_days": days,
+    }
 
 @app.get("/webhook")
 def verify(
