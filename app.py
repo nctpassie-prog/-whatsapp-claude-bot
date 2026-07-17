@@ -158,6 +158,10 @@ def is_blocked(sender: str) -> bool:
 # ---------------------------------------------------------------- bookings
 BOOKING_RE = re.compile(r"<<<BOOKING\|(.*?)>>>", re.DOTALL)
 
+def clean_reg(reg: str) -> str:
+    """Normalise a car registration: no spaces or dashes, uppercase (e.g. 11D2547)."""
+    return (reg or "").strip().replace(" ", "").replace("-", "").upper()
+
 def process_booking(answer: str):
     """Pull the hidden booking marker out of Claude's reply.
 
@@ -172,6 +176,8 @@ def process_booking(answer: str):
         if "=" in part:
             key, value = part.split("=", 1)
             fields[key.strip().lower()] = value.strip()
+    if "reg" in fields:
+        fields["reg"] = clean_reg(fields["reg"])  # always compact: no spaces/dashes
     return clean, fields
 
 def notify_owner_booking(fields: dict) -> None:
@@ -293,7 +299,7 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
         return False
     now = time.time()
     name = (name or "").strip()
-    reg = (reg or "").strip().replace(" ", "").upper()
+    reg = clean_reg(reg)
     with closing(db()) as conn, conn:
         row = conn.execute("SELECT name, reg FROM customers WHERE wa_number = ?", (number,)).fetchone()
         if row is None:
@@ -327,7 +333,7 @@ def customers_list(limit: int = 20) -> str:
     return "\n".join(lines)
 
 def save_booking(fields: dict) -> None:
-    reg = fields.get("reg", "").strip().replace(" ", "").upper()  # store reg without spaces
+    reg = clean_reg(fields.get("reg", ""))  # store reg without spaces or dashes
     with closing(db()) as conn, conn:
         conn.execute(
             "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang, created_ts)"
