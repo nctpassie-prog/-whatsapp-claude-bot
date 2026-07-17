@@ -492,10 +492,12 @@ OWNER_HINT = (
 def contact_hint(user: str) -> str:
     return (
         f"\n\nThe customer is messaging from WhatsApp number +{user}. Use THIS as their "
-        "contact number for any booking (it is guaranteed correct), unless they clearly ask "
-        "to be contacted on a different number. When taking a booking, read the phone number "
-        "back to the customer and ask them to confirm it is correct before you finalise — "
-        "this avoids wrong numbers. Put the confirmed number in the booking's phone field."
+        "contact number for the booking (it is guaranteed correct), unless they clearly ask "
+        "to be contacted on a different number. You do NOT need to ask them for a phone "
+        "number, and do NOT run a separate step just to confirm the number. The number is "
+        "included in the single booking read-back (the 'Shall I book you in?' step) for them "
+        "to check along with everything else — so when they confirm there, book immediately. "
+        "Put that number in the booking's phone field."
     )
 
 def _call_claude(messages: list, system_prompt: str) -> str:
