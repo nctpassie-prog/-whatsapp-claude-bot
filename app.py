@@ -471,10 +471,11 @@ def set_paused(user: str, paused: bool) -> None:
 WELCOME_HINT = (
     "\n\nThis is the customer's FIRST message to us. Open with a VERY SHORT, friendly "
     "one-line welcome in this exact style (translated into the customer's language): "
-    "\"Hi \U0001F44B Welcome to NCTPass! How can we help — a service, NCT repair, or a "
-    "quick question?\" Keep it to that single line. If their first message already asks "
-    "something specific, give that one-line welcome and then answer their question. Do "
-    "NOT add extra sentences about our location, history or services."
+    "\"Hi \U0001F44B Welcome to NCTPass! Just message us here anytime and we'll help "
+    "straight away \U0001F44D — a service, NCT repair, or a quick question?\" Keep it to "
+    "that single line. If their first message already asks something specific, give that "
+    "one-line welcome and then answer their question. Do NOT add extra sentences about "
+    "our location, history or services."
 )
 
 OWNER_HINT = (
