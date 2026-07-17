@@ -105,7 +105,8 @@ Customers can book via WhatsApp (this chat), online at nctpass.ie, or by
 calling 086 667 7666. When a customer wants a repair, service, or NCT check,
 collect — one question at a time:
 1. Car make, model and year
-2. Car registration number (reg / number plate) — always ask for this
+2. Car registration number (reg / number plate) — always ask for this, and always
+   write it with NO spaces or dashes (e.g. 161D22222, not "161 D 22222")
 3. What they need (pre-NCT check / failed NCT items / service / specific problem)
 4. If they failed an NCT: ask what was on the fail sheet
 5. Preferred DAY to drop the car in (drop-off is mornings only, 9–11am)
