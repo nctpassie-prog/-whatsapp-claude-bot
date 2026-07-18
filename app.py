@@ -992,6 +992,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             "This is a test from your NCTPass WhatsApp bot. If you can read this, "
             "booking emails are working.")
         return {"configured": True, "sent": ok, "detail": detail, "config": cfg}
+    if action == "clearchat":
+        # Delete one conversation (and its customer record) - e.g. to remove a test chat.
+        if not date:
+            return {"error": "provide date=<wa_number> (the chat to delete)"}
+        num = "".join(ch for ch in date if ch.isdigit())
+        with closing(db()) as conn, conn:
+            n = conn.execute("DELETE FROM messages WHERE wa_user = ?", (num,)).rowcount
+            conn.execute("DELETE FROM customers WHERE wa_number = ?", (num,))
+            conn.execute("DELETE FROM human_takeover WHERE wa_user = ?", (num,))
+        return {"deleted_messages": n, "chat": num}
     if action == "clear":
         with closing(db()) as conn, conn:
             if date == "all":
