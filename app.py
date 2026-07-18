@@ -858,6 +858,85 @@ def _start_reminder_thread() -> None:
 def health() -> dict:
     return {"status": "ok"}
 
+CHAT_CSS = """
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f4f6;color:#111}
+header{background:#075e54;color:#fff;padding:14px 16px;position:sticky;top:0}
+header a{color:#cfe9e4;text-decoration:none;font-size:15px}
+h1{margin:0;font-size:18px}
+.wrap{max-width:760px;margin:0 auto;padding:12px 14px 40px}
+.row{display:block;background:#fff;border-radius:10px;padding:12px 14px;margin-bottom:8px;
+ text-decoration:none;color:inherit;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.row b{font-size:16px}
+.meta{color:#667;font-size:13px;margin-top:2px}
+.snip{color:#444;font-size:14px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.b{max-width:78%;padding:9px 12px;border-radius:12px;margin:6px 0;font-size:15px;
+ line-height:1.35;white-space:pre-wrap;word-wrap:break-word}
+.cust{background:#fff;margin-right:auto;border-top-left-radius:3px}
+.bot{background:#dcf8c6;margin-left:auto;border-top-right-radius:3px}
+.t{font-size:11px;color:#8a8a8a;margin-top:3px}
+.empty{color:#667;text-align:center;padding:40px 10px}
+"""
+
+def _fmt_ts(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
+    except Exception:
+        return ""
+
+@app.get("/chats")
+def chats(token: str = Query(""), user: str = Query("")):
+    """Private web view of the bot's conversations with customers (token-guarded)."""
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return Response(status_code=403)
+    esc = __import__("html").escape
+    if user:  # one conversation
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT role, content, ts FROM messages WHERE wa_user = ? ORDER BY id", (user,)
+            ).fetchall()
+            cust = conn.execute(
+                "SELECT name, reg FROM customers WHERE wa_number = ?", (user,)).fetchone()
+        who = f"+{esc(user)}"
+        if cust and (cust[0] or cust[1]):
+            who += " &middot; " + esc(" ".join(x for x in cust if x))
+        bubbles = "".join(
+            f'<div class="b {"bot" if r == "assistant" else "cust"}">{esc(c or "")}'
+            f'<div class="t">{"Bot" if r == "assistant" else "Customer"} &middot; {_fmt_ts(t)}</div></div>'
+            for r, c, t in rows
+        ) or '<div class="empty">No messages yet.</div>'
+        body = (f'<header><a href="/chats?token={esc(token)}">&larr; All chats</a>'
+                f'<h1>{who}</h1></header><div class="wrap">{bubbles}</div>')
+    else:  # list of conversations
+        with closing(db()) as conn:
+            convos = conn.execute(
+                "SELECT wa_user, MAX(ts) AS last_ts, COUNT(*) AS n FROM messages "
+                "GROUP BY wa_user ORDER BY last_ts DESC LIMIT 100").fetchall()
+            names = dict((n, (nm, rg)) for n, nm, rg in conn.execute(
+                "SELECT wa_number, name, reg FROM customers").fetchall())
+            lasts = {}
+            for u, _, _ in convos:
+                r = conn.execute("SELECT content FROM messages WHERE wa_user = ? "
+                                 "ORDER BY id DESC LIMIT 1", (u,)).fetchone()
+                lasts[u] = r[0] if r else ""
+        items = ""
+        for u, last_ts, n in convos:
+            nm, rg = names.get(u, ("", ""))
+            label = esc(nm) if nm else f"+{esc(u)}"
+            extra = " &middot; ".join(x for x in [esc(rg) if rg else "", f"+{esc(u)}" if nm else ""] if x)
+            items += (f'<a class="row" href="/chats?token={esc(token)}&user={esc(u)}">'
+                      f'<b>{label}</b><div class="meta">{extra or "&nbsp;"}</div>'
+                      f'<div class="snip">{esc((lasts.get(u) or "")[:90])}</div>'
+                      f'<div class="meta">{n} messages &middot; {_fmt_ts(last_ts)}</div></a>')
+        if not items:
+            items = '<div class="empty">No conversations yet.</div>'
+        body = (f'<header><h1>NCTPass &mdash; customer chats</h1></header>'
+                f'<div class="wrap">{items}</div>')
+    html_doc = ('<!doctype html><html><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>NCTPass chats</title><style>{CHAT_CSS}</style></head>'
+                f'<body>{body}</body></html>')
+    return Response(content=html_doc, media_type="text/html")
+
 @app.get("/admin")
 def admin(token: str = Query(""), action: str = Query("status"), date: str = Query("")):
     """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all."""
