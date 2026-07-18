@@ -73,6 +73,9 @@ def reminder_lang_code(code: str) -> str:
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 BOOKING_EMAIL_FROM = os.environ.get("BOOKING_EMAIL_FROM", "onboarding@resend.dev")
 BOOKING_EMAIL_TO = os.environ.get("BOOKING_EMAIL_TO", "")  # inbox to receive bookings
+# Google account whose calendar booking links open in. Defaults to the booking inbox
+# so events always land on the same calendar, whoever is signed in.
+CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -190,6 +193,24 @@ def process_booking(answer: str):
         fields["reg"] = clean_reg(fields["reg"])  # always compact: no spaces/dashes
     return clean, fields
 
+def calendar_link(title: str, details: str, date_str: str = "") -> str:
+    """Google Calendar 'add event' link.
+
+    Pinned to CALENDAR_ACCOUNT so the event always lands on the same calendar no
+    matter which Google account the browser happens to be signed into, and
+    pre-filled with the 9-11am drop-off window when we know the date.
+    """
+    url = ("https://calendar.google.com/calendar/render?action=TEMPLATE"
+           f"&text={quote(title)}&details={quote(details)}")
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        url += f"&dates={d:%Y%m%d}T090000/{d:%Y%m%d}T110000&ctz=Europe/Dublin"
+    except Exception:
+        pass  # no usable date - let the owner pick it
+    if CALENDAR_ACCOUNT:
+        url += f"&authuser={quote(CALENDAR_ACCOUNT)}"
+    return url
+
 def notify_owner_booking(fields: dict) -> None:
     """Send the owner a booking summary on WhatsApp with a Google Calendar link."""
     if not OWNER_WHATSAPP:
@@ -210,10 +231,7 @@ def notify_owner_booking(fields: dict) -> None:
         f"Phone: {phone}"
     )
     title = f"NCTPass booking: {car} {reg}".strip()
-    cal_link = (
-        "https://calendar.google.com/calendar/render?action=TEMPLATE"
-        f"&text={quote(title)}&details={quote(summary)}"
-    )
+    cal_link = calendar_link(title, summary, fields.get("date", ""))
     send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
                   "\n\nAdd to Google Calendar:\n" + cal_link)
 
@@ -257,8 +275,7 @@ def email_booking(fields: dict) -> None:
         f"Name:      {name}\n"
         f"Phone:     {phone}\n\n"
         "Add to Google Calendar:\n"
-        "https://calendar.google.com/calendar/render?action=TEMPLATE"
-        f"&text={quote(title)}&details={quote(body_details(car, reg, need, when, name, phone))}"
+        + calendar_link(title, body_details(car, reg, need, when, name, phone), date)
     )
     ok, detail = send_email(title or "NCTPass booking", body)
     if ok:
