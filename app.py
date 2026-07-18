@@ -49,6 +49,9 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 PAUSE_KEYWORD = os.environ.get("PAUSE_KEYWORD", "#stop").lower()
 RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
+# Coexistence: hours the bot stays quiet in a chat after a colleague replies
+# from the WhatsApp Business app (so it never talks over staff).
+AUTO_RESUME_HOURS = float(os.environ.get("AUTO_RESUME_HOURS", "24"))
 # Where completed bookings are sent (owner's WhatsApp number, digits only).
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
@@ -352,6 +355,10 @@ def db() -> sqlite3.Connection:
     )
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
+    # Coexistence: when a human answers from the WhatsApp Business app we record it
+    # here so the bot stays quiet for that customer and never talks over staff.
+    conn.execute("CREATE TABLE IF NOT EXISTS human_takeover ("
+                 " wa_user TEXT PRIMARY KEY, ts REAL)")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bookings ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -544,6 +551,34 @@ def set_paused(user: str, paused: bool) -> None:
             conn.execute("INSERT OR IGNORE INTO paused (wa_user) VALUES (?)", (user,))
         else:
             conn.execute("DELETE FROM paused WHERE wa_user = ?", (user,))
+
+def mark_human_reply(user: str) -> None:
+    """A colleague answered this customer from the WhatsApp Business app."""
+    user = "".join(ch for ch in str(user) if ch.isdigit())
+    if not user:
+        return
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT INTO human_takeover (wa_user, ts) VALUES (?, ?) "
+            "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts", (user, time.time()))
+    log.info("Human replied to %s from the app; bot will stay quiet for %sh",
+             user, AUTO_RESUME_HOURS)
+
+def clear_human_takeover(user: str) -> None:
+    """Hand the chat back to the bot (e.g. owner sends the resume keyword)."""
+    with closing(db()) as conn, conn:
+        conn.execute("DELETE FROM human_takeover WHERE wa_user = ?", (user,))
+
+def human_handling(user: str) -> bool:
+    """True while a colleague is dealing with this customer, so the bot keeps out.
+
+    Humans always win: once someone replies from the app the bot goes silent for
+    that chat, and only picks up again after AUTO_RESUME_HOURS of no human reply.
+    """
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+    return bool(row) and (time.time() - (row[0] or 0)) < AUTO_RESUME_HOURS * 3600
 
 # ---------------------------------------------------------------- Claude
 WELCOME_HINT = (
@@ -1022,10 +1057,17 @@ def handle_message(sender: str, text: str) -> None:
         return
     if lowered == RESUME_KEYWORD:
         set_paused(sender, False)
+        clear_human_takeover(sender)
         return
     if is_paused(sender):
         log.info("Chat with %s is paused; skipping auto-reply", sender)
         save_message(sender, "user", text)
+        return
+    if not is_owner and human_handling(sender):
+        # A colleague is already dealing with this customer in the app.
+        log.info("Human is handling %s; skipping auto-reply", sender)
+        save_message(sender, "user", text)
+        record_customer(sender)
         return
     if not is_owner:  # remember the customer; alert the owner about brand-new ones
         try:
@@ -1043,6 +1085,11 @@ def handle_image_message(sender: str, media_id: str, caption: str) -> None:
     if is_paused(sender):
         log.info("Chat with %s is paused; skipping photo auto-reply", sender)
         save_message(sender, "user", "[Customer sent a photo]")
+        return
+    if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP) and human_handling(sender):
+        log.info("Human is handling %s; skipping photo auto-reply", sender)
+        save_message(sender, "user", "[Customer sent a photo]")
+        record_customer(sender)
         return
     if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP):
         try:
@@ -1077,7 +1124,24 @@ async def receive(request: Request, background: BackgroundTasks):
 
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
+            field = change.get("field", "")
             value = change.get("value", {})
+            # Coexistence: the one-off sync of past conversations. Never reply to these.
+            if field == "history" or "history" in value:
+                log.info("Ignoring coexistence history sync webhook")
+                continue
+            # Coexistence: a colleague sent a message from the WhatsApp Business app.
+            # Record it so the bot stays out of that conversation, and never reply.
+            echoes = value.get("message_echoes") or value.get("smb_message_echoes") or []
+            if field == "smb_message_echoes" or echoes:
+                for echo in echoes:
+                    customer = echo.get("to") or echo.get("recipient_id") or ""
+                    if customer:
+                        mark_human_reply(customer)
+                        body = (echo.get("text") or {}).get("body", "")
+                        save_message("".join(c for c in customer if c.isdigit()),
+                                     "assistant", body or "[colleague replied in the app]")
+                continue
             for msg in value.get("messages", []):
                 msg_id = msg.get("id", "")
                 if msg_id and already_seen(msg_id):
