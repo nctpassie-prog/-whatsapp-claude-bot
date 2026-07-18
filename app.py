@@ -838,6 +838,33 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all."""
     if not VERIFY_TOKEN or token != VERIFY_TOKEN:
         return Response(status_code=403)
+    if action == "testmail":
+        # Diagnose booking email setup. Never returns the password itself.
+        cfg = {
+            "smtp_host": SMTP_HOST,
+            "smtp_port": SMTP_PORT,
+            "smtp_user_set": bool(SMTP_USER),
+            "smtp_pass_set": bool(SMTP_PASS),
+            "booking_email_to": BOOKING_EMAIL_TO or "(not set)",
+        }
+        if not (SMTP_USER and SMTP_PASS and BOOKING_EMAIL_TO):
+            return {"configured": False, "config": cfg,
+                    "hint": "Set SMTP_USER, SMTP_PASS and BOOKING_EMAIL_TO in Railway variables."}
+        msg = EmailMessage()
+        msg["Subject"] = "NCTPass bot - test email"
+        msg["From"] = SMTP_USER
+        msg["To"] = BOOKING_EMAIL_TO
+        msg.set_content("This is a test from your NCTPass WhatsApp bot. If you can read "
+                        "this, booking emails are working.")
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+                s.starttls()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+            return {"configured": True, "sent": True, "config": cfg}
+        except Exception as e:
+            return {"configured": True, "sent": False, "error": f"{type(e).__name__}: {e}",
+                    "config": cfg}
     if action == "clear":
         with closing(db()) as conn, conn:
             if date == "all":
