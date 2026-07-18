@@ -24,12 +24,10 @@ import json
 import logging
 import os
 import re
-import smtplib
 import sqlite3
 import threading
 import time
 from contextlib import closing
-from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -69,11 +67,11 @@ def reminder_lang_code(code: str) -> str:
     return code if code in REMINDER_LANGS else REMINDER_LANG
 
 # Email booking records to an inbox (e.g. onlinebookingnctpass@gmail.com). Optional:
-# if SMTP is not configured the bot simply skips the email and nothing breaks.
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")          # sending Gmail address
-SMTP_PASS = os.environ.get("SMTP_PASS", "")          # Gmail App Password (16 chars)
+# if not configured the bot simply skips the email and nothing breaks.
+# NOTE: Railway blocks outbound SMTP on Free/Trial/Hobby plans, so we send over
+# HTTPS via the Resend API instead of talking to Gmail directly.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+BOOKING_EMAIL_FROM = os.environ.get("BOOKING_EMAIL_FROM", "onboarding@resend.dev")
 BOOKING_EMAIL_TO = os.environ.get("BOOKING_EMAIL_TO", "")  # inbox to receive bookings
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
@@ -219,9 +217,27 @@ def notify_owner_booking(fields: dict) -> None:
     send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
                   "\n\nAdd to Google Calendar:\n" + cal_link)
 
+def send_email(subject: str, body: str) -> tuple[bool, str]:
+    """Send an email over HTTPS via Resend. Returns (ok, detail)."""
+    if not (RESEND_API_KEY and BOOKING_EMAIL_TO):
+        return False, "not configured"
+    try:
+        r = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={"from": BOOKING_EMAIL_FROM, "to": [BOOKING_EMAIL_TO],
+                  "subject": subject, "text": body},
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}"
+        return True, "sent"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def email_booking(fields: dict) -> None:
-    """Email a booking record to BOOKING_EMAIL_TO. No-op if SMTP isn't configured."""
-    if not (SMTP_USER and SMTP_PASS and BOOKING_EMAIL_TO):
+    """Email a booking record to BOOKING_EMAIL_TO. No-op if email isn't configured."""
+    if not (RESEND_API_KEY and BOOKING_EMAIL_TO):
         return
     car = fields.get("car", "")
     reg = fields.get("reg", "")
@@ -244,19 +260,11 @@ def email_booking(fields: dict) -> None:
         "https://calendar.google.com/calendar/render?action=TEMPLATE"
         f"&text={quote(title)}&details={quote(body_details(car, reg, need, when, name, phone))}"
     )
-    msg = EmailMessage()
-    msg["Subject"] = title or "NCTPass booking"
-    msg["From"] = SMTP_USER
-    msg["To"] = BOOKING_EMAIL_TO
-    msg.set_content(body)
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
+    ok, detail = send_email(title or "NCTPass booking", body)
+    if ok:
         log.info("Booking emailed to %s", BOOKING_EMAIL_TO)
-    except Exception:
-        log.exception("Failed to email booking")
+    else:
+        log.warning("Failed to email booking: %s", detail)
 
 def body_details(car, reg, need, when, name, phone) -> str:
     return (f"Car: {car}\nReg: {reg}\nNeed: {need}\nPreferred: {when}\n"
@@ -841,30 +849,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "testmail":
         # Diagnose booking email setup. Never returns the password itself.
         cfg = {
-            "smtp_host": SMTP_HOST,
-            "smtp_port": SMTP_PORT,
-            "smtp_user_set": bool(SMTP_USER),
-            "smtp_pass_set": bool(SMTP_PASS),
+            "resend_api_key_set": bool(RESEND_API_KEY),
+            "booking_email_from": BOOKING_EMAIL_FROM,
             "booking_email_to": BOOKING_EMAIL_TO or "(not set)",
         }
-        if not (SMTP_USER and SMTP_PASS and BOOKING_EMAIL_TO):
+        if not (RESEND_API_KEY and BOOKING_EMAIL_TO):
             return {"configured": False, "config": cfg,
-                    "hint": "Set SMTP_USER, SMTP_PASS and BOOKING_EMAIL_TO in Railway variables."}
-        msg = EmailMessage()
-        msg["Subject"] = "NCTPass bot - test email"
-        msg["From"] = SMTP_USER
-        msg["To"] = BOOKING_EMAIL_TO
-        msg.set_content("This is a test from your NCTPass WhatsApp bot. If you can read "
-                        "this, booking emails are working.")
-        try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-                s.starttls()
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
-            return {"configured": True, "sent": True, "config": cfg}
-        except Exception as e:
-            return {"configured": True, "sent": False, "error": f"{type(e).__name__}: {e}",
-                    "config": cfg}
+                    "hint": "Set RESEND_API_KEY and BOOKING_EMAIL_TO in Railway variables."}
+        ok, detail = send_email(
+            "NCTPass bot - test email",
+            "This is a test from your NCTPass WhatsApp bot. If you can read this, "
+            "booking emails are working.")
+        return {"configured": True, "sent": ok, "detail": detail, "config": cfg}
     if action == "clear":
         with closing(db()) as conn, conn:
             if date == "all":
