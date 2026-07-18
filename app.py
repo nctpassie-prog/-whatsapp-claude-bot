@@ -24,10 +24,12 @@ import json
 import logging
 import os
 import re
+import smtplib
 import sqlite3
 import threading
 import time
 from contextlib import closing
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -65,6 +67,14 @@ REMINDER_LANGS = {"en", "ru", "lt", "ro"}
 def reminder_lang_code(code: str) -> str:
     code = (code or "").strip().lower()[:2]
     return code if code in REMINDER_LANGS else REMINDER_LANG
+
+# Email booking records to an inbox (e.g. onlinebookingnctpass@gmail.com). Optional:
+# if SMTP is not configured the bot simply skips the email and nothing breaks.
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")          # sending Gmail address
+SMTP_PASS = os.environ.get("SMTP_PASS", "")          # Gmail App Password (16 chars)
+BOOKING_EMAIL_TO = os.environ.get("BOOKING_EMAIL_TO", "")  # inbox to receive bookings
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -208,6 +218,49 @@ def notify_owner_booking(fields: dict) -> None:
     )
     send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
                   "\n\nAdd to Google Calendar:\n" + cal_link)
+
+def email_booking(fields: dict) -> None:
+    """Email a booking record to BOOKING_EMAIL_TO. No-op if SMTP isn't configured."""
+    if not (SMTP_USER and SMTP_PASS and BOOKING_EMAIL_TO):
+        return
+    car = fields.get("car", "")
+    reg = fields.get("reg", "")
+    need = fields.get("need", "")
+    when = fields.get("time", "")
+    date = fields.get("date", "")
+    name = fields.get("name", "")
+    phone = fields.get("phone", "")
+    title = f"NCTPass booking: {car} {reg}".strip()
+    body = (
+        "New booking taken by the WhatsApp bot:\n\n"
+        f"Car:       {car}\n"
+        f"Reg:       {reg}\n"
+        f"Need:      {need}\n"
+        f"Preferred: {when}\n"
+        f"Date:      {date}\n"
+        f"Name:      {name}\n"
+        f"Phone:     {phone}\n\n"
+        "Add to Google Calendar:\n"
+        "https://calendar.google.com/calendar/render?action=TEMPLATE"
+        f"&text={quote(title)}&details={quote(body_details(car, reg, need, when, name, phone))}"
+    )
+    msg = EmailMessage()
+    msg["Subject"] = title or "NCTPass booking"
+    msg["From"] = SMTP_USER
+    msg["To"] = BOOKING_EMAIL_TO
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        log.info("Booking emailed to %s", BOOKING_EMAIL_TO)
+    except Exception:
+        log.exception("Failed to email booking")
+
+def body_details(car, reg, need, when, name, phone) -> str:
+    return (f"Car: {car}\nReg: {reg}\nNeed: {need}\nPreferred: {when}\n"
+            f"Name: {name}\nPhone: {phone}")
 
 FEEDBACK_RE = re.compile(r"<<<FEEDBACK\|(.*?)>>>", re.DOTALL)
 
@@ -548,6 +601,10 @@ def _finish_reply(user: str, answer: str) -> str:
             notify_owner_booking(booking)
         except Exception:
             log.exception("Failed to notify owner of booking")
+        try:
+            email_booking(booking)
+        except Exception:
+            log.exception("Failed to email booking")
     answer, feedback = process_feedback(answer)
     if feedback:
         try:
