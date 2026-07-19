@@ -125,6 +125,14 @@ Headlight repair (specialist)
 - Headlight removal: from €75
 - Full headlight jobs: from €400
 
+## What we do NOT do
+If a customer asks for any of these, say politely and clearly that it is not something we
+do, so they don't waste time waiting. Do not invent a recommendation or name another
+garage. Then offer what we CAN help with (service, NCT prep, repairs) if it's relevant.
+- Wheel refurbishment / alloy wheel repair or refinishing — we do NOT do this.
+- Electric vehicles (Teslas and other EVs) — we do NOT work on electric cars. Our remaps
+  and engine work are for diesel and petrol engines only.
+
 ## Guarantee
 - All repairs backed by a 12-month parts and labour guarantee
 

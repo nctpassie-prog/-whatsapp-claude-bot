@@ -1289,6 +1289,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "SELECT question, reported, ts FROM unknowns ORDER BY id DESC LIMIT 100"
             ).fetchall()
         return {"unanswered": [{"question": q, "reported": bool(r)} for q, r, _ in rows]}
+    if action == "gapsdone":
+        # Mark logged questions as dealt with (answers added to the knowledge base).
+        with closing(db()) as conn, conn:
+            n = conn.execute("UPDATE unknowns SET reported = 1 WHERE reported = 0").rowcount
+        return {"marked_done": n}
     if action == "clearchat":
         # Delete one conversation (and its customer record) - e.g. to remove a test chat.
         if not date:
