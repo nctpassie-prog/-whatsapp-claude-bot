@@ -456,6 +456,9 @@ def db() -> sqlite3.Connection:
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
     )
+    # Simple key/value settings that must survive restarts (e.g. the master off switch).
+    conn.execute("CREATE TABLE IF NOT EXISTS settings ("
+                 " key TEXT PRIMARY KEY, value TEXT)")
     # Questions the bot could not answer — the weekly "what I didn't know" report.
     conn.execute("CREATE TABLE IF NOT EXISTS unknowns ("
                  " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -643,6 +646,20 @@ def set_paused(user: str, paused: bool) -> None:
             conn.execute("INSERT OR IGNORE INTO paused (wa_user) VALUES (?)", (user,))
         else:
             conn.execute("DELETE FROM paused WHERE wa_user = ?", (user,))
+
+def get_setting(key: str, default: str = "") -> str:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+def set_setting(key: str, value: str) -> None:
+    with closing(db()) as conn, conn:
+        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+def bot_enabled() -> bool:
+    """Master switch. Owner can text 'bot off' to silence it everywhere, instantly."""
+    return get_setting("bot_enabled", "1") != "0"
 
 def conversation_excerpt(user: str, limit: int = 6) -> str:
     """The last few messages of a chat, short enough to read on a phone."""
@@ -1282,6 +1299,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             "This is a test from your NCTPass WhatsApp bot. If you can read this, "
             "booking emails are working.")
         return {"configured": True, "sent": ok, "detail": detail, "config": cfg}
+    if action in ("botoff", "boton"):
+        set_setting("bot_enabled", "0" if action == "botoff" else "1")
+        log.warning("Bot %s via admin endpoint", "DISABLED" if action == "botoff" else "ENABLED")
+        return {"bot_enabled": bot_enabled()}
     if action == "gaps":
         # Questions the bot couldn't answer (the weekly report, on demand).
         with closing(db()) as conn:
@@ -1328,6 +1349,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         used = dict(by_date).get(iso, 0)
         days.append({"date": iso, "day": d.strftime("%a"), "used": used, "capacity": day_capacity(d)})
     return {
+        "bot_enabled": bot_enabled(),
         "today": today.isoformat(),
         "total_bookings": total_bookings,
         "total_customers": total_customers,
@@ -1363,6 +1385,32 @@ def handle_message(sender: str, text: str) -> None:
         return
     if is_owner and lowered.lstrip("#/ ") in ("customers", "customer"):
         send_whatsapp(sender, customers_list())
+        return
+    # Master off switch — owner only, takes effect immediately.
+    if is_owner and lowered.lstrip("#/ ").replace("-", " ") in (
+            "bot off", "stop bot", "off"):
+        set_setting("bot_enabled", "0")
+        send_whatsapp(sender, "🛑 Bot is now OFF. It will not reply to any customer. "
+                              "Your staff can carry on as normal in WhatsApp. "
+                              "Send 'bot on' to switch it back on.")
+        log.warning("Bot DISABLED by owner")
+        return
+    if is_owner and lowered.lstrip("#/ ").replace("-", " ") in (
+            "bot on", "start bot", "on"):
+        set_setting("bot_enabled", "1")
+        send_whatsapp(sender, "✅ Bot is back ON and answering customers again.")
+        log.warning("Bot ENABLED by owner")
+        return
+    if is_owner and lowered.lstrip("#/ ") in ("bot", "status", "bot status"):
+        send_whatsapp(sender, "Bot is currently " +
+                      ("✅ ON (answering customers)" if bot_enabled()
+                       else "🛑 OFF (silent — send 'bot on' to resume)"))
+        return
+    if not is_owner and not bot_enabled():
+        # Master switch is off: record everything, reply to nobody.
+        log.info("Bot is OFF; recording message from %s without replying", sender)
+        save_message(sender, "user", text)
+        record_customer(sender)
         return
     if lowered == PAUSE_KEYWORD:
         set_paused(sender, True)
@@ -1402,6 +1450,11 @@ def handle_image_message(sender: str, media_id: str, caption: str) -> None:
     if is_paused(sender):
         log.info("Chat with %s is paused; skipping photo auto-reply", sender)
         save_message(sender, "user", "[Customer sent a photo]")
+        return
+    if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP) and not bot_enabled():
+        log.info("Bot is OFF; recording photo from %s without replying", sender)
+        save_message(sender, "user", "[Customer sent a photo]")
+        record_customer(sender)
         return
     if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP) and human_handling(sender):
         log.info("Human is handling %s; skipping photo auto-reply", sender)
