@@ -88,6 +88,14 @@ Engine / remaps / diagnostics
 - Lane assist repair: from €50
 
 Brakes
+- Brake brands we fit — the customer can choose, and the brand affects the price:
+  * Brembo (Italy)
+  * Bosch (Germany)
+  * Apec (UK)
+  * Jurid (Germany)
+  When quoting any brake job, say the price is "from €X + VAT" and mention we can fit
+  Brembo, Bosch, Apec or Jurid depending on their budget — that is what changes the
+  final figure. Never quote a fixed price without knowing the car and the brand.
 - Brake line repair: from €100
 - Front brake pads + labour: from €100
 - Rear brake pads + labour: from €100
