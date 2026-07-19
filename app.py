@@ -172,6 +172,19 @@ def load_blocklist() -> set[str]:
             numbers.add(digits)
     return numbers
 
+def is_group_chat(identifier: str) -> bool:
+    """True if this looks like a WhatsApp GROUP rather than one person.
+
+    The bot must never answer in groups (staff groups, supplier groups, family
+    chats). Meta's Cloud API does not deliver group messages anyway, so this is a
+    belt-and-braces guard. Group ids look like '120363042...-1612345678@g.us',
+    never a plain phone number.
+    """
+    s = str(identifier or "")
+    if "@g.us" in s or "-" in s or ":" in s:
+        return True
+    return len(re.sub(r"\D", "", s)) > 16  # real numbers are at most 15 digits
+
 def is_blocked(sender: str) -> bool:
     digits = "".join(ch for ch in sender if ch.isdigit())
     return bool(digits) and digits in load_blocklist()
@@ -1330,6 +1343,9 @@ async def receive(request: Request, background: BackgroundTasks):
             if field == "smb_message_echoes" or echoes:
                 for echo in echoes:
                     customer = echo.get("to") or echo.get("recipient_id") or ""
+                    if customer and is_group_chat(customer):
+                        log.info("Ignoring group echo")
+                        continue
                     if customer:
                         mark_human_reply(customer)
                         body = (echo.get("text") or {}).get("body", "")
@@ -1341,6 +1357,11 @@ async def receive(request: Request, background: BackgroundTasks):
                 if msg_id and already_seen(msg_id):
                     continue  # Meta retries webhooks; don't answer twice
                 sender = msg.get("from", "")
+                # Never answer in group chats (staff/supplier/family groups).
+                if is_group_chat(sender) or msg.get("group_id") or \
+                        is_group_chat((msg.get("context") or {}).get("group_id", "")):
+                    log.info("Ignoring group message from %s", sender)
+                    continue
                 mtype = msg.get("type")
                 if mtype == "text":
                     text = msg.get("text", {}).get("body", "")
