@@ -51,6 +51,15 @@ How to use these prices:
 Servicing
 - Engine service (fully synthetic oil + oil & air filter, supplied & fitted):
   from €140 (petrol), from €200 (diesel), up to €240 for larger engines
+- Oil brands we use — all premium, quality brands. The customer can choose:
+  * Shell (Netherlands / UK)
+  * Mobil (USA)
+  * Castrol (UK)
+  * Liqui Moly (Germany)
+  When a customer asks about a service, mention we use quality oil brands and that they
+  can choose (Shell, Mobil, Castrol or Liqui Moly). Explain the brand and the oil spec
+  their engine needs can affect the final price, and that we confirm it in the quote.
+  We always use fully synthetic oil to the correct specification for the engine.
 
 Air conditioning
 - AC re-gas: from €120
