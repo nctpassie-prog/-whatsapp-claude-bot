@@ -64,6 +64,9 @@ MANAGER_WHATSAPP = "".join(ch for ch in os.environ.get("MANAGER_WHATSAPP", "") i
 # Ping the owner every time a brand-new number messages? Off by default: it is noise
 # once the bot is busy, and drowns out the alerts that actually matter.
 NEW_CUSTOMER_ALERT = os.environ.get("NEW_CUSTOMER_ALERT", "0") == "1"
+# Weekly "what I couldn't answer" report: Monday=0 … Sunday=6, and the hour (local).
+GAP_REPORT_WEEKDAY = int(os.environ.get("GAP_REPORT_WEEKDAY", "0"))  # Monday
+GAP_REPORT_HOUR = int(os.environ.get("GAP_REPORT_HOUR", "9"))        # 9am Irish time
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -320,6 +323,31 @@ def body_details(car, reg, need, when, name, phone) -> str:
     return (f"Car: {car}\nReg: {reg}\nNeed: {need}\nPreferred: {when}\n"
             f"Name: {name}\nPhone: {phone}")
 
+UNKNOWN_RE = re.compile(r"<<<UNKNOWN\|(.*?)>>>", re.DOTALL)
+
+def process_unknown(answer: str):
+    """Pull the hidden 'I didn't know this' marker out of the reply."""
+    m = UNKNOWN_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = UNKNOWN_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    return clean, fields
+
+def save_unknown(user: str, fields: dict) -> None:
+    """Record a question we couldn't answer, for the weekly gap report."""
+    question = " ".join((fields.get("question") or "").split())[:300]
+    if not question:
+        return
+    with closing(db()) as conn, conn:
+        conn.execute("INSERT INTO unknowns (wa_user, question, ts) VALUES (?, ?, ?)",
+                     (user, question, time.time()))
+    log.info("Logged unanswered question from %s: %s", user, question)
+
 CHARGE_RE = re.compile(r"<<<CHARGE\|(.*?)>>>", re.DOTALL)
 
 def process_charge(answer: str):
@@ -428,6 +456,10 @@ def db() -> sqlite3.Connection:
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
     )
+    # Questions the bot could not answer — the weekly "what I didn't know" report.
+    conn.execute("CREATE TABLE IF NOT EXISTS unknowns ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 " wa_user TEXT, question TEXT, ts REAL, reported INTEGER DEFAULT 0)")
     # When we last warned the owner about a chat, so we don't spam them.
     conn.execute("CREATE TABLE IF NOT EXISTS alerts ("
                  " wa_user TEXT PRIMARY KEY, ts REAL)")
@@ -869,6 +901,12 @@ def _finish_reply(user: str, answer: str) -> str:
             email_booking(booking)
         except Exception:
             log.exception("Failed to email booking")
+    answer, unknown = process_unknown(answer)
+    if unknown:
+        try:
+            save_unknown(user, unknown)
+        except Exception:
+            log.exception("Failed to save unanswered question")
     answer, charge = process_charge(answer)
     if charge:
         try:
@@ -1079,6 +1117,43 @@ def send_due_reviews() -> None:
                 conn.execute("UPDATE bookings SET review_sent = 1 WHERE id = ?", (bid,))
             log.info("Sent review request for booking %s to %s", bid, phone)
 
+def send_weekly_gap_report() -> None:
+    """Once a week, tell the owner what customers asked that the bot couldn't answer.
+
+    These are the real knowledge gaps — found by customers, not guesswork. Each one
+    is something worth adding so the bot handles it on its own from then on.
+    """
+    if not OWNER_WHATSAPP:
+        return
+    now = now_local()
+    if now.weekday() != GAP_REPORT_WEEKDAY or now.hour != GAP_REPORT_HOUR:
+        return
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, question FROM unknowns WHERE reported = 0 ORDER BY id").fetchall()
+    if not rows:
+        return
+    seen, lines = set(), []
+    for _id, q in rows:
+        key = q.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            lines.append(f"• {q}")
+    body = (f"📋 This week the bot couldn't answer {len(seen)} question"
+            f"{'s' if len(seen) != 1 else ''}:\n\n" + "\n".join(lines[:15]))
+    if len(lines) > 15:
+        body += f"\n\n…and {len(lines) - 15} more."
+    body += ("\n\nTell Claude the answers and the bot will handle these itself "
+             "from now on.")
+    try:
+        send_whatsapp(OWNER_WHATSAPP, body)
+    except Exception:
+        log.exception("Failed to send weekly gap report")
+        return
+    with closing(db()) as conn, conn:
+        conn.execute("UPDATE unknowns SET reported = 1 WHERE reported = 0")
+    log.info("Weekly gap report sent (%s questions)", len(seen))
+
 def reminder_loop() -> None:
     while True:
         try:
@@ -1089,6 +1164,10 @@ def reminder_loop() -> None:
             send_due_reviews()
         except Exception:
             log.exception("Review loop error")
+        try:
+            send_weekly_gap_report()
+        except Exception:
+            log.exception("Gap report error")
         time.sleep(3600)  # check hourly
 
 # ---------------------------------------------------------------- webhook
@@ -1203,6 +1282,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             "This is a test from your NCTPass WhatsApp bot. If you can read this, "
             "booking emails are working.")
         return {"configured": True, "sent": ok, "detail": detail, "config": cfg}
+    if action == "gaps":
+        # Questions the bot couldn't answer (the weekly report, on demand).
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT question, reported, ts FROM unknowns ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+        return {"unanswered": [{"question": q, "reported": bool(r)} for q, r, _ in rows]}
     if action == "clearchat":
         # Delete one conversation (and its customer record) - e.g. to remove a test chat.
         if not date:
