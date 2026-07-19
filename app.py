@@ -61,6 +61,9 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL",
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
 # Optional manager who also gets the "customer needs a human" notes.
 MANAGER_WHATSAPP = "".join(ch for ch in os.environ.get("MANAGER_WHATSAPP", "") if ch.isdigit())
+# Ping the owner every time a brand-new number messages? Off by default: it is noise
+# once the bot is busy, and drowns out the alerts that actually matter.
+NEW_CUSTOMER_ALERT = os.environ.get("NEW_CUSTOMER_ALERT", "0") == "1"
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -1292,9 +1295,9 @@ def handle_message(sender: str, text: str) -> None:
         except Exception:
             log.exception("Escalation check failed for %s", sender)
         return
-    if not is_owner:  # remember the customer; alert the owner about brand-new ones
+    if not is_owner:  # remember the customer (alerting about new ones is off by default)
         try:
-            if record_customer(sender) and OWNER_WHATSAPP:
+            if record_customer(sender) and OWNER_WHATSAPP and NEW_CUSTOMER_ALERT:
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
@@ -1316,7 +1319,7 @@ def handle_image_message(sender: str, media_id: str, caption: str) -> None:
         return
     if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP):
         try:
-            if record_customer(sender) and OWNER_WHATSAPP:
+            if record_customer(sender) and OWNER_WHATSAPP and NEW_CUSTOMER_ALERT:
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
