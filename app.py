@@ -186,8 +186,15 @@ def is_group_chat(identifier: str) -> bool:
     return len(re.sub(r"\D", "", s)) > 16  # real numbers are at most 15 digits
 
 def is_blocked(sender: str) -> bool:
+    """Match on the last 9 digits so 0861234567 and 353861234567 both work."""
     digits = "".join(ch for ch in sender if ch.isdigit())
-    return bool(digits) and digits in load_blocklist()
+    if not digits:
+        return False
+    blocked = load_blocklist()
+    if digits in blocked:
+        return True
+    tail = digits[-9:]
+    return len(tail) == 9 and any(b[-9:] == tail for b in blocked if len(b) >= 9)
 
 # ---------------------------------------------------------------- bookings
 BOOKING_RE = re.compile(r"<<<BOOKING\|(.*?)>>>", re.DOTALL)

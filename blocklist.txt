@@ -1,11 +1,18 @@
 # Blocklist — the bot will NEVER reply to any number listed here.
 # Use this for suppliers, friends and family who message the business number.
 #
-# One phone number per line, in full international format.
-# The + sign, spaces and dashes are ignored, so all of these work:
+# One phone number per line. The + sign, spaces and dashes are ignored, and
+# numbers are matched on their last 9 digits, so all of these work:
 #   +353 86 123 4567
 #   353861234567
+#   0861234567
 # Put a # after a number to add a note. Blank lines are ignored.
 #
 # Add numbers below:
 
+0892228862
+0894530816
+0873490606
+0858331394
+0872025561
+0851684332
