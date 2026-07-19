@@ -689,10 +689,10 @@ def customer_context(user: str) -> str:
             when = datetime.fromtimestamp(ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %Y") \
                 if ts else ""
             out.append(f"  * {when}: {amount} {('- ' + note) if note else ''}".rstrip())
-    out.append("IMPORTANT: never promise a price we charged before as today's price. Prices depend "
-               "on the car, its condition and the BRAND of parts chosen, so always give the current "
-               "\"from €X\" or \"around €X\" price, mention that the brand of parts affects it, and "
-               "offer the free inspection and written quote.")
+    out.append("IMPORTANT: never promise a price we charged before as today's price. Always give "
+               "the current \"from €X\" or \"around €X\" price and offer the free inspection and "
+               "written quote. Only bring up parts brands if they ask about brands/quality or ask "
+               "why the price differs.")
     return "\n".join(out)
 
 def contact_hint(user: str) -> str:
