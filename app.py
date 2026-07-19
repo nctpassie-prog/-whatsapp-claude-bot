@@ -52,6 +52,11 @@ RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
 # Coexistence: hours the bot stays quiet in a chat after a colleague replies
 # from the WhatsApp Business app (so it never talks over staff).
 AUTO_RESUME_HOURS = float(os.environ.get("AUTO_RESUME_HOURS", "24"))
+# Don't warn the owner about the same chat more often than this.
+ALERT_COOLDOWN_HOURS = float(os.environ.get("ALERT_COOLDOWN_HOURS", "6"))
+# Public base URL, used to link the owner straight to a chat.
+PUBLIC_URL = os.environ.get("PUBLIC_URL",
+                            "https://whatsapp-claude-bot-production-8b33.up.railway.app")
 # Where completed bookings are sent (owner's WhatsApp number, digits only).
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
@@ -332,18 +337,16 @@ def process_feedback(answer: str):
             fields[key.strip().lower()] = value.strip()
     return clean, fields
 
-def notify_owner_feedback(fields: dict) -> None:
+def notify_owner_feedback(fields: dict, user: str = "") -> None:
     """Alert the owner about an unhappy customer so they can put it right."""
     if not OWNER_WHATSAPP:
         return
-    send_whatsapp(
-        OWNER_WHATSAPP,
-        "⚠️ Customer feedback needs attention\n\n"
-        f"Rating: {fields.get('rating', '?')}\n"
-        f"Name: {fields.get('name', '')}\n"
-        f"Phone: {fields.get('phone', '')}\n"
-        f"Said: {fields.get('comment', '')}",
-    )
+    detail = (f"Rating: {fields.get('rating', '?')} · {fields.get('name', '')}\n"
+              f"Said: {fields.get('comment', '')}").strip()
+    if user:
+        alert_owner(user, "⚠️ Unhappy customer", detail)
+    else:
+        send_whatsapp(OWNER_WHATSAPP, "⚠️ Unhappy customer\n\n" + detail)
 
 HANDOVER_RE = re.compile(r"<<<HANDOVER\|(.*?)>>>", re.DOTALL)
 
@@ -365,12 +368,8 @@ def notify_owner_handover(number: str, fields: dict) -> None:
     if not OWNER_WHATSAPP:
         return
     number = "".join(ch for ch in str(number) if ch.isdigit())
-    send_whatsapp(
-        OWNER_WHATSAPP,
-        "🙋 A customer needs you to follow up\n\n"
-        f"From: +{number}\n"
-        f"About: {fields.get('reason', 'a question the bot could not answer')}",
-    )
+    alert_owner(number, "🙋 A customer needs you to follow up",
+                fields.get("reason", "a question the bot could not answer"))
 
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
@@ -404,6 +403,9 @@ def db() -> sqlite3.Connection:
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
     )
+    # When we last warned the owner about a chat, so we don't spam them.
+    conn.execute("CREATE TABLE IF NOT EXISTS alerts ("
+                 " wa_user TEXT PRIMARY KEY, ts REAL)")
     # What we actually charged for a job, logged by the owner after the work.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS charges ("
@@ -584,6 +586,83 @@ def set_paused(user: str, paused: bool) -> None:
             conn.execute("INSERT OR IGNORE INTO paused (wa_user) VALUES (?)", (user,))
         else:
             conn.execute("DELETE FROM paused WHERE wa_user = ?", (user,))
+
+def conversation_excerpt(user: str, limit: int = 6) -> str:
+    """The last few messages of a chat, short enough to read on a phone."""
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE wa_user = ? ORDER BY id DESC LIMIT ?",
+            (user, limit)).fetchall()
+    lines = []
+    for role, content in reversed(rows):
+        who = "Us" if role == "assistant" else "Customer"
+        text = " ".join((content or "").split())
+        if len(text) > 160:
+            text = text[:157] + "..."
+        if text:
+            lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+def alert_owner(user: str, headline: str, reason: str = "") -> None:
+    """Send the owner a short alert plus the tail of the conversation."""
+    if not OWNER_WHATSAPP:
+        return
+    parts = [headline, f"From: +{user}"]
+    if reason:
+        parts.append(f"What's wrong: {reason}")
+    excerpt = conversation_excerpt(user)
+    if excerpt:
+        parts.append("\n--- conversation ---\n" + excerpt)
+    parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={VERIFY_TOKEN}&user={user}")
+    send_whatsapp(OWNER_WHATSAPP, "\n".join(parts))
+    with closing(db()) as conn, conn:
+        conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
+                     "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
+                     (user, time.time()))
+
+def alerted_recently(user: str) -> bool:
+    """True if we already warned the owner about this chat lately."""
+    with closing(db()) as conn:
+        row = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    return bool(row) and (time.time() - (row[0] or 0)) < ALERT_COOLDOWN_HOURS * 3600
+
+ESCALATION_SYSTEM = (
+    "You are quietly monitoring a WhatsApp conversation between a car garage and a "
+    "customer. Decide whether the garage OWNER should be alerted right now. Alert only if "
+    "the customer is clearly unhappy, angry, complaining, disputing a price or the work, "
+    "threatening to leave a bad review or go elsewhere, or if there is an argument or "
+    "tense situation between the customer and our staff. Do NOT alert for normal "
+    "questions, bookings, or mild impatience. Answer with EXACTLY one line: either 'NO' "
+    "or 'YES: <reason, max 12 words>'."
+)
+
+def check_escalation(user: str) -> None:
+    """Watch a chat a colleague is handling and warn the owner if it turns sour."""
+    if not OWNER_WHATSAPP or alerted_recently(user):
+        return
+    excerpt = conversation_excerpt(user, 8)
+    if not excerpt:
+        return
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": ANTHROPIC_MODEL, "max_tokens": 40,
+                  "system": ESCALATION_SYSTEM,
+                  "messages": [{"role": "user", "content": excerpt}]},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        verdict = "".join(b.get("text", "") for b in resp.json().get("content", [])).strip()
+    except Exception:
+        log.exception("Escalation check failed for %s", user)
+        return
+    if verdict.upper().startswith("YES"):
+        reason = verdict.split(":", 1)[1].strip() if ":" in verdict else ""
+        log.info("Escalation detected for %s: %s", user, reason)
+        alert_owner(user, "⚠️ Customer may be unhappy", reason)
 
 def mark_human_reply(user: str) -> None:
     """A colleague answered this customer from the WhatsApp Business app."""
@@ -767,7 +846,7 @@ def _finish_reply(user: str, answer: str) -> str:
     answer, feedback = process_feedback(answer)
     if feedback:
         try:
-            notify_owner_feedback(feedback)
+            notify_owner_feedback(feedback, user)
         except Exception:
             log.exception("Failed to notify owner of feedback")
     answer, handover = process_handover(answer)
@@ -1174,10 +1253,15 @@ def handle_message(sender: str, text: str) -> None:
         save_message(sender, "user", text)
         return
     if not is_owner and human_handling(sender):
-        # A colleague is already dealing with this customer in the app.
+        # A colleague is already dealing with this customer in the app. We stay out of
+        # the conversation, but keep watching in case it turns sour.
         log.info("Human is handling %s; skipping auto-reply", sender)
         save_message(sender, "user", text)
         record_customer(sender)
+        try:
+            check_escalation(sender)
+        except Exception:
+            log.exception("Escalation check failed for %s", sender)
         return
     if not is_owner:  # remember the customer; alert the owner about brand-new ones
         try:
