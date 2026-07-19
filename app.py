@@ -290,6 +290,33 @@ def body_details(car, reg, need, when, name, phone) -> str:
     return (f"Car: {car}\nReg: {reg}\nNeed: {need}\nPreferred: {when}\n"
             f"Name: {name}\nPhone: {phone}")
 
+CHARGE_RE = re.compile(r"<<<CHARGE\|(.*?)>>>", re.DOTALL)
+
+def process_charge(answer: str):
+    """Pull the hidden 'what we charged' marker (owner-logged) out of the reply."""
+    m = CHARGE_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = CHARGE_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    if "reg" in fields:
+        fields["reg"] = clean_reg(fields["reg"])
+    return clean, fields
+
+def save_charge(fields: dict) -> None:
+    """Record what a job actually cost, so we build a price history per car."""
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT INTO charges (reg, amount, note, ts) VALUES (?, ?, ?, ?)",
+            (clean_reg(fields.get("reg", "")), fields.get("amount", ""),
+             fields.get("note", ""), time.time()),
+        )
+    log.info("Charge logged for %s: %s", fields.get("reg", ""), fields.get("amount", ""))
+
 FEEDBACK_RE = re.compile(r"<<<FEEDBACK\|(.*?)>>>", re.DOTALL)
 
 def process_feedback(answer: str):
@@ -376,6 +403,12 @@ def db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS customers ("
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
+    )
+    # What we actually charged for a job, logged by the owner after the work.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS charges ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " reg TEXT, amount TEXT, note TEXT, ts REAL)"
     )
     return conn
 
@@ -599,7 +632,15 @@ OWNER_HINT = (
     "the hidden <<<BOOKING|...>>> line with whatever details they gave — leave any unknown "
     "fields blank, and still work out the date=YYYY-MM-DD from the day they mention. The "
     "owner may give minimal info (just car + job + day); that is fine. Count it toward "
-    "capacity like any booking."
+    "capacity like any booking.\n"
+    "The owner can also log WHAT A JOB ACTUALLY COST after the work is done, so we build a "
+    "price history per car. They will say things like \"charged 180 for 16D11223\", "
+    "\"16D11223 brakes 240 + vat\" or \"Avensis service came to 155\". When they do, reply "
+    "briefly (e.g. 'Logged ✅ €180 for 16D11223') and add ONE final hidden line at the very "
+    "end, in EXACTLY this format (never show it):\n"
+    "<<<CHARGE|reg=REGISTRATION|amount=AMOUNT|note=WHAT THE WORK WAS>>>\n"
+    "Write the reg with no spaces or dashes. Put the amount as they said it (e.g. \"€180 + VAT\"). "
+    "Only output this line when the owner is telling you what a job cost — never for a booking."
 )
 
 def customer_context(user: str) -> str:
@@ -615,6 +656,10 @@ def customer_context(user: str) -> str:
         rows = conn.execute(
             "SELECT date, car, reg, need, phone FROM bookings ORDER BY date DESC LIMIT 300"
         ).fetchall()
+        reg_on_file = clean_reg(cust[1]) if cust and cust[1] else ""
+        charges = conn.execute(
+            "SELECT amount, note, ts FROM charges WHERE reg = ? ORDER BY id DESC LIMIT 5",
+            (reg_on_file,)).fetchall() if reg_on_file else []
     name = (cust[0] if cust else "") or ""
     reg = (cust[1] if cust else "") or ""
     past = []
@@ -637,8 +682,16 @@ def customer_context(user: str) -> str:
                    "refer to their car naturally, e.g. \"good to hear from you again\". Do not "
                    "recite their history at them, and do not ask again for details we already "
                    "have — confirm instead, e.g. \"still the Yaris, 12D3456?\".")
+    if charges:
+        out.append("- What we charged them before (INTERNAL ONLY — never quote these back "
+                   "as today's price):")
+        for amount, note, ts in charges:
+            when = datetime.fromtimestamp(ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %Y") \
+                if ts else ""
+            out.append(f"  * {when}: {amount} {('- ' + note) if note else ''}".rstrip())
     out.append("IMPORTANT: never promise a price we charged before as today's price. Prices depend "
-               "on the car and its condition, so always give the current \"from €X\" price and "
+               "on the car, its condition and the BRAND of parts chosen, so always give the current "
+               "\"from €X\" or \"around €X\" price, mention that the brand of parts affects it, and "
                "offer the free inspection and written quote.")
     return "\n".join(out)
 
@@ -705,6 +758,12 @@ def _finish_reply(user: str, answer: str) -> str:
             email_booking(booking)
         except Exception:
             log.exception("Failed to email booking")
+    answer, charge = process_charge(answer)
+    if charge:
+        try:
+            save_charge(charge)
+        except Exception:
+            log.exception("Failed to save charge")
     answer, feedback = process_feedback(answer)
     if feedback:
         try:
