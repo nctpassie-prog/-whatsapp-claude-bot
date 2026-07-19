@@ -60,6 +60,12 @@ Servicing
   can choose (Shell, Mobil, Castrol or Liqui Moly). Explain the brand and the oil spec
   their engine needs can affect the final price, and that we confirm it in the quote.
   We always use fully synthetic oil to the correct specification for the engine.
+- Filter brands we use on a general service — all quality original-equipment makers:
+  * MANN+HUMMEL (Germany)
+  * MAHLE (Germany)
+  * Bosch (Germany)
+  Use this to reassure customers we fit quality filters (oil and air), not cheap
+  unbranded parts. Mention it if they ask what parts we use or worry about quality.
 
 Air conditioning
 - AC re-gas: from €120
