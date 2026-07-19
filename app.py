@@ -67,6 +67,8 @@ NEW_CUSTOMER_ALERT = os.environ.get("NEW_CUSTOMER_ALERT", "0") == "1"
 # Weekly "what I couldn't answer" report: Monday=0 … Sunday=6, and the hour (local).
 GAP_REPORT_WEEKDAY = int(os.environ.get("GAP_REPORT_WEEKDAY", "0"))  # Monday
 GAP_REPORT_HOUR = int(os.environ.get("GAP_REPORT_HOUR", "9"))        # 9am Irish time
+# Don't accept bookings before this date (YYYY-MM-DD). Blank = no restriction.
+BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-07-27").strip()
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -580,6 +582,37 @@ FULL_DAY_MSG = {
           "Spuneți-mi o altă zi potrivită și rezolv eu.",
 }
 
+def bookings_open_from() -> "datetime.date | None":
+    """First date we will accept bookings for (BOOKINGS_FROM), or None for no limit."""
+    if not BOOKINGS_FROM:
+        return None
+    try:
+        return datetime.strptime(BOOKINGS_FROM, "%Y-%m-%d").date()
+    except Exception:
+        log.warning("BOOKINGS_FROM is not a valid YYYY-MM-DD date: %s", BOOKINGS_FROM)
+        return None
+
+def before_open_date(date_str: str) -> bool:
+    """True if this booking date is earlier than the day we start taking bookings."""
+    opens = bookings_open_from()
+    if not opens:
+        return False
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date() < opens
+    except Exception:
+        return False
+
+NOT_OPEN_MSG = {
+    "en": "We're taking bookings from {date} onwards. \U0001F64f Would a day from then suit? "
+          "Just tell me which day and I'll get you booked in.",
+    "ru": "Мы принимаем записи начиная с {date}. \U0001F64f Подойдёт ли вам день с этой даты? "
+          "Напишите, какой день удобен, и я вас запишу.",
+    "lt": "Registruojame nuo {date}. \U0001F64f Ar tiktų diena nuo tada? "
+          "Parašykite, kuri diena jums tinka, ir jus užregistruosiu.",
+    "ro": "Facem programări începând cu {date}. \U0001F64f V-ar conveni o zi de atunci? "
+          "Spuneți-mi ce zi vă convine și vă programez.",
+}
+
 def availability_block() -> str:
     """Real-time availability for the next 2 weeks, to inject into the prompt."""
     today = now_local().date()
@@ -589,15 +622,26 @@ def availability_block() -> str:
             (today.isoformat(),),
         ).fetchall()
     taken = {d: c for d, c in rows}
+    opens = bookings_open_from()
+    start = max(today, opens) if opens else today
     lines = []
     for i in range(14):
-        d = today + timedelta(days=i)
+        d = start + timedelta(days=i)
         cap = day_capacity(d)
         if cap == 0:
             continue  # closed Sundays
         left = max(0, cap - taken.get(d.isoformat(), 0))
         lines.append(f"{d.strftime('%a %d %b')}: " + ("FULL" if left == 0 else f"{left} slot(s) left"))
-    return (
+    opening_note = ""
+    if opens and opens > today:
+        opening_note = (
+            f"\n\nIMPORTANT — WE ARE NOT TAKING BOOKINGS BEFORE {opens.strftime('%A %d %B %Y')}. "
+            "If a customer asks for any earlier day, do NOT book it and do NOT output the booking "
+            f"marker. Politely say we're taking bookings from {opens.strftime('%A %d %B')} onwards "
+            "and offer the first available day from the list above. You can still answer their "
+            "questions and give prices as normal — only the booking date is restricted."
+        )
+    return (opening_note +
         "\n\nBOOKING AVAILABILITY — capacity is 9 jobs Mon-Fri; Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
@@ -901,6 +945,15 @@ def _finish_reply(user: str, answer: str) -> str:
     if booking:
         # Hard safety net: never confirm a booking on a day that is already full.
         # (Owner can override capacity when logging their own manual bookings.)
+        # Not open for bookings yet (owner can still log their own).
+        if not is_owner and before_open_date(booking.get("date", "")):
+            opens = bookings_open_from()
+            log.info("Booking for %s rejected: before opening date", booking.get("date"))
+            answer = NOT_OPEN_MSG.get(
+                reminder_lang_code(booking.get("lang", "")), NOT_OPEN_MSG["en"]
+            ).format(date=opens.strftime("%A %d %B") if opens else "")
+            save_message(user, "assistant", answer)
+            return answer
         if not is_owner and day_is_full(booking.get("date", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
