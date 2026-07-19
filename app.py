@@ -602,6 +602,46 @@ OWNER_HINT = (
     "capacity like any booking."
 )
 
+def customer_context(user: str) -> str:
+    """Tell Claude what we already know about a returning customer.
+
+    Pulls their name, car reg and previous bookings out of the database so the bot
+    can greet them properly instead of treating every regular as a stranger.
+    """
+    tail = user[-9:]
+    with closing(db()) as conn:
+        cust = conn.execute(
+            "SELECT name, reg FROM customers WHERE wa_number = ?", (user,)).fetchone()
+        rows = conn.execute(
+            "SELECT date, car, reg, need, phone FROM bookings ORDER BY date DESC LIMIT 300"
+        ).fetchall()
+    name = (cust[0] if cust else "") or ""
+    reg = (cust[1] if cust else "") or ""
+    past = []
+    for d, car, r, need, phone in rows:
+        pdigits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if (tail and pdigits.endswith(tail)) or (reg and r and r == reg):
+            past.append(f"{d}: {' '.join(x for x in (car, r) if x)} - {need}".strip())
+    if not (name or reg or past):
+        return ""  # brand new customer, nothing to add
+    out = ["\n\nWHAT WE ALREADY KNOW ABOUT THIS CUSTOMER (internal — use it naturally, "
+           "never read it back as a list):"]
+    if name:
+        out.append(f"- Name: {name}")
+    if reg:
+        out.append(f"- Car reg on file: {reg}")
+    if past:
+        out.append("- Previous bookings with us:")
+        out += [f"  * {p}" for p in past[:6]]
+        out.append("This is a RETURNING customer: greet them warmly (by name if you have it) and "
+                   "refer to their car naturally, e.g. \"good to hear from you again\". Do not "
+                   "recite their history at them, and do not ask again for details we already "
+                   "have — confirm instead, e.g. \"still the Yaris, 12D3456?\".")
+    out.append("IMPORTANT: never promise a price we charged before as today's price. Prices depend "
+               "on the car and its condition, so always give the current \"from €X\" price and "
+               "offer the free inspection and written quote.")
+    return "\n".join(out)
+
 def contact_hint(user: str) -> str:
     return (
         f"\n\nThe customer is messaging from WhatsApp number +{user}. Use THIS as their "
@@ -687,7 +727,7 @@ def ask_claude(user: str, text: str) -> str:
     if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
         system_prompt += OWNER_HINT
     else:
-        system_prompt += contact_hint(user)
+        system_prompt += contact_hint(user) + customer_context(user)
         if len(messages) <= 1:  # first message we've ever seen from this customer
             system_prompt += WELCOME_HINT
     return _finish_reply(user, _call_claude(messages, system_prompt))
@@ -696,7 +736,8 @@ def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
     note = (caption or "").strip()
     save_message(user, "user", ("[Customer sent a photo] " + note).strip())
     history = get_history(user)
-    system_prompt = load_system_prompt() + availability_block() + contact_hint(user)
+    system_prompt = (load_system_prompt() + availability_block() + contact_hint(user)
+                     + customer_context(user))
     if len(history) <= 1:
         system_prompt += WELCOME_HINT
     prompt_text = note or (
