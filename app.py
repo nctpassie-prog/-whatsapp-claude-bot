@@ -59,6 +59,8 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL",
                             "https://whatsapp-claude-bot-production-8b33.up.railway.app")
 # Where completed bookings are sent (owner's WhatsApp number, digits only).
 OWNER_WHATSAPP = "".join(ch for ch in os.environ.get("OWNER_WHATSAPP", "") if ch.isdigit())
+# Optional manager who also gets the "customer needs a human" notes.
+MANAGER_WHATSAPP = "".join(ch for ch in os.environ.get("MANAGER_WHATSAPP", "") if ch.isdigit())
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -624,8 +626,10 @@ def conversation_excerpt(user: str, limit: int = 6) -> str:
     return "\n".join(lines)
 
 def alert_owner(user: str, headline: str, reason: str = "") -> None:
-    """Send the owner a short alert plus the tail of the conversation."""
-    if not OWNER_WHATSAPP:
+    """Send the owner (and manager, if set) a short note plus the conversation."""
+    recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
+    recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
+    if not recipients:
         return
     parts = [headline, f"From: +{user}"]
     if reason:
@@ -634,7 +638,12 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     if excerpt:
         parts.append("\n--- conversation ---\n" + excerpt)
     parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={VERIFY_TOKEN}&user={user}")
-    send_whatsapp(OWNER_WHATSAPP, "\n".join(parts))
+    body = "\n".join(parts)
+    for number in recipients:
+        try:
+            send_whatsapp(number, body)
+        except Exception:
+            log.exception("Failed to alert %s", number)
     with closing(db()) as conn, conn:
         conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
                      "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
