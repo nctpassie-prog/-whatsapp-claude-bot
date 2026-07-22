@@ -74,6 +74,13 @@ BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-07-27").strip()
 # e.g. the owner's private line — is ignored completely. Blank = allow all.
 ALLOWED_PHONE_IDS = {p.strip() for p in
                      os.environ.get("ALLOWED_PHONE_IDS", "").split(",") if p.strip()}
+# Chakra (WhatsApp coexistence provider). When set, we send through Chakra instead of
+# talking to Meta directly — the payload format is identical to Meta's Messages API.
+CHAKRA_API_KEY = os.environ.get("CHAKRA_API_KEY", "")
+CHAKRA_PLUGIN_ID = os.environ.get("CHAKRA_PLUGIN_ID", "")
+WA_API_VERSION = os.environ.get("WA_API_VERSION", "v21.0")
+# Number to send from when we can't tell (defaults to the single allowed number).
+SEND_PHONE_ID = os.environ.get("SEND_PHONE_ID", "")
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -1059,15 +1066,31 @@ def get_media(media_id: str):
     return base64.b64encode(blob.content).decode(), mime
 
 # ---------------------------------------------------------------- WhatsApp send
+def default_send_phone_id() -> str:
+    """Which business number to send from when the caller didn't say."""
+    if SEND_PHONE_ID:
+        return SEND_PHONE_ID
+    if len(ALLOWED_PHONE_IDS) == 1:
+        return next(iter(ALLOWED_PHONE_IDS))
+    return PHONE_NUMBER_ID
+
+def send_endpoint(phone_id: str = "") -> tuple:
+    """(url, bearer token) for sending — via Chakra if configured, else Meta direct."""
+    pid = phone_id or default_send_phone_id()
+    if CHAKRA_API_KEY and CHAKRA_PLUGIN_ID:
+        return (f"https://api.chakrahq.com/v1/ext/plugin/whatsapp/{CHAKRA_PLUGIN_ID}"
+                f"/api/{WA_API_VERSION}/{pid}/messages", CHAKRA_API_KEY)
+    return (f"https://graph.facebook.com/{WA_API_VERSION}/{pid}/messages", WHATSAPP_TOKEN)
+
 def graph_url_for(phone_id: str = "") -> str:
-    """Send endpoint for a given business number (falls back to the configured one)."""
-    return f"https://graph.facebook.com/v21.0/{phone_id or PHONE_NUMBER_ID}/messages"
+    return send_endpoint(phone_id)[0]
 
 def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
+    url, token = send_endpoint(from_phone_id)
     try:
         r = httpx.post(
-            graph_url_for(from_phone_id),
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            url,
+            headers={"Authorization": f"Bearer {token}"},
             json={
                 "messaging_product": "whatsapp",
                 "to": to,
@@ -1084,8 +1107,8 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
 def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
     try:
         r = httpx.post(
-            GRAPH_URL,
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            send_endpoint()[0],
+            headers={"Authorization": f"Bearer {send_endpoint()[1]}"},
             json={
                 "messaging_product": "whatsapp",
                 "to": to,
@@ -1142,8 +1165,8 @@ def send_due_reminders() -> None:
 def _send_review_in(to: str, params: list, lang_code: str) -> bool:
     try:
         r = httpx.post(
-            GRAPH_URL,
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            send_endpoint()[0],
+            headers={"Authorization": f"Bearer {send_endpoint()[1]}"},
             json={
                 "messaging_product": "whatsapp",
                 "to": to,
