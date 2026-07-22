@@ -69,6 +69,11 @@ GAP_REPORT_WEEKDAY = int(os.environ.get("GAP_REPORT_WEEKDAY", "0"))  # Monday
 GAP_REPORT_HOUR = int(os.environ.get("GAP_REPORT_HOUR", "9"))        # 9am Irish time
 # Don't accept bookings before this date (YYYY-MM-DD). Blank = no restriction.
 BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-07-27").strip()
+# SAFETY LOCK: only answer messages that arrive on these WhatsApp numbers
+# (comma-separated phone_number_ids). Anything arriving on any other number —
+# e.g. the owner's private line — is ignored completely. Blank = allow all.
+ALLOWED_PHONE_IDS = {p.strip() for p in
+                     os.environ.get("ALLOWED_PHONE_IDS", "").split(",") if p.strip()}
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -1054,10 +1059,14 @@ def get_media(media_id: str):
     return base64.b64encode(blob.content).decode(), mime
 
 # ---------------------------------------------------------------- WhatsApp send
-def send_whatsapp(to: str, text: str) -> None:
+def graph_url_for(phone_id: str = "") -> str:
+    """Send endpoint for a given business number (falls back to the configured one)."""
+    return f"https://graph.facebook.com/v21.0/{phone_id or PHONE_NUMBER_ID}/messages"
+
+def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
     try:
         r = httpx.post(
-            GRAPH_URL,
+            graph_url_for(from_phone_id),
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             json={
                 "messaging_product": "whatsapp",
@@ -1549,6 +1558,12 @@ async def receive(request: Request, background: BackgroundTasks):
         for change in entry.get("changes", []):
             field = change.get("field", "")
             value = change.get("value", {})
+            # SAFETY LOCK: ignore anything that arrived on a number we don't serve
+            # (e.g. the owner's private line, accidentally connected).
+            arrived_on = (value.get("metadata") or {}).get("phone_number_id", "")
+            if ALLOWED_PHONE_IDS and arrived_on and arrived_on not in ALLOWED_PHONE_IDS:
+                log.info("Ignoring message on unserved number %s", arrived_on)
+                continue
             # Coexistence: the one-off sync of past conversations. Never reply to these.
             if field == "history" or "history" in value:
                 log.info("Ignoring coexistence history sync webhook")
