@@ -103,6 +103,10 @@ def reminder_lang_code(code: str) -> str:
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 BOOKING_EMAIL_FROM = os.environ.get("BOOKING_EMAIL_FROM", "onboarding@resend.dev")
 BOOKING_EMAIL_TO = os.environ.get("BOOKING_EMAIL_TO", "")  # inbox to receive bookings
+# Where owner alerts (needs-a-human, unhappy customer, new booking) are emailed.
+# Email is the RELIABLE channel: WhatsApp free-form alerts to the owner are blocked
+# outside the 24-hour window, so we always email as well. Defaults to the booking inbox.
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "")
 # Google account whose calendar booking links open in. Defaults to the booking inbox
 # so events always land on the same calendar, whoever is signed in.
 CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
@@ -285,15 +289,16 @@ def notify_owner_booking(fields: dict) -> None:
     send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
                   "\n\nAdd to Google Calendar:\n" + cal_link)
 
-def send_email(subject: str, body: str) -> tuple[bool, str]:
+def send_email(subject: str, body: str, to: str = "") -> tuple[bool, str]:
     """Send an email over HTTPS via Resend. Returns (ok, detail)."""
-    if not (RESEND_API_KEY and BOOKING_EMAIL_TO):
+    to = to or BOOKING_EMAIL_TO
+    if not (RESEND_API_KEY and to):
         return False, "not configured"
     try:
         r = httpx.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-            json={"from": BOOKING_EMAIL_FROM, "to": [BOOKING_EMAIL_TO],
+            json={"from": BOOKING_EMAIL_FROM, "to": [to],
                   "subject": subject, "text": body},
             timeout=20,
         )
@@ -747,11 +752,19 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
         parts.append("\n--- conversation ---\n" + excerpt)
     parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={VERIFY_TOKEN}&user={user}")
     body = "\n".join(parts)
+    # WhatsApp alert (best effort — may be blocked outside the 24h window).
     for number in recipients:
         try:
             send_whatsapp(number, body)
         except Exception:
             log.exception("Failed to alert %s", number)
+    # Email alert (reliable — always delivered). This is the channel the owner can rely on.
+    try:
+        ok, detail = send_email("NCTPass: " + headline, body, OWNER_EMAIL or BOOKING_EMAIL_TO)
+        if not ok:
+            log.warning("Owner alert email failed: %s", detail)
+    except Exception:
+        log.exception("Failed to email owner alert")
     with closing(db()) as conn, conn:
         conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
                      "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
@@ -1086,6 +1099,9 @@ def graph_url_for(phone_id: str = "") -> str:
     return send_endpoint(phone_id)[0]
 
 def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
+    if not (text and text.strip()):
+        log.info("Skipping empty message to %s", to)
+        return
     url, token = send_endpoint(from_phone_id)
     try:
         r = httpx.post(
