@@ -1530,6 +1530,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         set_setting("bot_enabled", "0" if action == "botoff" else "1")
         log.warning("Bot %s via admin endpoint", "DISABLED" if action == "botoff" else "ENABLED")
         return {"bot_enabled": bot_enabled()}
+    if action == "followuptest":
+        # Preview the follow-up the bot WOULD send to a customer (does not send).
+        num = "".join(ch for ch in date if ch.isdigit())
+        if not num:
+            return {"error": "provide date=<wa_number>"}
+        text = _make_followup(num)
+        return {"user": num, "would_send": bool(text), "text": text or "(SKIP - no follow-up)"}
     if action == "gaps":
         # Questions the bot couldn't answer (the weekly report, on demand).
         with closing(db()) as conn:
