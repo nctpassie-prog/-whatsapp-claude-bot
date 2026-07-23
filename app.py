@@ -115,6 +115,11 @@ ALERT_TEMPLATE_ENABLED = os.environ.get("ALERT_TEMPLATE_ENABLED", "0") == "1"
 # Phone numbers that get WhatsApp alerts (comma-separated). Defaults to the owner.
 ALERT_NUMBERS = [d for d in ("".join(c for c in n if c.isdigit())
                  for n in os.environ.get("ALERT_NUMBERS", "").split(",")) if d]
+# Follow up a customer who went quiet after our last reply (one gentle check-in,
+# only inside WhatsApp's 24h window, daytime only).
+FOLLOWUP_ENABLED = os.environ.get("FOLLOWUP_ENABLED", "1") == "1"
+FOLLOWUP_AFTER_HOURS = float(os.environ.get("FOLLOWUP_AFTER_HOURS", "3"))
+FOLLOWUP_WINDOW_HOURS = float(os.environ.get("FOLLOWUP_WINDOW_HOURS", "23"))
 # Google account whose calendar booking links open in. Defaults to the booking inbox
 # so events always land on the same calendar, whoever is signed in.
 CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
@@ -461,6 +466,9 @@ def db() -> sqlite3.Connection:
     )
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
+    # Gentle follow-up to customers who went quiet after our last reply.
+    conn.execute("CREATE TABLE IF NOT EXISTS followups ("
+                 " wa_user TEXT PRIMARY KEY, inbound_ts REAL)")
     # Coexistence: when a human answers from the WhatsApp Business app we record it
     # here so the bot stays quiet for that customer and never talks over staff.
     conn.execute("CREATE TABLE IF NOT EXISTS human_takeover ("
@@ -1310,8 +1318,88 @@ def send_weekly_gap_report() -> None:
         conn.execute("UPDATE unknowns SET reported = 1 WHERE reported = 0")
     log.info("Weekly gap report sent (%s questions)", len(seen))
 
+FOLLOWUP_SYSTEM = (
+    "You are the NCTPass car garage's WhatsApp assistant. The customer sent a message, you "
+    "replied, and they have now gone quiet without answering. Write ONE short, warm, "
+    "no-pressure follow-up in the SAME LANGUAGE as the conversation — gently checking if they "
+    "still need help, have any questions, or would like to book in. One friendly sentence only; "
+    "do not repeat prices or long details, and never output any hidden markers.\n"
+    "BUT if a follow-up would be inappropriate — e.g. your last message already told them a "
+    "colleague/human will get back to them, they are already booked in, or the conversation had "
+    "clearly ended — reply with EXACTLY the single word SKIP and nothing else."
+)
+
+def _make_followup(user: str) -> str:
+    history = get_history(user)
+    if not history:
+        return ""
+    messages = history + [{"role": "user", "content":
+                           "(Internal: the customer has gone quiet. Write the follow-up now.)"}]
+    raw = _call_claude(messages, FOLLOWUP_SYSTEM) or ""
+    text = re.sub(r"<<<.*?>>>", "", raw).strip()
+    if not text or text.strip().upper().startswith("SKIP"):
+        return ""
+    return text
+
+def _maybe_followup(user: str, nowts: float) -> None:
+    if is_blocked(user) or (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
+        return
+    if not bot_enabled() or is_paused(user) or human_handling(user):
+        return
+    with closing(db()) as conn:
+        last = conn.execute("SELECT role, ts FROM messages WHERE wa_user = ? "
+                            "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        last_in = conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                               "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        done = conn.execute("SELECT inbound_ts FROM followups WHERE wa_user = ?",
+                            (user,)).fetchone()
+    if not last or last[0] != "assistant":
+        return  # it's already the customer's turn, or no history
+    if nowts - last[1] < FOLLOWUP_AFTER_HOURS * 3600:
+        return  # not quiet long enough yet
+    if not last_in or nowts - last_in[0] > FOLLOWUP_WINDOW_HOURS * 3600:
+        return  # outside WhatsApp's 24h window — a free-form nudge would be blocked
+    if done and abs((done[0] or 0) - last_in[0]) < 1:
+        return  # already followed up for this message
+    text = _make_followup(user)
+    if not text:
+        # Claude judged a follow-up inappropriate; remember so we don't re-check endlessly.
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO followups (wa_user, inbound_ts) VALUES (?, ?) "
+                         "ON CONFLICT(wa_user) DO UPDATE SET inbound_ts = excluded.inbound_ts",
+                         (user, last_in[0]))
+        return
+    send_whatsapp(user, text)
+    save_message(user, "assistant", text)
+    with closing(db()) as conn, conn:
+        conn.execute("INSERT INTO followups (wa_user, inbound_ts) VALUES (?, ?) "
+                     "ON CONFLICT(wa_user) DO UPDATE SET inbound_ts = excluded.inbound_ts",
+                     (user, last_in[0]))
+    log.info("Sent follow-up to %s", user)
+
+def send_due_followups() -> None:
+    if not FOLLOWUP_ENABLED:
+        return
+    now = now_local()
+    if not (9 <= now.hour < 20):
+        return  # daytime only
+    nowts = time.time()
+    with closing(db()) as conn:
+        users = [r[0] for r in conn.execute(
+            "SELECT DISTINCT wa_user FROM messages WHERE ts > ?",
+            (nowts - 2 * 86400,)).fetchall()]
+    for user in users:
+        try:
+            _maybe_followup(user, nowts)
+        except Exception:
+            log.exception("Follow-up failed for %s", user)
+
 def reminder_loop() -> None:
     while True:
+        try:
+            send_due_followups()
+        except Exception:
+            log.exception("Follow-up loop error")
         try:
             send_due_reminders()
         except Exception:
