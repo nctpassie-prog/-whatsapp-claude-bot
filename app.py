@@ -1319,14 +1319,19 @@ def send_weekly_gap_report() -> None:
     log.info("Weekly gap report sent (%s questions)", len(seen))
 
 FOLLOWUP_SYSTEM = (
-    "You are the NCTPass car garage's WhatsApp assistant. The customer sent a message, you "
-    "replied, and they have now gone quiet without answering. Write ONE short, warm, "
-    "no-pressure follow-up in the SAME LANGUAGE as the conversation — gently checking if they "
-    "still need help, have any questions, or would like to book in. One friendly sentence only; "
-    "do not repeat prices or long details, and never output any hidden markers.\n"
-    "BUT if a follow-up would be inappropriate — e.g. your last message already told them a "
-    "colleague/human will get back to them, they are already booked in, or the conversation had "
-    "clearly ended — reply with EXACTLY the single word SKIP and nothing else."
+    "You are the NCTPass car garage's WhatsApp assistant. The customer messaged, you replied, "
+    "and they have gone quiet.\n"
+    "FIRST decide if a follow-up is even appropriate. Reply with EXACTLY the single word SKIP "
+    "(nothing else) if ANY of these are true:\n"
+    "- your last message said a colleague/human/manager/team would get back to them, or that "
+    "you'd check with someone;\n"
+    "- the customer asked something we were unsure about or could not answer;\n"
+    "- they are already booked in, or the conversation had clearly ended (e.g. they said thanks/bye).\n"
+    "Otherwise, write ONE short, warm, no-pressure follow-up in the SAME LANGUAGE as the "
+    "conversation. Keep it a GENERIC gentle check-in — ask only whether they still need help, "
+    "have any questions, or would like to book in. Do NOT offer, promise or mention any specific "
+    "service, repair or price, and NEVER imply we can do something we didn't already confirm we "
+    "do. One friendly sentence, no hidden markers."
 )
 
 def _make_followup(user: str) -> str:
@@ -1334,7 +1339,8 @@ def _make_followup(user: str) -> str:
     if not history:
         return ""
     messages = history + [{"role": "user", "content":
-                           "(Internal: the customer has gone quiet. Write the follow-up now.)"}]
+                           "(Internal: the customer has gone quiet. Decide per your rules — "
+                           "reply SKIP if a follow-up is not appropriate, otherwise write it.)"}]
     raw = _call_claude(messages, FOLLOWUP_SYSTEM) or ""
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
     if not text or text.strip().upper().startswith("SKIP"):
