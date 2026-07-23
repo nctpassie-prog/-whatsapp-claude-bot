@@ -118,6 +118,13 @@ Electrical / sensors
 - Tyre pressure sensor: from €50 plus fit from €40
 - NCT check + headlight alignment: from €40
 
+Headlight beam stickers (for German / EU imports)
+- We do NOT sell or stock the headlight beam-deflection stickers.
+- The customer buys their own stickers (e.g. from Halfords), brings them in, and we
+  fit them and do the headlight/lighting alignment. Treat it as a small fitting +
+  alignment job with the usual free inspection and written quote. Just invite them to
+  pop in with their stickers.
+
 Headlight repair (specialist)
 - Headlight lens including cleaning & re-sealing: from €250 per light
 - DRL chips: from €75
