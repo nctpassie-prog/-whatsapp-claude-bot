@@ -1542,10 +1542,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         log.warning("Bot %s via admin endpoint", "DISABLED" if action == "botoff" else "ENABLED")
         return {"bot_enabled": bot_enabled()}
     if action == "followuptest":
-        # Preview the follow-up the bot WOULD send to a customer (does not send).
+        # Preview whether/what the bot WOULD follow up (does not send).
         num = "".join(ch for ch in date if ch.isdigit())
         if not num:
             return {"error": "provide date=<wa_number>"}
+        with closing(db()) as conn:
+            alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (num,)).fetchone()
+        gated = bool(alerted and time.time() - (alerted[0] or 0) < 24 * 3600)
+        if gated:
+            return {"user": num, "would_send": False,
+                    "text": "(SKIP - a human was already alerted about this chat)"}
         text = _make_followup(num)
         return {"user": num, "would_send": bool(text), "text": text or "(SKIP - no follow-up)"}
     if action == "gaps":
