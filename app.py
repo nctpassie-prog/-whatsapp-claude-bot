@@ -107,6 +107,14 @@ BOOKING_EMAIL_TO = os.environ.get("BOOKING_EMAIL_TO", "")  # inbox to receive bo
 # Email is the RELIABLE channel: WhatsApp free-form alerts to the owner are blocked
 # outside the 24-hour window, so we always email as well. Defaults to the booking inbox.
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "")
+# WhatsApp alert TEMPLATE — the only way to reliably message the owner's phone outside
+# the 24h window. Sends a one-line ping; full detail is in the email. Needs Meta approval.
+ALERT_TEMPLATE = os.environ.get("ALERT_TEMPLATE", "owner_alert")
+ALERT_TEMPLATE_LANG = os.environ.get("ALERT_TEMPLATE_LANG", "en")
+ALERT_TEMPLATE_ENABLED = os.environ.get("ALERT_TEMPLATE_ENABLED", "0") == "1"
+# Phone numbers that get WhatsApp alerts (comma-separated). Defaults to the owner.
+ALERT_NUMBERS = [d for d in ("".join(c for c in n if c.isdigit())
+                 for n in os.environ.get("ALERT_NUMBERS", "").split(",")) if d]
 # Google account whose calendar booking links open in. Defaults to the booking inbox
 # so events always land on the same calendar, whoever is signed in.
 CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
@@ -738,6 +746,27 @@ def conversation_excerpt(user: str, limit: int = 6) -> str:
             lines.append(f"{who}: {text}")
     return "\n".join(lines)
 
+def send_alert_template(to: str, one_liner: str) -> None:
+    """Send the approved owner-alert template (reliable, no 24h window)."""
+    url, token = send_endpoint()
+    r = httpx.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": ALERT_TEMPLATE,
+                "language": {"code": ALERT_TEMPLATE_LANG},
+                "components": [{"type": "body",
+                                "parameters": [{"type": "text", "text": one_liner}]}],
+            },
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+
 def alert_owner(user: str, headline: str, reason: str = "") -> None:
     """Send the owner (and manager, if set) a short note plus the conversation."""
     recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
@@ -752,8 +781,17 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
         parts.append("\n--- conversation ---\n" + excerpt)
     parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={VERIFY_TOKEN}&user={user}")
     body = "\n".join(parts)
-    # WhatsApp alert (best effort — may be blocked outside the 24h window).
-    for number in recipients:
+    alert_targets = list(dict.fromkeys(
+        [n for n in recipients] + ALERT_NUMBERS))  # owner/manager + any extra alert numbers
+    one_liner = f"{headline} — from +{user}" + (f" ({reason})" if reason else "")
+    for number in alert_targets:
+        # Reliable WhatsApp ping via approved template (works outside the 24h window).
+        if ALERT_TEMPLATE_ENABLED:
+            try:
+                send_alert_template(number, one_liner[:300])
+            except Exception:
+                log.exception("Failed to send alert template to %s", number)
+        # Also try a full free-form message (arrives if a 24h window is open).
         try:
             send_whatsapp(number, body)
         except Exception:
