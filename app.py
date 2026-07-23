@@ -1359,6 +1359,11 @@ def _maybe_followup(user: str, nowts: float) -> None:
                                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         done = conn.execute("SELECT inbound_ts FROM followups WHERE wa_user = ?",
                             (user,)).fetchone()
+    # If a human has been alerted about this chat recently, leave it to them — don't nudge.
+    with closing(db()) as conn:
+        alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    if alerted and nowts - (alerted[0] or 0) < 24 * 3600:
+        return
     if not last or last[0] != "assistant":
         return  # it's already the customer's turn, or no history
     if nowts - last[1] < FOLLOWUP_AFTER_HOURS * 3600:
