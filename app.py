@@ -18,6 +18,7 @@ Optional:
 """
 
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
@@ -1125,8 +1126,14 @@ def get_media(media_id: str):
     return base64.b64encode(blob.content).decode(), mime
 
 # ---------------------------------------------------------------- WhatsApp send
+# The business number the message we're currently handling arrived on — so replies go
+# back out on the SAME number when several numbers share one bot.
+_ctx_phone_id: "contextvars.ContextVar[str]" = contextvars.ContextVar("phone_id", default="")
+
 def default_send_phone_id() -> str:
     """Which business number to send from when the caller didn't say."""
+    if _ctx_phone_id.get():
+        return _ctx_phone_id.get()
     if SEND_PHONE_ID:
         return SEND_PHONE_ID
     if len(ALLOWED_PHONE_IDS) == 1:
@@ -1625,7 +1632,9 @@ def valid_signature(body: bytes, signature: str) -> bool:
     expected = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
-def handle_message(sender: str, text: str) -> None:
+def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
+    if arrived_on:
+        _ctx_phone_id.set(arrived_on)  # reply from the number it came in on
     if is_blocked(sender):
         log.info("Sender %s is on the blocklist; not replying", sender)
         return
@@ -1695,7 +1704,9 @@ def handle_message(sender: str, text: str) -> None:
     answer = ask_claude(sender, text)
     send_whatsapp(sender, answer)
 
-def handle_image_message(sender: str, media_id: str, caption: str) -> None:
+def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: str = "") -> None:
+    if arrived_on:
+        _ctx_phone_id.set(arrived_on)
     if is_blocked(sender):
         log.info("Sender %s is on the blocklist; not replying", sender)
         return
@@ -1787,12 +1798,13 @@ async def receive(request: Request, background: BackgroundTasks):
                 if mtype == "text":
                     text = msg.get("text", {}).get("body", "")
                     if sender and text:
-                        background.add_task(handle_message, sender, text)
+                        background.add_task(handle_message, sender, text, arrived_on)
                 elif mtype == "image":
                     media_id = msg.get("image", {}).get("id", "")
                     caption = msg.get("image", {}).get("caption", "")
                     if sender and media_id:
-                        background.add_task(handle_image_message, sender, media_id, caption)
+                        background.add_task(handle_image_message, sender, media_id,
+                                            caption, arrived_on)
                 else:
                     text = (
                         "[Customer sent a non-text message "
@@ -1800,5 +1812,5 @@ async def receive(request: Request, background: BackgroundTasks):
                         "and a colleague will check the attachment.]"
                     )
                     if sender:
-                        background.add_task(handle_message, sender, text)
+                        background.add_task(handle_message, sender, text, arrived_on)
     return {"status": "ok"}
