@@ -381,6 +381,21 @@ def save_unknown(user: str, fields: dict) -> None:
                      (user, question, time.time()))
     log.info("Logged unanswered question from %s: %s", user, question)
 
+CUSTOMER_RE = re.compile(r"<<<CUSTOMER\|(.*?)>>>", re.DOTALL)
+
+def process_customer(answer: str):
+    """Pull the hidden contact-details marker (name/reg learned) out of the reply."""
+    m = CUSTOMER_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = CUSTOMER_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    return clean, fields
+
 CHARGE_RE = re.compile(r"<<<CHARGE\|(.*?)>>>", re.DOTALL)
 
 def process_charge(answer: str):
@@ -1043,6 +1058,12 @@ def _finish_reply(user: str, answer: str) -> str:
             email_booking(booking)
         except Exception:
             log.exception("Failed to email booking")
+    answer, customer = process_customer(answer)
+    if customer and not is_owner:
+        try:
+            record_customer(user, customer.get("name", ""), customer.get("reg", ""))
+        except Exception:
+            log.exception("Failed to save customer contact")
     answer, unknown = process_unknown(answer)
     if unknown:
         try:
