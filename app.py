@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Query, Request, Response
+from fastapi.responses import RedirectResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -124,6 +125,14 @@ FOLLOWUP_WINDOW_HOURS = float(os.environ.get("FOLLOWUP_WINDOW_HOURS", "23"))
 # Google account whose calendar booking links open in. Defaults to the booking inbox
 # so events always land on the same calendar, whoever is signed in.
 CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
+# Google Contacts (People API) auto-save. The owner sets these two after creating an
+# OAuth client in Google Cloud, then authorises once via /google/connect. The refresh
+# token is stored in the settings table (survives restarts). All optional — if unset,
+# contact saving simply no-ops and nothing else is affected.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
+GOOGLE_REDIRECT_PATH = "/google/callback"
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -507,6 +516,12 @@ def db() -> sqlite3.Connection:
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
     )
+    # Stores the Google Contacts resource id once a customer is pushed there, so we
+    # update the same contact instead of creating duplicates.
+    try:
+        conn.execute("ALTER TABLE customers ADD COLUMN google_resource TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # Simple key/value settings that must survive restarts (e.g. the master off switch).
     conn.execute("CREATE TABLE IF NOT EXISTS settings ("
                  " key TEXT PRIMARY KEY, value TEXT)")
@@ -533,6 +548,7 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
     now = time.time()
     name = (name or "").strip()
     reg = clean_reg(reg)
+    brand_new = False
     with closing(db()) as conn, conn:
         row = conn.execute("SELECT name, reg FROM customers WHERE wa_number = ?", (number,)).fetchone()
         if row is None:
@@ -540,12 +556,98 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
                 "INSERT INTO customers (wa_number, name, reg, first_ts, last_ts) VALUES (?,?,?,?,?)",
                 (number, name, reg, now, now),
             )
-            return True
-        conn.execute(
-            "UPDATE customers SET name = ?, reg = ?, last_ts = ? WHERE wa_number = ?",
-            (name or row[0], reg or row[1], now, number),
-        )
-        return False
+            brand_new = True
+        else:
+            conn.execute(
+                "UPDATE customers SET name = ?, reg = ?, last_ts = ? WHERE wa_number = ?",
+                (name or row[0], reg or row[1], now, number),
+            )
+    # When we actually learned a name or reg, push it to Google Contacts in the
+    # background so it never slows down the customer reply (and never breaks it if
+    # Google is down or not set up yet).
+    if name or reg:
+        threading.Thread(target=sync_google_contact, args=(number,), daemon=True).start()
+    return brand_new
+
+# ---------------------------------------------------------------- Google Contacts
+def google_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and get_setting("google_refresh_token"))
+
+def _google_access_token() -> str:
+    """Swap the stored long-lived refresh token for a short-lived access token."""
+    refresh = get_setting("google_refresh_token")
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and refresh):
+        return ""
+    r = httpx.post("https://oauth2.googleapis.com/token", data={
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh,
+        "grant_type": "refresh_token",
+    }, timeout=20)
+    r.raise_for_status()
+    return r.json().get("access_token", "")
+
+def _google_person_body(name: str, reg: str, number: str) -> dict:
+    """Build the People API contact body. Shows in WhatsApp as e.g. 'John (11D2547)'."""
+    given = (name or "").strip()
+    family = f"({reg})" if reg else ""
+    if not given:  # no name yet — lead with the reg so it's still recognisable
+        given = reg or ("+" + number)
+        family = ""
+    return {
+        "names": [{"givenName": given, "familyName": family}],
+        "phoneNumbers": [{"value": "+" + number, "type": "mobile"}],
+        "biographies": [{"value": f"NCTPass customer. Reg: {reg or '-'}",
+                         "contentType": "TEXT_PLAIN"}],
+    }
+
+def sync_google_contact(number: str) -> None:
+    """Create or update this customer in Google Contacts. Safe to call anytime; no-ops
+    if Google isn't connected. Runs in a background thread — never blocks a reply."""
+    if not google_enabled():
+        return
+    number = "".join(ch for ch in str(number) if ch.isdigit())
+    if not number:
+        return
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT name, reg, google_resource FROM customers WHERE wa_number = ?",
+            (number,)).fetchone()
+    if not row:
+        return
+    name, reg, resource = (row[0] or ""), (row[1] or ""), (row[2] or "")
+    if not (name or reg):
+        return
+    try:
+        token = _google_access_token()
+        if not token:
+            return
+        headers = {"Authorization": f"Bearer {token}"}
+        body = _google_person_body(name, reg, number)
+        if resource:  # update the contact we already created (needs a fresh etag)
+            g = httpx.get(f"https://people.googleapis.com/v1/{resource}",
+                          params={"personFields": "metadata"}, headers=headers, timeout=20)
+            if g.status_code == 200:
+                body["etag"] = g.json().get("etag")
+                u = httpx.patch(
+                    f"https://people.googleapis.com/v1/{resource}:updateContact",
+                    params={"updatePersonFields": "names,phoneNumbers,biographies"},
+                    headers=headers, json=body, timeout=20)
+                if u.status_code < 300:
+                    return
+            resource = ""  # contact was deleted upstream — recreate it below
+        c = httpx.post("https://people.googleapis.com/v1/people:createContact",
+                       headers=headers, json=body, timeout=20)
+        if c.status_code < 300:
+            rn = c.json().get("resourceName", "")
+            if rn:
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE customers SET google_resource = ? WHERE wa_number = ?",
+                                 (rn, number))
+        else:
+            log.warning("Google createContact failed %s: %s", c.status_code, c.text[:200])
+    except Exception:
+        log.exception("Google Contacts sync failed for %s", number)
 
 def customers_list(limit: int = 20) -> str:
     with closing(db()) as conn:
@@ -1545,6 +1647,60 @@ def chats(token: str = Query(""), user: str = Query("")):
                 f'<body>{body}</body></html>')
     return Response(content=html_doc, media_type="text/html")
 
+@app.get("/google/connect")
+def google_connect(token: str = Query("")):
+    """Owner visits this once to authorise Google Contacts. Redirects to Google's
+    consent screen; Google then calls /google/callback with the code."""
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return Response(status_code=403)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return Response("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Railway first.",
+                        status_code=400)
+    redirect_uri = PUBLIC_URL.rstrip("/") + GOOGLE_REDIRECT_PATH
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={quote(GOOGLE_CLIENT_ID)}"
+        f"&redirect_uri={quote(redirect_uri)}"
+        "&response_type=code"
+        f"&scope={quote(GOOGLE_SCOPE)}"
+        "&access_type=offline&prompt=consent"
+        f"&state={quote(VERIFY_TOKEN)}"
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/google/callback")
+def google_callback(code: str = Query(""), state: str = Query(""), error: str = Query("")):
+    """Google redirects here after the owner clicks Allow. We swap the code for a
+    long-lived refresh token and store it, so contact-saving works from then on."""
+    if state != VERIFY_TOKEN:
+        return Response("Bad state — please start again from /google/connect.", status_code=403)
+    if error:
+        return Response(f"Google returned: {error}", status_code=400)
+    if not code:
+        return Response("No code returned by Google.", status_code=400)
+    redirect_uri = PUBLIC_URL.rstrip("/") + GOOGLE_REDIRECT_PATH
+    try:
+        r = httpx.post("https://oauth2.googleapis.com/token", data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }, timeout=20)
+        data = r.json()
+    except Exception:
+        log.exception("Google token exchange failed")
+        return Response("Could not reach Google. Please try again.", status_code=502)
+    refresh = data.get("refresh_token", "")
+    if not refresh:
+        return Response(
+            "Connected, but Google did not return a refresh token. Remove NCTPass at "
+            "myaccount.google.com/permissions, then open /google/connect again.",
+            status_code=400)
+    set_setting("google_refresh_token", refresh)
+    return Response("✅ Google Contacts is connected. You can close this page — new "
+                    "customers will now be saved automatically.")
+
 @app.get("/admin")
 def admin(token: str = Query(""), action: str = Query("status"), date: str = Query("")):
     """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all."""
@@ -1590,6 +1746,24 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"count": len(rows),
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
                               for n, nm, rg in rows]}
+    if action == "gstatus":
+        # Is Google Contacts connected? (never returns the token itself)
+        return {"google_client_id_set": bool(GOOGLE_CLIENT_ID),
+                "google_client_secret_set": bool(GOOGLE_CLIENT_SECRET),
+                "authorised": bool(get_setting("google_refresh_token")),
+                "ready": google_enabled(),
+                "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "gsyncall":
+        # Push every existing customer who has a name or reg into Google Contacts.
+        if not google_enabled():
+            return {"error": "Google not connected yet. Open /google/connect first."}
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_number FROM customers WHERE TRIM(name) <> '' OR TRIM(reg) <> ''"
+            ).fetchall()
+        for (num,) in rows:
+            sync_google_contact(num)
+        return {"synced": len(rows), "note": "Pushed to Google Contacts (may take a moment)."}
     if action == "gaps":
         # Questions the bot couldn't answer (the weekly report, on demand).
         with closing(db()) as conn:
