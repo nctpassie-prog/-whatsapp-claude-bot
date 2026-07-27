@@ -1561,6 +1561,14 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "text": "(SKIP - a human was already alerted about this chat)"}
         text = _make_followup(num)
         return {"user": num, "would_send": bool(text), "text": text or "(SKIP - no follow-up)"}
+    if action == "customers":
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_number, name, reg FROM customers ORDER BY last_ts DESC LIMIT 100"
+            ).fetchall()
+        return {"count": len(rows),
+                "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
+                              for n, nm, rg in rows]}
     if action == "gaps":
         # Questions the bot couldn't answer (the weekly report, on demand).
         with closing(db()) as conn:
