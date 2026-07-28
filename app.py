@@ -488,14 +488,16 @@ def process_feedback(answer: str):
 
 def notify_owner_feedback(fields: dict, user: str = "") -> None:
     """Alert the owner about an unhappy customer so they can put it right."""
-    if not OWNER_WHATSAPP:
-        return
     detail = (f"Rating: {fields.get('rating', '?')} · {fields.get('name', '')}\n"
               f"Said: {fields.get('comment', '')}").strip()
     if user:
         alert_owner(user, "⚠️ Unhappy customer", detail)
-    else:
-        send_whatsapp(OWNER_WHATSAPP, "⚠️ Unhappy customer\n\n" + detail)
+        return
+    # No chat to attach — still push it out on the channels that work.
+    note = "⚠️ Unhappy customer\n\n" + detail
+    send_telegram(note)
+    if OWNER_WHATSAPP:
+        send_whatsapp(OWNER_WHATSAPP, note)
 
 HANDOVER_RE = re.compile(r"<<<HANDOVER\|(.*?)>>>", re.DOTALL)
 
@@ -514,8 +516,6 @@ def process_handover(answer: str):
 
 def notify_owner_handover(number: str, fields: dict) -> None:
     """Ping the owner when the bot defers something to a human, so they can follow up."""
-    if not OWNER_WHATSAPP:
-        return
     number = "".join(ch for ch in str(number) if ch.isdigit())
     alert_owner(number, "🙋 A customer needs you to follow up",
                 fields.get("reason", "a question the bot could not answer"))
@@ -955,8 +955,8 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     """Send the owner (and manager, if set) a short note plus the conversation."""
     recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
-    if not recipients:
-        return
+    # No early return when there are no WhatsApp recipients — Telegram and email
+    # below are the channels that actually reach the owner.
     parts = [headline, f"From: +{user}"]
     if reason:
         parts.append(f"What's wrong: {reason}")
