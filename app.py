@@ -881,6 +881,16 @@ def conversation_excerpt(user: str, limit: int = 6) -> str:
 
 def send_alert_template(to: str, one_liner: str) -> None:
     """Send the approved owner-alert template (reliable, no 24h window)."""
+    status, body = _post_alert_template(to, one_liner)
+    if status >= 300 or '"error"' in body:
+        raise RuntimeError(f"template send to {to} returned {status}: {body[:300]}")
+
+def _post_alert_template(to: str, one_liner: str) -> tuple:
+    """Do the template POST and hand back (status, body) so failures are visible.
+
+    A 200 from Chakra does not guarantee WhatsApp accepted it — the real verdict is
+    in the body, so we always log it rather than trusting the status code alone.
+    """
     url, token = send_endpoint()
     r = httpx.post(
         url,
@@ -898,7 +908,9 @@ def send_alert_template(to: str, one_liner: str) -> None:
         },
         timeout=30,
     )
-    r.raise_for_status()
+    body = (r.text or "")[:500]
+    log.info("Alert template -> %s: HTTP %s %s", to, r.status_code, body)
+    return r.status_code, body
 
 def alert_owner(user: str, headline: str, reason: str = "") -> None:
     """Send the owner (and manager, if set) a short note plus the conversation."""
@@ -1336,6 +1348,10 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
             },
             timeout=30,
         )
+        # Chakra can answer 200 while WhatsApp still refuses the message (most often
+        # the 24-hour window), so log the body — the status alone hides the failure.
+        if r.status_code >= 300 or '"error"' in (r.text or ""):
+            log.warning("WhatsApp send to %s: HTTP %s %s", to, r.status_code, (r.text or "")[:400])
         r.raise_for_status()
     except Exception:
         log.exception("Failed to send WhatsApp message to %s", to)
@@ -1791,6 +1807,27 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"count": len(rows),
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
                               for n, nm, rg in rows]}
+    if action == "testalert":
+        # Fire a real alert at the owner's phone and report exactly what WhatsApp said.
+        target = date or OWNER_WHATSAPP  # reuse ?date= to pass a number, e.g. 353858182839
+        out = {"to": target, "template_enabled": ALERT_TEMPLATE_ENABLED,
+               "template_name": ALERT_TEMPLATE, "send_url": send_endpoint()[0]}
+        try:
+            status, body = _post_alert_template(target, "This is a test alert from your bot.")
+            out["template_result"] = {"http": status, "body": body}
+        except Exception as exc:
+            out["template_result"] = {"error": str(exc)[:300]}
+        try:
+            url, tok = send_endpoint()
+            r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
+                           json={"messaging_product": "whatsapp", "to": target,
+                                 "type": "text",
+                                 "text": {"body": "Test alert (free-form) from your bot."}},
+                           timeout=30)
+            out["freeform_result"] = {"http": r.status_code, "body": (r.text or "")[:500]}
+        except Exception as exc:
+            out["freeform_result"] = {"error": str(exc)[:300]}
+        return out
     if action == "gstatus":
         # Is Google Contacts connected? (never returns the token itself)
         return {"google_client_id_set": bool(GOOGLE_CLIENT_ID),
