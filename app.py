@@ -1857,6 +1857,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         if not TELEGRAM_BOT_TOKEN:
             return {"error": "Set TELEGRAM_BOT_TOKEN in Railway first."}
         try:
+            me = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe",
+                           timeout=20).json().get("result", {})
+            bot_user = me.get("username", "")
             r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                           timeout=20)
             found = []
@@ -1867,9 +1870,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                   "name": chat.get("first_name") or chat.get("title") or "",
                                   "username": chat.get("username", "")})
             uniq = {str(f["chat_id"]): f for f in found}
-            return {"chats": list(uniq.values()),
+            return {"bot_name": me.get("first_name", ""),
+                    "bot_username": bot_user,
+                    "open_this_link": f"https://t.me/{bot_user}" if bot_user else "",
+                    "chats": list(uniq.values()),
                     "hint": "Put chat_id into TELEGRAM_CHAT_IDS in Railway."
-                            if uniq else "Send your bot a message in Telegram, then reload."}
+                            if uniq else "Open the link above, tap START, send any message."}
         except Exception as exc:
             return {"error": str(exc)[:300]}
     if action == "tgtest":
