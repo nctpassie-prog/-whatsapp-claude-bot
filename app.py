@@ -753,6 +753,13 @@ def before_open_date(date_str: str) -> bool:
     except Exception:
         return False
 
+# Last-resort line when the bot produced no visible answer at all. Deliberately
+# neutral: promises nothing, quotes nothing, and hands over to a person.
+BLANK_REPLY_FALLBACK = (
+    "Thanks for your message! \U0001F64f Let me check that with a colleague "
+    "and we'll come straight back to you."
+)
+
 NOT_OPEN_MSG = {
     "en": "We're taking bookings from {date} onwards. \U0001F64f Would a day from then suit? "
           "Just tell me which day and I'll get you booked in.",
@@ -1190,6 +1197,18 @@ def _finish_reply(user: str, answer: str) -> str:
             notify_owner_handover(user, handover)
         except Exception:
             log.exception("Failed to notify owner of handover")
+    # Safety net: if the visible reply came out blank (e.g. Claude returned only a
+    # hidden marker), never leave the customer in silence. Send a neutral holding
+    # line and tell the owner so a human can pick it up.
+    if not answer.strip():
+        log.warning("Blank reply for %s after marker processing — sending fallback", user)
+        answer = BLANK_REPLY_FALLBACK
+        if not is_owner:
+            try:
+                alert_owner(user, "A customer message needs a human reply",
+                            "The bot could not produce an answer and sent a holding message.")
+            except Exception:
+                log.exception("Failed to alert owner about blank reply")
     save_message(user, "assistant", answer)
     return answer
 
