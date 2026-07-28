@@ -327,15 +327,21 @@ def notify_owner_booking(fields: dict) -> None:
     else:
         log.info("Booking captured but OWNER_WHATSAPP not set; skipped WhatsApp note")
 
+def telegram_chat_ids() -> list:
+    """Everyone who gets Telegram alerts: the Railway setting plus any phones added
+    later via ?action=tgadd (stored in the DB, so no redeploy is needed)."""
+    extra = [c.strip() for c in (get_setting("telegram_chat_ids") or "").split(",") if c.strip()]
+    return list(dict.fromkeys(TELEGRAM_CHAT_IDS + extra))
+
 def telegram_enabled() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS)
+    return bool(TELEGRAM_BOT_TOKEN and telegram_chat_ids())
 
 def send_telegram(text: str) -> None:
     """Push an alert to the owner's Telegram. Never raises — alerting must not be
     able to break a customer reply."""
     if not telegram_enabled():
         return
-    for chat_id in TELEGRAM_CHAT_IDS:
+    for chat_id in telegram_chat_ids():
         try:
             r = httpx.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -1878,12 +1884,29 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                             if uniq else "Open the link above, tap START, send any message."}
         except Exception as exc:
             return {"error": str(exc)[:300]}
+    if action == "tgadd":
+        # Add another phone to the Telegram alert list (?action=tgadd&date=<chat_id>).
+        new_id = "".join(ch for ch in date if ch.isdigit() or ch == "-")
+        if not new_id:
+            return {"error": "Pass the chat id, e.g. ?action=tgadd&date=1001948448"}
+        current = [c.strip() for c in (get_setting("telegram_chat_ids") or "").split(",")
+                   if c.strip()]
+        if new_id not in current and new_id not in TELEGRAM_CHAT_IDS:
+            current.append(new_id)
+            set_setting("telegram_chat_ids", ",".join(current))
+        return {"added": new_id, "now_alerting": telegram_chat_ids()}
+    if action == "tgremove":
+        drop = "".join(ch for ch in date if ch.isdigit() or ch == "-")
+        current = [c.strip() for c in (get_setting("telegram_chat_ids") or "").split(",")
+                   if c.strip() and c.strip() != drop]
+        set_setting("telegram_chat_ids", ",".join(current))
+        return {"removed": drop, "now_alerting": telegram_chat_ids()}
     if action == "tgtest":
         if not telegram_enabled():
-            return {"error": "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in Railway first.",
-                    "token_set": bool(TELEGRAM_BOT_TOKEN), "chat_ids": TELEGRAM_CHAT_IDS}
+            return {"error": "Set TELEGRAM_BOT_TOKEN in Railway and add a chat id first.",
+                    "token_set": bool(TELEGRAM_BOT_TOKEN), "chat_ids": telegram_chat_ids()}
         send_telegram("✅ Test alert from your NCTPass bot. Alerts are working.")
-        return {"sent_to": TELEGRAM_CHAT_IDS}
+        return {"sent_to": telegram_chat_ids()}
     if action == "delivery":
         # What WhatsApp told us about our recent outgoing messages.
         return {"count": len(RECENT_STATUSES), "statuses": list(RECENT_STATUSES)[-40:]}
