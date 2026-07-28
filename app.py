@@ -134,6 +134,11 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
 GOOGLE_REDIRECT_PATH = "/google/callback"
+# Telegram alerts to the owner. Free, instant, and not subject to WhatsApp's 24-hour
+# window or per-message charges — so this is the reliable phone channel for alerts.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_IDS = [c for c in (x.strip() for x in
+                     os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")) if c]
 
 # Last delivery receipts from WhatsApp, so ?action=delivery can show whether an
 # alert actually landed without digging through the platform logs.
@@ -294,10 +299,7 @@ def calendar_link(title: str, details: str, date_str: str = "") -> str:
     return url
 
 def notify_owner_booking(fields: dict) -> None:
-    """Send the owner a booking summary on WhatsApp with a Google Calendar link."""
-    if not OWNER_WHATSAPP:
-        log.info("Booking captured but OWNER_WHATSAPP not set; not notifying owner")
-        return
+    """Send the owner a booking summary (Telegram + WhatsApp) with a calendar link."""
     car = fields.get("car", "")
     reg = fields.get("reg", "")
     need = fields.get("need", "")
@@ -314,8 +316,40 @@ def notify_owner_booking(fields: dict) -> None:
     )
     title = f"NCTPass booking: {car} {reg}".strip()
     cal_link = calendar_link(title, summary, fields.get("date", ""))
-    send_whatsapp(OWNER_WHATSAPP, "\U0001F514 New booking request\n\n" + summary +
-                  "\n\nAdd to Google Calendar:\n" + cal_link)
+    note = ("\U0001F514 New booking request\n\n" + summary +
+            "\n\nAdd to Google Calendar:\n" + cal_link)
+    try:
+        send_telegram(note)
+    except Exception:
+        log.exception("Failed to send Telegram booking note")
+    if OWNER_WHATSAPP:
+        send_whatsapp(OWNER_WHATSAPP, note)
+    else:
+        log.info("Booking captured but OWNER_WHATSAPP not set; skipped WhatsApp note")
+
+def telegram_enabled() -> bool:
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS)
+
+def send_telegram(text: str) -> None:
+    """Push an alert to the owner's Telegram. Never raises — alerting must not be
+    able to break a customer reply."""
+    if not telegram_enabled():
+        return
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            r = httpx.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": (text or "")[:4000],
+                      "disable_web_page_preview": True},
+                timeout=20,
+            )
+            if r.status_code >= 300:
+                log.warning("Telegram send to %s: HTTP %s %s",
+                            chat_id, r.status_code, (r.text or "")[:300])
+            else:
+                log.info("Telegram alert delivered to %s", chat_id)
+        except Exception:
+            log.exception("Failed to send Telegram alert to %s", chat_id)
 
 def send_email(subject: str, body: str, to: str = "") -> tuple[bool, str]:
     """Send an email over HTTPS via Resend. Returns (ok, detail)."""
@@ -946,6 +980,11 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
             send_whatsapp(number, body)
         except Exception:
             log.exception("Failed to alert %s", number)
+    # Telegram alert — free, instant, no 24h window. The primary phone channel.
+    try:
+        send_telegram("\U0001F514 " + body)
+    except Exception:
+        log.exception("Failed to send Telegram owner alert")
     # Email alert (reliable — always delivered). This is the channel the owner can rely on.
     try:
         ok, detail = send_email("NCTPass: " + headline, body, OWNER_EMAIL or BOOKING_EMAIL_TO)
@@ -1812,6 +1851,33 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"count": len(rows),
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
                               for n, nm, rg in rows]}
+    if action == "tgchat":
+        # After the owner messages their new Telegram bot, this shows the chat id(s)
+        # to put in TELEGRAM_CHAT_IDS. Never returns the bot token.
+        if not TELEGRAM_BOT_TOKEN:
+            return {"error": "Set TELEGRAM_BOT_TOKEN in Railway first."}
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          timeout=20)
+            found = []
+            for upd in r.json().get("result", []):
+                chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
+                if chat.get("id") is not None:
+                    found.append({"chat_id": chat.get("id"),
+                                  "name": chat.get("first_name") or chat.get("title") or "",
+                                  "username": chat.get("username", "")})
+            uniq = {str(f["chat_id"]): f for f in found}
+            return {"chats": list(uniq.values()),
+                    "hint": "Put chat_id into TELEGRAM_CHAT_IDS in Railway."
+                            if uniq else "Send your bot a message in Telegram, then reload."}
+        except Exception as exc:
+            return {"error": str(exc)[:300]}
+    if action == "tgtest":
+        if not telegram_enabled():
+            return {"error": "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in Railway first.",
+                    "token_set": bool(TELEGRAM_BOT_TOKEN), "chat_ids": TELEGRAM_CHAT_IDS}
+        send_telegram("✅ Test alert from your NCTPass bot. Alerts are working.")
+        return {"sent_to": TELEGRAM_CHAT_IDS}
     if action == "delivery":
         # What WhatsApp told us about our recent outgoing messages.
         return {"count": len(RECENT_STATUSES), "statuses": list(RECENT_STATUSES)[-40:]}
