@@ -18,6 +18,7 @@ Optional:
 """
 
 import base64
+import collections
 import contextvars
 import hashlib
 import hmac
@@ -133,6 +134,10 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
 GOOGLE_REDIRECT_PATH = "/google/callback"
+
+# Last delivery receipts from WhatsApp, so ?action=delivery can show whether an
+# alert actually landed without digging through the platform logs.
+RECENT_STATUSES: "collections.deque" = collections.deque(maxlen=60)
 
 GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
@@ -1807,6 +1812,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"count": len(rows),
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
                               for n, nm, rg in rows]}
+    if action == "delivery":
+        # What WhatsApp told us about our recent outgoing messages.
+        return {"count": len(RECENT_STATUSES), "statuses": list(RECENT_STATUSES)[-40:]}
     if action == "testalert":
         # Fire a real alert at the owner's phone and report exactly what WhatsApp said.
         target = date or OWNER_WHATSAPP  # reuse ?date= to pass a number, e.g. 353858182839
@@ -2068,6 +2076,24 @@ async def receive(request: Request, background: BackgroundTasks):
                         body = (echo.get("text") or {}).get("body", "")
                         save_message("".join(c for c in customer if c.isdigit()),
                                      "assistant", body or "[colleague replied in the app]")
+                continue
+            # Delivery receipts (sent / delivered / read / failed). Nothing to reply to,
+            # but this is the ONLY place WhatsApp explains why a message never landed,
+            # so keep the last few and log failures loudly.
+            statuses = value.get("statuses") or []
+            if statuses:
+                for st in statuses:
+                    state = st.get("status", "")
+                    errs = st.get("errors") or []
+                    entry_txt = (f"{_fmt_ts(time.time())} {state or 'unknown'} "
+                                 f"-> {st.get('recipient_id', '')}"
+                                 + (f" ERRORS: {json.dumps(errs)[:300]}" if errs else ""))
+                    RECENT_STATUSES.append(entry_txt)
+                    if state == "failed" or errs:
+                        log.warning("Delivery FAILED to %s: %s",
+                                    st.get("recipient_id", ""), json.dumps(errs)[:400])
+                    else:
+                        log.info("Delivery %s to %s", state, st.get("recipient_id", ""))
                 continue
             for msg in value.get("messages", []):
                 msg_id = msg.get("id", "")
