@@ -1134,8 +1134,33 @@ def _call_claude(messages: list, system_prompt: str) -> str:
             "A colleague will get back to you shortly."
         )
 
+ALL_MARKERS_RE = re.compile(
+    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER)\|.*?>>>", re.DOTALL)
+
+def visible_text(answer: str) -> str:
+    """What the customer would actually see once the hidden markers are removed."""
+    return ALL_MARKERS_RE.sub("", answer or "").strip()
+
+RETRY_NUDGE = (
+    "\n\nIMPORTANT: your previous attempt contained NO visible message for the customer. "
+    "Reply now with a normal, complete, friendly message in plain words. Do NOT output any "
+    "hidden <<<...>>> line this time — just the message the customer should read."
+)
+
+def _call_claude_visible(messages: list, system_prompt: str, user: str = "") -> str:
+    """Call Claude, and if the reply has no visible words (only hidden markers, or
+    nothing at all), ask once more. Stops customers getting silence or a holding line
+    when a real answer was possible."""
+    answer = _call_claude(messages, system_prompt)
+    if visible_text(answer):
+        return answer
+    log.warning("Claude returned no visible text for %s (raw=%r) — retrying once",
+                user or "?", (answer or "")[:300])
+    return _call_claude(messages, system_prompt + RETRY_NUDGE)
+
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
+    raw_answer = answer
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     if booking:
@@ -1201,7 +1226,8 @@ def _finish_reply(user: str, answer: str) -> str:
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
     if not answer.strip():
-        log.warning("Blank reply for %s after marker processing — sending fallback", user)
+        log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
+                    user, (raw_answer or "")[:300])
         answer = BLANK_REPLY_FALLBACK
         if not is_owner:
             try:
@@ -1222,7 +1248,7 @@ def ask_claude(user: str, text: str) -> str:
         system_prompt += contact_hint(user) + customer_context(user)
         if len(messages) <= 1:  # first message we've ever seen from this customer
             system_prompt += WELCOME_HINT
-    return _finish_reply(user, _call_claude(messages, system_prompt))
+    return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
 
 def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
     note = (caption or "").strip()
@@ -1246,7 +1272,7 @@ def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
             {"type": "text", "text": prompt_text},
         ],
     }]
-    return _finish_reply(user, _call_claude(messages, system_prompt))
+    return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
 
 # ---------------------------------------------------------------- WhatsApp media
 _CLAUDE_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
