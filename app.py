@@ -1996,16 +1996,27 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                            "totalItems": cj.get("totalItems")}
                 # Read back one contact we believe we created, to prove where it landed.
                 with closing(db()) as c2:
-                    got = c2.execute(
-                        "SELECT wa_number, google_resource FROM customers "
-                        "WHERE google_resource <> '' AND google_resource <> ? LIMIT 1",
-                        (GOOGLE_SKIP,)).fetchone()
+                    if date:  # ?date=<number> to inspect one specific customer
+                        got = c2.execute(
+                            "SELECT wa_number, google_resource FROM customers "
+                            "WHERE wa_number = ? AND google_resource <> ''", (date,)).fetchone()
+                    else:
+                        got = c2.execute(
+                            "SELECT wa_number, google_resource FROM customers "
+                            "WHERE google_resource <> '' AND google_resource <> ? LIMIT 1",
+                            (GOOGLE_SKIP,)).fetchone()
                 if got:
                     rb = httpx.get(f"https://people.googleapis.com/v1/{got[1]}",
                                    params={"personFields": "names,phoneNumbers"},
                                    headers=headers, timeout=20)
-                    out["readback"] = {"number": got[0], "http": rb.status_code,
-                                       "body": (rb.text or "")[:300]}
+                    rj = rb.json() if rb.status_code < 300 else {}
+                    out["readback"] = {
+                        "number": got[0], "resource": got[1], "http": rb.status_code,
+                        "saved_name": " ".join(
+                            x for x in [(rj.get("names") or [{}])[0].get("givenName", ""),
+                                        (rj.get("names") or [{}])[0].get("familyName", "")] if x),
+                        "saved_phones": [p.get("value") for p in (rj.get("phoneNumbers") or [])],
+                    }
         except Exception as exc:
             out["error"] = str(exc)[:300]
         return out
