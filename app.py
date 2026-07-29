@@ -1934,11 +1934,43 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "customers":
         with closing(db()) as conn:
             rows = conn.execute(
-                "SELECT wa_number, name, reg FROM customers ORDER BY last_ts DESC LIMIT 100"
+                "SELECT wa_number, name, reg, COALESCE(google_resource,'') "
+                "FROM customers ORDER BY last_ts DESC LIMIT 100"
             ).fetchall()
+        def gstate(res: str) -> str:
+            if res == GOOGLE_SKIP:
+                return "skipped (already in your contacts)"
+            if res:
+                return "saved to Google"
+            return "not synced"
         return {"count": len(rows),
-                "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)"}
-                              for n, nm, rg in rows]}
+                "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)",
+                               "google": gstate(gr)}
+                              for n, nm, rg, gr in rows]}
+    if action == "gtest":
+        # Prove the Google connection works end to end and show the real API replies.
+        out = {"ready": google_enabled()}
+        try:
+            token = _google_access_token()
+            out["got_access_token"] = bool(token)
+            if token:
+                headers = {"Authorization": f"Bearer {token}"}
+                me = httpx.get("https://people.googleapis.com/v1/people/me",
+                               params={"personFields": "emailAddresses"},
+                               headers=headers, timeout=20)
+                out["account"] = {"http": me.status_code, "body": (me.text or "")[:300]}
+                probe = date or "353879962929"
+                warm = httpx.get("https://people.googleapis.com/v1/people:searchContacts",
+                                 params={"query": "", "readMask": "phoneNumbers"},
+                                 headers=headers, timeout=20)
+                s = httpx.get("https://people.googleapis.com/v1/people:searchContacts",
+                              params={"query": probe[-9:], "readMask": "names,phoneNumbers"},
+                              headers=headers, timeout=20)
+                out["search"] = {"probe": probe[-9:], "warmup_http": warm.status_code,
+                                 "http": s.status_code, "body": (s.text or "")[:400]}
+        except Exception as exc:
+            out["error"] = str(exc)[:300]
+        return out
     if action == "tgchat":
         # After the owner messages their new Telegram bot, this shows the chat id(s)
         # to put in TELEGRAM_CHAT_IDS. Never returns the bot token.
