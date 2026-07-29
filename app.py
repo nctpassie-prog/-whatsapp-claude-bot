@@ -1763,6 +1763,37 @@ def chats(token: str = Query(""), user: str = Query("")):
                 f'<body>{body}</body></html>')
     return Response(content=html_doc, media_type="text/html")
 
+@app.get("/contacts.vcf")
+def contacts_vcf(token: str = Query("")):
+    """Every known customer as a vCard file, ready to import into Google Contacts.
+
+    This is the no-setup route to getting names and regs onto the phones: download,
+    then Google Contacts -> Import. Works whether or not the People API is connected.
+    """
+    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+        return Response(status_code=403)
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_number, name, reg FROM customers "
+            "WHERE TRIM(COALESCE(name,'')) <> '' OR TRIM(COALESCE(reg,'')) <> '' "
+            "ORDER BY last_ts DESC").fetchall()
+    cards = []
+    for number, name, reg in rows:
+        name = (name or "").strip()
+        reg = (reg or "").strip()
+        display = " ".join(x for x in [name or "NCTPass customer", f"({reg})" if reg else ""] if x)
+        cards.append(
+            "BEGIN:VCARD\r\nVERSION:3.0\r\n"
+            f"N:;{name or reg};;;\r\n"
+            f"FN:{display}\r\n"
+            f"TEL;TYPE=CELL:+{number}\r\n"
+            f"NOTE:NCTPass customer. Reg: {reg or '-'}\r\n"
+            "END:VCARD"
+        )
+    body = "\r\n".join(cards) + ("\r\n" if cards else "")
+    return Response(content=body, media_type="text/vcard",
+                    headers={"Content-Disposition": 'attachment; filename="nctpass-customers.vcf"'})
+
 @app.get("/google/connect")
 def google_connect(token: str = Query("")):
     """Owner visits this once to authorise Google Contacts. Redirects to Google's
