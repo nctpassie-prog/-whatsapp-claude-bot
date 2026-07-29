@@ -1968,6 +1968,28 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                               headers=headers, timeout=20)
                 out["search"] = {"probe": probe[-9:], "warmup_http": warm.status_code,
                                  "http": s.status_code, "body": (s.text or "")[:400]}
+                # How many contacts the connected account holds — tells us WHICH
+                # account we are actually writing to (a big existing book vs a fresh one).
+                conn_r = httpx.get(
+                    "https://people.googleapis.com/v1/people/me/connections",
+                    params={"pageSize": 1, "personFields": "names"},
+                    headers=headers, timeout=20)
+                cj = conn_r.json() if conn_r.status_code < 300 else {}
+                out["account_contacts"] = {"http": conn_r.status_code,
+                                           "totalPeople": cj.get("totalPeople"),
+                                           "totalItems": cj.get("totalItems")}
+                # Read back one contact we believe we created, to prove where it landed.
+                with closing(db()) as c2:
+                    got = c2.execute(
+                        "SELECT wa_number, google_resource FROM customers "
+                        "WHERE google_resource <> '' AND google_resource <> ? LIMIT 1",
+                        (GOOGLE_SKIP,)).fetchone()
+                if got:
+                    rb = httpx.get(f"https://people.googleapis.com/v1/{got[1]}",
+                                   params={"personFields": "names,phoneNumbers"},
+                                   headers=headers, timeout=20)
+                    out["readback"] = {"number": got[0], "http": rb.status_code,
+                                       "body": (rb.text or "")[:300]}
         except Exception as exc:
             out["error"] = str(exc)[:300]
         return out
