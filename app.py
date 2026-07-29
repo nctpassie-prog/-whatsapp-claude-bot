@@ -136,6 +136,9 @@ GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
 GOOGLE_REDIRECT_PATH = "/google/callback"
 # Telegram alerts to the owner. Free, instant, and not subject to WhatsApp's 24-hour
 # window or per-message charges — so this is the reliable phone channel for alerts.
+# Keep trying WhatsApp for owner alerts even when Telegram is working. Off by default
+# because Meta rejects them (no payment method on the WABA / 24h window).
+OWNER_WHATSAPP_ALERTS = os.environ.get("OWNER_WHATSAPP_ALERTS", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_IDS = [c for c in (x.strip() for x in
                      os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")) if c]
@@ -322,10 +325,8 @@ def notify_owner_booking(fields: dict) -> None:
         send_telegram(note)
     except Exception:
         log.exception("Failed to send Telegram booking note")
-    if OWNER_WHATSAPP:
+    if OWNER_WHATSAPP and (OWNER_WHATSAPP_ALERTS or not telegram_enabled()):
         send_whatsapp(OWNER_WHATSAPP, note)
-    else:
-        log.info("Booking captured but OWNER_WHATSAPP not set; skipped WhatsApp note")
 
 def telegram_chat_ids() -> list:
     """Everyone who gets Telegram alerts: the Railway setting plus any phones added
@@ -974,18 +975,22 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     alert_targets = list(dict.fromkeys(
         [n for n in recipients] + ALERT_NUMBERS))  # owner/manager + any extra alert numbers
     one_liner = f"{headline} — from +{user}" + (f" ({reason})" if reason else "")
-    for number in alert_targets:
-        # Reliable WhatsApp ping via approved template (works outside the 24h window).
-        if ALERT_TEMPLATE_ENABLED:
+    # WhatsApp owner-alerts only work if this account can actually send them. Template
+    # sends need a payment method on the WABA (error 131042) and free-form needs an
+    # open 24h window (131047), so when Telegram is carrying alerts we skip WhatsApp
+    # rather than fire calls that always fail. Set OWNER_WHATSAPP_ALERTS=1 to re-enable.
+    if OWNER_WHATSAPP_ALERTS or not telegram_enabled():
+        for number in alert_targets:
+            if ALERT_TEMPLATE_ENABLED:
+                try:
+                    send_alert_template(number, one_liner[:300])
+                except Exception:
+                    log.exception("Failed to send alert template to %s", number)
+            # Full free-form message (arrives if a 24h window is open).
             try:
-                send_alert_template(number, one_liner[:300])
+                send_whatsapp(number, body)
             except Exception:
-                log.exception("Failed to send alert template to %s", number)
-        # Also try a full free-form message (arrives if a 24h window is open).
-        try:
-            send_whatsapp(number, body)
-        except Exception:
-            log.exception("Failed to alert %s", number)
+                log.exception("Failed to alert %s", number)
     # Telegram alert — free, instant, no 24h window. The primary phone channel.
     try:
         send_telegram("\U0001F514 " + body)
