@@ -666,34 +666,59 @@ def _google_person_body(name: str, reg: str, number: str) -> dict:
                          "contentType": "TEXT_PLAIN"}],
     }
 
-def _google_contact_exists(number: str, headers: dict) -> bool:
-    """True if the owner's Google Contacts already has this phone number.
+_GOOGLE_NUMBERS_CACHE = {"tails": None, "ts": 0.0}
+GOOGLE_NUMBERS_TTL = 6 * 3600
 
-    We must never rename or overwrite a contact the owner already keeps (e.g. a
-    supplier saved under their business name), so an existing match means skip.
+def _google_existing_numbers(headers: dict, force: bool = False):
+    """Every phone number already in the owner's Google Contacts, as last-9-digit keys.
+
+    We list the whole address book rather than use searchContacts: search silently
+    returns nothing for contacts that clearly exist (it missed cashforcar.ie), and a
+    false 'not found' means creating a duplicate. Cached — it is ~11 calls for 10k+
+    contacts. Returns None if the book could not be read, which callers treat as
+    "don't risk it".
     """
-    tail = number[-9:]  # compare on the last 9 digits: formatting varies wildly
+    now = time.time()
+    if not force and _GOOGLE_NUMBERS_CACHE["tails"] is not None \
+            and now - _GOOGLE_NUMBERS_CACHE["ts"] < GOOGLE_NUMBERS_TTL:
+        return _GOOGLE_NUMBERS_CACHE["tails"]
+    tails, page = set(), ""
     try:
-        # Google asks for a warm-up call before the first searchContacts query.
-        httpx.get("https://people.googleapis.com/v1/people:searchContacts",
-                  params={"query": "", "readMask": "phoneNumbers"},
-                  headers=headers, timeout=20)
-        r = httpx.get("https://people.googleapis.com/v1/people:searchContacts",
-                      params={"query": tail, "readMask": "names,phoneNumbers"},
-                      headers=headers, timeout=20)
-        if r.status_code >= 300:
-            log.warning("Contact search failed %s: %s — skipping to be safe",
-                        r.status_code, (r.text or "")[:200])
-            return True  # fail SAFE: never risk overwriting when we cannot check
-        for res in r.json().get("results", []):
-            for ph in (res.get("person", {}).get("phoneNumbers") or []):
-                digits = "".join(c for c in (ph.get("value") or "") if c.isdigit())
-                if digits.endswith(tail):
-                    return True
+        for _ in range(40):  # hard stop; 40 x 1000 covers any realistic address book
+            params = {"pageSize": 1000, "personFields": "phoneNumbers"}
+            if page:
+                params["pageToken"] = page
+            r = httpx.get("https://people.googleapis.com/v1/people/me/connections",
+                          params=params, headers=headers, timeout=40)
+            if r.status_code >= 300:
+                log.warning("Listing contacts failed %s: %s", r.status_code, (r.text or "")[:200])
+                return None
+            data = r.json()
+            for person in data.get("connections", []):
+                for ph in (person.get("phoneNumbers") or []):
+                    digits = "".join(c for c in (ph.get("value") or "") if c.isdigit())
+                    if len(digits) >= 9:
+                        tails.add(digits[-9:])
+            page = data.get("nextPageToken", "")
+            if not page:
+                break
     except Exception:
-        log.exception("Contact search errored for %s — skipping to be safe", number)
-        return True  # fail safe
-    return False
+        log.exception("Could not list Google Contacts")
+        return None
+    _GOOGLE_NUMBERS_CACHE.update({"tails": tails, "ts": now})
+    log.info("Google Contacts holds %d distinct numbers", len(tails))
+    return tails
+
+def _google_contact_exists(number: str, headers: dict) -> bool:
+    """True if the owner already has this phone number saved themselves.
+
+    We must never rename, overwrite or duplicate a contact the owner keeps (a
+    supplier, a friend, cashforcar.ie...), so an existing match means skip.
+    """
+    tails = _google_existing_numbers(headers)
+    if tails is None:
+        return True  # fail SAFE: never risk a duplicate when we cannot check
+    return number[-9:] in tails
 
 def sync_google_contact(number: str) -> None:
     """Create or update this customer in Google Contacts. Safe to call anytime; no-ops
@@ -1963,6 +1988,39 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)",
                                "google": gstate(gr)}
                               for n, nm, rg, gr in rows]}
+    if action == "gdelete":
+        # Remove contacts WE created for the given numbers (?date=num1,num2,...) and
+        # stop them syncing again. Only ever touches contacts recorded against our own
+        # resourceName — never a contact the owner made.
+        wanted = [w.strip() for w in date.split(",") if w.strip()]
+        if not wanted:
+            return {"error": "Pass numbers, e.g. ?action=gdelete&date=0899000555,0899000333"}
+        token = _google_access_token()
+        if not token:
+            return {"error": "Google not connected."}
+        headers = {"Authorization": f"Bearer {token}"}
+        done = []
+        for num in wanted:
+            with closing(db()) as conn:
+                row = conn.execute("SELECT google_resource FROM customers WHERE wa_number = ?",
+                                   (num,)).fetchone()
+            res = (row[0] if row else "") or ""
+            if not res or res == GOOGLE_SKIP:
+                done.append({"number": num, "result": "nothing of ours to delete"})
+                continue
+            try:
+                d = httpx.delete(f"https://people.googleapis.com/v1/{res}:deleteContact",
+                                 headers=headers, timeout=20)
+                ok = d.status_code < 300
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE customers SET google_resource = ? WHERE wa_number = ?",
+                                 (GOOGLE_SKIP if ok else res, num))
+                done.append({"number": num, "result": "deleted" if ok else
+                             f"failed {d.status_code}: {(d.text or '')[:120]}"})
+            except Exception as exc:
+                done.append({"number": num, "result": f"error {str(exc)[:120]}"})
+        _GOOGLE_NUMBERS_CACHE.update({"tails": None, "ts": 0.0})  # book changed
+        return {"deleted": done}
     if action == "gtest":
         # Prove the Google connection works end to end and show the real API replies.
         out = {"ready": google_enabled()}
