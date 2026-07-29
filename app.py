@@ -133,6 +133,9 @@ CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
+# Marker stored against a customer whose number the owner already has saved in their
+# own Google Contacts — we leave those alone rather than rename or duplicate them.
+GOOGLE_SKIP = "SKIP_ALREADY_IN_CONTACTS"
 GOOGLE_REDIRECT_PATH = "/google/callback"
 # Telegram alerts to the owner. Free, instant, and not subject to WhatsApp's 24-hour
 # window or per-message charges — so this is the reliable phone channel for alerts.
@@ -647,6 +650,35 @@ def _google_person_body(name: str, reg: str, number: str) -> dict:
                          "contentType": "TEXT_PLAIN"}],
     }
 
+def _google_contact_exists(number: str, headers: dict) -> bool:
+    """True if the owner's Google Contacts already has this phone number.
+
+    We must never rename or overwrite a contact the owner already keeps (e.g. a
+    supplier saved under their business name), so an existing match means skip.
+    """
+    tail = number[-9:]  # compare on the last 9 digits: formatting varies wildly
+    try:
+        # Google asks for a warm-up call before the first searchContacts query.
+        httpx.get("https://people.googleapis.com/v1/people:searchContacts",
+                  params={"query": "", "readMask": "phoneNumbers"},
+                  headers=headers, timeout=20)
+        r = httpx.get("https://people.googleapis.com/v1/people:searchContacts",
+                      params={"query": tail, "readMask": "names,phoneNumbers"},
+                      headers=headers, timeout=20)
+        if r.status_code >= 300:
+            log.warning("Contact search failed %s: %s — skipping to be safe",
+                        r.status_code, (r.text or "")[:200])
+            return True  # fail SAFE: never risk overwriting when we cannot check
+        for res in r.json().get("results", []):
+            for ph in (res.get("person", {}).get("phoneNumbers") or []):
+                digits = "".join(c for c in (ph.get("value") or "") if c.isdigit())
+                if digits.endswith(tail):
+                    return True
+    except Exception:
+        log.exception("Contact search errored for %s — skipping to be safe", number)
+        return True  # fail safe
+    return False
+
 def sync_google_contact(number: str) -> None:
     """Create or update this customer in Google Contacts. Safe to call anytime; no-ops
     if Google isn't connected. Runs in a background thread — never blocks a reply."""
@@ -664,11 +696,22 @@ def sync_google_contact(number: str) -> None:
     name, reg, resource = (row[0] or ""), (row[1] or ""), (row[2] or "")
     if not (name or reg):
         return
+    if resource == GOOGLE_SKIP:  # the owner already has this number saved themselves
+        return
     try:
         token = _google_access_token()
         if not token:
             return
         headers = {"Authorization": f"Bearer {token}"}
+        # Before creating anything, make sure this number isn't already one of the
+        # owner's own contacts (a supplier, a friend, cashforcar.ie...). We never
+        # rename or overwrite those — we leave them completely alone.
+        if not resource and _google_contact_exists(number, headers):
+            log.info("%s already in Google Contacts — leaving it untouched", number)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE customers SET google_resource = ? WHERE wa_number = ?",
+                             (GOOGLE_SKIP, number))
+            return
         body = _google_person_body(name, reg, number)
         if resource:  # update the contact we already created (needs a fresh etag)
             g = httpx.get(f"https://people.googleapis.com/v1/{resource}",
@@ -1781,7 +1824,10 @@ def contacts_vcf(token: str = Query("")):
     for number, name, reg in rows:
         name = (name or "").strip()
         reg = (reg or "").strip()
-        display = " ".join(x for x in [name or "NCTPass customer", f"({reg})" if reg else ""] if x)
+        # Prefix so these never look like, or get merged over, the owner's own saved
+        # contacts. If Google offers to merge a duplicate it stays obvious which is which.
+        display = " ".join(x for x in ["NCTPass:", name or "customer",
+                                       f"({reg})" if reg else ""] if x)
         cards.append(
             "BEGIN:VCARD\r\nVERSION:3.0\r\n"
             f"N:;{name or reg};;;\r\n"
