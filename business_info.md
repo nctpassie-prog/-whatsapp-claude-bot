@@ -28,7 +28,7 @@
 - Headlight repair and alignment
 
 ## Pricing
-FREE pre-NCT inspection with any service or repair. Labour from €80/hour.
+FREE pre-NCT inspection with any service or repair. Labour from €80 per hour + VAT.
 No hidden charges. 12-month parts & labour guarantee.
 
 How to use these prices:
@@ -298,6 +298,9 @@ Availability / capacity (important — how to talk about slots):
   A: Yes — all our repairs come with a 12-month parts and labour guarantee.
 - Q: Do you work on my make of car?
   A: Yes, we service and repair all makes and models.
+- Q: What is your labour rate / how much do you charge per hour?
+  A: Labour is from €80 per hour + VAT. How long a job takes depends on the car and
+  the work, so we always give a written quote before starting.
 - Q: Will I get a price before you do the work?
   A: Always. We do a free inspection and give you a written quote before any work
   starts — no hidden charges. (If a fault needs longer than a quick check to trace,
