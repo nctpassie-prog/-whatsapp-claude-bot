@@ -636,17 +636,33 @@ def _google_access_token() -> str:
     r.raise_for_status()
     return r.json().get("access_token", "")
 
+def intl_number(number: str) -> str:
+    """Best-effort international format, so the phone can match it to a WhatsApp chat.
+
+    Real WhatsApp numbers already arrive as 353…, but older records were stored in
+    local form (0858…) and '+0858…' is not a valid number anyone can dial or match.
+    """
+    digits = "".join(ch for ch in str(number) if ch.isdigit())
+    if not digits:
+        return ""
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):  # local Irish form -> +353
+        digits = "353" + digits.lstrip("0")
+    return "+" + digits
+
 def _google_person_body(name: str, reg: str, number: str) -> dict:
     """Build the People API contact body. Shows in WhatsApp as e.g. 'John (11D2547)'."""
     given = (name or "").strip()
-    family = f"({reg})" if reg else ""
+    family = f"({clean_reg(reg)})" if reg else ""
+    tel = intl_number(number)
     if not given:  # no name yet — lead with the reg so it's still recognisable
-        given = reg or ("+" + number)
+        given = clean_reg(reg) or tel
         family = ""
     return {
         "names": [{"givenName": given, "familyName": family}],
-        "phoneNumbers": [{"value": "+" + number, "type": "mobile"}],
-        "biographies": [{"value": f"NCTPass customer. Reg: {reg or '-'}",
+        "phoneNumbers": [{"value": tel, "type": "mobile"}],
+        "biographies": [{"value": f"NCTPass customer. Reg: {clean_reg(reg) or '-'}",
                          "contentType": "TEXT_PLAIN"}],
     }
 
@@ -1832,7 +1848,7 @@ def contacts_vcf(token: str = Query("")):
             "BEGIN:VCARD\r\nVERSION:3.0\r\n"
             f"N:;{name or reg};;;\r\n"
             f"FN:{display}\r\n"
-            f"TEL;TYPE=CELL:+{number}\r\n"
+            f"TEL;TYPE=CELL:{intl_number(number)}\r\n"
             f"NOTE:NCTPass customer. Reg: {reg or '-'}\r\n"
             "END:VCARD"
         )
