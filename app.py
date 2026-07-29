@@ -1988,6 +1988,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)",
                                "google": gstate(gr)}
                               for n, nm, rg, gr in rows]}
+    if action == "gexists":
+        # Is this number already in the owner's Google Contacts? Uses the reliable
+        # full listing, not searchContacts. ?action=gexists&date=353852113111
+        token = _google_access_token()
+        if not token:
+            return {"error": "Google not connected."}
+        tails = _google_existing_numbers({"Authorization": f"Bearer {token}"}, force=True)
+        if tails is None:
+            return {"error": "Could not read your contacts."}
+        probe = "".join(ch for ch in date if ch.isdigit())
+        return {"number": probe, "in_your_contacts": probe[-9:] in tails if probe else None,
+                "distinct_numbers_in_book": len(tails)}
     if action == "gdelete":
         # Remove contacts WE created for the given numbers (?date=num1,num2,...) and
         # stop them syncing again. Only ever touches contacts recorded against our own
