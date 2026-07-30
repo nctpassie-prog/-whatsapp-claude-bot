@@ -46,6 +46,10 @@ log = logging.getLogger("bot")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "change-me")
+# Read-only key for reviewing conversations. Opens /chats and the read-only report
+# actions ONLY — it can never change or delete anything, so it is safe to share with
+# whoever is helping improve the bot without handing over the master key.
+REVIEW_TOKEN = os.environ.get("REVIEW_TOKEN", "")
 APP_SECRET = os.environ.get("APP_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
@@ -1611,39 +1615,58 @@ def send_due_reviews() -> None:
                 conn.execute("UPDATE bookings SET review_sent = 1 WHERE id = ?", (bid,))
             log.info("Sent review request for booking %s to %s", bid, phone)
 
-def send_weekly_gap_report() -> None:
+def send_weekly_gap_report(force: bool = False) -> None:
     """Once a week, tell the owner what customers asked that the bot couldn't answer.
 
     These are the real knowledge gaps — found by customers, not guesswork. Each one
     is something worth adding so the bot handles it on its own from then on.
     """
-    if not OWNER_WHATSAPP:
-        return
     now = now_local()
-    if now.weekday() != GAP_REPORT_WEEKDAY or now.hour != GAP_REPORT_HOUR:
+    if not force and (now.weekday() != GAP_REPORT_WEEKDAY or now.hour != GAP_REPORT_HOUR):
         return
+    week_ago = time.time() - 7 * 86400
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT id, question FROM unknowns WHERE reported = 0 ORDER BY id").fetchall()
-    if not rows:
-        return
+        handovers = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE ts >= ?", (week_ago,)).fetchone()[0]
+        booked = conn.execute(
+            "SELECT COUNT(*) FROM bookings WHERE created_ts >= ?", (week_ago,)).fetchone()[0]
+        new_custs = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE first_ts >= ?", (week_ago,)).fetchone()[0]
+        chatted = conn.execute(
+            "SELECT COUNT(DISTINCT wa_user) FROM messages WHERE ts >= ?", (week_ago,)).fetchone()[0]
     seen, lines = set(), []
     for _id, q in rows:
         key = q.lower().strip()
         if key and key not in seen:
             seen.add(key)
             lines.append(f"• {q}")
-    body = (f"📋 This week the bot couldn't answer {len(seen)} question"
-            f"{'s' if len(seen) != 1 else ''}:\n\n" + "\n".join(lines[:15]))
-    if len(lines) > 15:
-        body += f"\n\n…and {len(lines) - 15} more."
-    body += ("\n\nTell Claude the answers and the bot will handle these itself "
-             "from now on.")
-    try:
-        send_whatsapp(OWNER_WHATSAPP, body)
-    except Exception:
-        log.exception("Failed to send weekly gap report")
+    # Nothing worth sending if the week was quiet and nothing went wrong.
+    if not force and not lines and not handovers and not chatted:
         return
+    parts = ["📋 NCTPass bot — this week",
+             "",
+             f"💬 Customers chatted: {chatted}",
+             f"🆕 New customers: {new_custs}",
+             f"📅 Bookings taken: {booked}",
+             f"🙋 Times a human was needed: {handovers}"]
+    if lines:
+        parts += ["", f"❓ Questions the bot couldn't answer ({len(seen)}):"] + lines[:15]
+        if len(lines) > 15:
+            parts.append(f"…and {len(lines) - 15} more.")
+        parts += ["", "Tell Claude the answers and the bot will handle these itself from now on."]
+    else:
+        parts += ["", "✅ No unanswered questions this week."]
+    body = "\n".join(parts)
+    try:
+        send_telegram(body)
+    except Exception:
+        log.exception("Failed to send weekly report to Telegram")
+    try:
+        send_email("NCTPass bot — weekly report", body, OWNER_EMAIL or BOOKING_EMAIL_TO)
+    except Exception:
+        log.exception("Failed to email weekly report")
     with closing(db()) as conn, conn:
         conn.execute("UPDATE unknowns SET reported = 1 WHERE reported = 0")
     log.info("Weekly gap report sent (%s questions)", len(seen))
@@ -1787,6 +1810,16 @@ h1{margin:0;font-size:18px}
 .empty{color:#667;text-align:center;padding:40px 10px}
 """
 
+# Admin actions that only READ. The review key may run these; everything else —
+# clearing bookings, turning the bot off, deleting contacts — needs the master key.
+READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus"}
+
+def can_review(token: str) -> bool:
+    """True for the master key or the read-only review key."""
+    if VERIFY_TOKEN and token == VERIFY_TOKEN:
+        return True
+    return bool(REVIEW_TOKEN) and token == REVIEW_TOKEN
+
 def _fmt_ts(ts: float) -> str:
     try:
         return datetime.fromtimestamp(ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
@@ -1796,7 +1829,7 @@ def _fmt_ts(ts: float) -> str:
 @app.get("/chats")
 def chats(token: str = Query(""), user: str = Query("")):
     """Private web view of the bot's conversations with customers (token-guarded)."""
-    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+    if not can_review(token):
         return Response(status_code=403)
     esc = __import__("html").escape
     if user:  # one conversation
@@ -1937,9 +1970,15 @@ def google_callback(code: str = Query(""), state: str = Query(""), error: str = 
 
 @app.get("/admin")
 def admin(token: str = Query(""), action: str = Query("status"), date: str = Query("")):
-    """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all."""
-    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
-        return Response(status_code=403)
+    """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all.
+
+    The read-only REVIEW_TOKEN is accepted for the reporting actions only — anything
+    that changes or deletes data still requires the master key.
+    """
+    is_master = bool(VERIFY_TOKEN) and token == VERIFY_TOKEN
+    if not is_master:
+        if not (REVIEW_TOKEN and token == REVIEW_TOKEN and action in READ_ONLY_ACTIONS):
+            return Response(status_code=403)
     if action == "testmail":
         # Diagnose booking email setup. Never returns the password itself.
         cfg = {
@@ -1988,6 +2027,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)",
                                "google": gstate(gr)}
                               for n, nm, rg, gr in rows]}
+    if action == "weeklytest":
+        # Send this week's report right now, ignoring the day/hour schedule.
+        send_weekly_gap_report(force=True)
+        return {"sent": True, "to_telegram": telegram_chat_ids(),
+                "note": "Weekly report sent now; the normal schedule is unchanged."}
     if action == "gexists":
         # Is this number already in the owner's Google Contacts? Uses the reliable
         # full listing, not searchContacts. ?action=gexists&date=353852113111
