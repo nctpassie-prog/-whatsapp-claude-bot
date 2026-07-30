@@ -1789,7 +1789,12 @@ def _start_reminder_thread() -> None:
 
 @app.get("/")
 def health() -> dict:
-    return {"status": "ok"}
+    # Booleans and a length only — never the key itself. Enough to tell whether the
+    # running process actually picked up the review key.
+    return {"status": "ok",
+            "review_key_loaded": bool(REVIEW_TOKEN),
+            "review_key_len": len(REVIEW_TOKEN),
+            "master_key_len": len(VERIFY_TOKEN)}
 
 CHAT_CSS = """
 body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f4f6;color:#111}
