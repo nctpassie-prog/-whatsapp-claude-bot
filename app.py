@@ -88,6 +88,15 @@ CHAKRA_PLUGIN_ID = os.environ.get("CHAKRA_PLUGIN_ID", "")
 WA_API_VERSION = os.environ.get("WA_API_VERSION", "v21.0")
 # Number to send from when we can't tell (defaults to the single allowed number).
 SEND_PHONE_ID = os.environ.get("SEND_PHONE_ID", "")
+# Friendly names for each business number, so alerts can say WHICH line a customer
+# came in on. Format: "<phone_number_id>=<label>,<phone_number_id>=<label>".
+PHONE_LABELS = {}
+for _pair in os.environ.get(
+        "PHONE_LABELS",
+        "1314437165075333=085 777 7888,335852741443330=086 667 7666").split(","):
+    if "=" in _pair:
+        _pid, _lbl = _pair.split("=", 1)
+        PHONE_LABELS[_pid.strip()] = _lbl.strip()
 # Appointment reminder (sent to the customer 1 day before, via an approved template).
 REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
@@ -331,7 +340,8 @@ def notify_owner_booking(fields: dict) -> None:
         f"Need: {need}\n"
         f"Preferred: {when}\n"
         f"Name: {name}\n"
-        f"Phone: {phone}"
+        f"Phone: {phone}\n"
+        f"Came in on: {line_label()}"
     )
     title = f"NCTPass booking: {car} {reg}".strip()
     cal_link = calendar_link(title, summary, fields.get("date", ""))
@@ -1061,7 +1071,7 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
     # No early return when there are no WhatsApp recipients — Telegram and email
     # below are the channels that actually reach the owner.
-    parts = [headline, f"From: +{user}"]
+    parts = [headline, f"From: +{user}", f"Came in on: {line_label()}"]
     if reason:
         parts.append(f"What's wrong: {reason}")
     excerpt = conversation_excerpt(user)
@@ -1471,6 +1481,11 @@ def default_send_phone_id() -> str:
     if len(ALLOWED_PHONE_IDS) == 1:
         return next(iter(ALLOWED_PHONE_IDS))
     return PHONE_NUMBER_ID
+
+def line_label(phone_id: str = "") -> str:
+    """Which of our business numbers this conversation is on, in words."""
+    pid = phone_id or _ctx_phone_id.get() or default_send_phone_id()
+    return PHONE_LABELS.get(pid, pid or "unknown number")
 
 def send_endpoint(phone_id: str = "") -> tuple:
     """(url, bearer token) for sending — via Chakra if configured, else Meta direct."""
