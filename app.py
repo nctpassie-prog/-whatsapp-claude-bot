@@ -155,6 +155,11 @@ GOOGLE_REDIRECT_PATH = "/google/callback"
 # Keep trying WhatsApp for owner alerts even when Telegram is working. Off by default
 # because Meta rejects them (no payment method on the WABA / 24h window).
 OWNER_WHATSAPP_ALERTS = os.environ.get("OWNER_WHATSAPP_ALERTS", "0") == "1"
+# Speech-to-text for customer voice notes. Either provider works; Deepgram is tried
+# first when both are set. Without a key the bot politely says it can't listen.
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_IDS = [c for c in (x.strip() for x in
                      os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")) if c]
@@ -1467,6 +1472,67 @@ def get_media(media_id: str):
         mime = "image/jpeg"
     return base64.b64encode(blob.content).decode(), mime
 
+def get_media_bytes(media_id: str):
+    """Download a WhatsApp media file as raw bytes. Returns (bytes, mime_type)."""
+    meta = httpx.get(
+        f"https://graph.facebook.com/v21.0/{media_id}",
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        timeout=30,
+    )
+    meta.raise_for_status()
+    url = meta.json()["url"]
+    blob = httpx.get(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=90)
+    blob.raise_for_status()
+    return blob.content, blob.headers.get("content-type", "audio/ogg").split(";")[0].strip()
+
+def transcribe_audio(media_id: str) -> str:
+    """Turn a customer's WhatsApp voice note into text. Empty string if unavailable.
+
+    Costs a fraction of a cent per note — far cheaper than answering live calls, and
+    it means customers who would rather talk than type still get served properly.
+    """
+    if not (DEEPGRAM_API_KEY or OPENAI_API_KEY):
+        return ""
+    try:
+        audio, mime = get_media_bytes(media_id)
+    except Exception:
+        log.exception("Could not download voice note %s", media_id)
+        return ""
+    if DEEPGRAM_API_KEY:
+        try:
+            r = httpx.post(
+                "https://api.deepgram.com/v1/listen",
+                params={"model": "nova-3", "smart_format": "true",
+                        "detect_language": "true"},
+                headers={"Authorization": f"Token {DEEPGRAM_API_KEY}",
+                         "Content-Type": mime or "audio/ogg"},
+                content=audio, timeout=90)
+            if r.status_code < 300:
+                alts = (r.json().get("results", {}).get("channels", [{}])[0]
+                        .get("alternatives", [{}]))
+                text = (alts[0].get("transcript", "") if alts else "").strip()
+                if text:
+                    return text
+            log.warning("Deepgram transcription failed %s: %s",
+                        r.status_code, (r.text or "")[:200])
+        except Exception:
+            log.exception("Deepgram transcription errored")
+    if OPENAI_API_KEY:
+        try:
+            r = httpx.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={"file": ("voice.ogg", audio, mime or "audio/ogg")},
+                data={"model": OPENAI_TRANSCRIBE_MODEL},
+                timeout=90)
+            if r.status_code < 300:
+                return (r.json().get("text", "") or "").strip()
+            log.warning("OpenAI transcription failed %s: %s",
+                        r.status_code, (r.text or "")[:200])
+        except Exception:
+            log.exception("OpenAI transcription errored")
+    return ""
+
 # ---------------------------------------------------------------- WhatsApp send
 # The business number the message we're currently handling arrived on — so replies go
 # back out on the SAME number when several numbers share one bot.
@@ -1818,7 +1884,9 @@ def health() -> dict:
     return {"status": "ok",
             "review_key_loaded": bool(REVIEW_TOKEN),
             "review_key_len": len(REVIEW_TOKEN),
-            "master_key_len": len(VERIFY_TOKEN)}
+            "master_key_len": len(VERIFY_TOKEN),
+            "voice_notes": ("deepgram" if DEEPGRAM_API_KEY
+                            else "openai" if OPENAI_API_KEY else "not set up")}
 
 CHAT_CSS = """
 body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f4f6;color:#111}
@@ -2398,6 +2466,23 @@ def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
     answer = ask_claude(sender, text)
     send_whatsapp(sender, answer)
 
+def handle_voice_message(sender: str, media_id: str, arrived_on: str = "") -> None:
+    """Listen to a customer's voice note and answer it like any other message."""
+    if arrived_on:
+        _ctx_phone_id.set(arrived_on)
+    text = transcribe_audio(media_id)
+    if not text:
+        # Couldn't listen (no key, or transcription failed) — fall back to the old
+        # polite reply rather than leaving the customer with nothing.
+        handle_message(sender,
+                       "[Customer sent a voice message that could not be transcribed. "
+                       "Politely say you couldn't listen to it and ask them to type it, "
+                       "or say a colleague will listen and come back to them.]",
+                       arrived_on)
+        return
+    log.info("Voice note from %s transcribed (%d chars)", sender, len(text))
+    handle_message(sender, text, arrived_on)
+
 def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: str = "") -> None:
     if arrived_on:
         _ctx_phone_id.set(arrived_on)
@@ -2517,6 +2602,11 @@ async def receive(request: Request, background: BackgroundTasks):
                     if sender and media_id:
                         background.add_task(handle_image_message, sender, media_id,
                                             caption, arrived_on)
+                elif mtype in ("audio", "voice"):
+                    media_id = (msg.get(mtype, {}) or {}).get("id", "")
+                    if sender and media_id:
+                        background.add_task(handle_voice_message, sender, media_id,
+                                            arrived_on)
                 else:
                     text = (
                         "[Customer sent a non-text message "
