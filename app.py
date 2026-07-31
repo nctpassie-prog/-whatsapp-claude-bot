@@ -807,6 +807,25 @@ def sync_google_contact(number: str) -> None:
     except Exception:
         log.exception("Google Contacts sync failed for %s", number)
 
+def customer_label(number: str) -> str:
+    """Who this number belongs to, for alerts — 'Sam Ukaga (131MH704) +3538…'.
+
+    Falls back to just the number for someone we've not met yet, so the owner can
+    always tell at a glance whether it's a regular or a stranger.
+    """
+    digits = "".join(ch for ch in str(number) if ch.isdigit())
+    name = reg = ""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT name, reg FROM customers WHERE wa_number = ?", (digits,)).fetchone()
+        if row:
+            name, reg = (row[0] or "").strip(), (row[1] or "").strip()
+    except Exception:
+        log.exception("Could not look up customer name for %s", number)
+    bits = [b for b in [name, f"({reg})" if reg else ""] if b]
+    return (" ".join(bits) + f" +{digits}") if bits else f"+{digits}"
+
 def customers_list(limit: int = 20) -> str:
     with closing(db()) as conn:
         rows = conn.execute(
@@ -1076,7 +1095,7 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
     # No early return when there are no WhatsApp recipients — Telegram and email
     # below are the channels that actually reach the owner.
-    parts = [headline, f"From: +{user}", f"Came in on: {line_label()}"]
+    parts = [headline, f"From: {customer_label(user)}", f"Came in on: {line_label()}"]
     if reason:
         parts.append(f"What's wrong: {reason}")
     excerpt = conversation_excerpt(user)
@@ -1086,7 +1105,7 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     body = "\n".join(parts)
     alert_targets = list(dict.fromkeys(
         [n for n in recipients] + ALERT_NUMBERS))  # owner/manager + any extra alert numbers
-    one_liner = f"{headline} — from +{user}" + (f" ({reason})" if reason else "")
+    one_liner = f"{headline} — from {customer_label(user)}" + (f" ({reason})" if reason else "")
     # WhatsApp owner-alerts only work if this account can actually send them. Template
     # sends need a payment method on the WABA (error 131042) and free-form needs an
     # open 24h window (131047), so when Telegram is carrying alerts we skip WhatsApp
