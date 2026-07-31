@@ -2466,19 +2466,55 @@ def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
     answer = ask_claude(sender, text)
     send_whatsapp(sender, answer)
 
+# Things a customer sends that carry REAL content we can't read (a fail sheet PDF,
+# a video of a noise). Worth a human looking. Stickers, reactions, polls and the
+# like carry nothing — never promise a colleague will "check the attachment" for those.
+REAL_ATTACHMENTS = {"document", "video", "audio", "voice"}
+
+def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> None:
+    """A customer sent something the bot can't open.
+
+    Two very different cases: a real attachment (document/video) genuinely needs a
+    person, so we promise that AND actually alert. A sticker or reaction carries no
+    information — promising a colleague there is a lie, so we just ask them to type it.
+    """
+    real = what in REAL_ATTACHMENTS
+    if real:
+        prompt = (f"[Customer sent a {what}. Thank them warmly for sending it and say "
+                  "one of the team will look at it and come straight back to them. "
+                  "NEVER mention that you cannot open or read it, never explain what "
+                  "formats you support, and do not ask them to retype it. Sound like a "
+                  "person at the garage, not a system.]")
+    else:
+        prompt = ("[Customer sent something with no words in it (a sticker, reaction or "
+                  "similar). There is nothing to read and nothing for anyone to check. "
+                  "Reply in ONE short, warm, natural line inviting them to tell you what "
+                  "they need. NEVER mention files, attachments, formats, or anything you "
+                  "can or cannot read, and do NOT promise that anyone will look at "
+                  "anything. Sound like a friendly person at the garage.]")
+    handle_message(sender, prompt, arrived_on)
+    if not real:
+        return  # nothing to chase — no alert, or every sticker would ping the phones
+    if OWNER_WHATSAPP and sender == OWNER_WHATSAPP:
+        return
+    if is_blocked(sender) or is_paused(sender) or human_handling(sender):
+        return
+    try:
+        alert_owner(sender, "📎 Customer sent something the bot can't open",
+                    f"They sent a {what} — open WhatsApp to see it. "
+                    "The bot told them a colleague would come back to them.")
+    except Exception:
+        log.exception("Failed to alert owner about unreadable message from %s", sender)
+
 def handle_voice_message(sender: str, media_id: str, arrived_on: str = "") -> None:
     """Listen to a customer's voice note and answer it like any other message."""
     if arrived_on:
         _ctx_phone_id.set(arrived_on)
     text = transcribe_audio(media_id)
     if not text:
-        # Couldn't listen (no key, or transcription failed) — fall back to the old
-        # polite reply rather than leaving the customer with nothing.
-        handle_message(sender,
-                       "[Customer sent a voice message that could not be transcribed. "
-                       "Politely say you couldn't listen to it and ask them to type it, "
-                       "or say a colleague will listen and come back to them.]",
-                       arrived_on)
+        # Couldn't listen (no key set, or transcription failed). Treat it like any
+        # other real attachment: thank them, tell a colleague, never explain why.
+        handle_unreadable_message(sender, "voice", arrived_on)
         return
     log.info("Voice note from %s transcribed (%d chars)", sender, len(text))
     handle_message(sender, text, arrived_on)
@@ -2608,11 +2644,7 @@ async def receive(request: Request, background: BackgroundTasks):
                         background.add_task(handle_voice_message, sender, media_id,
                                             arrived_on)
                 else:
-                    text = (
-                        "[Customer sent a non-text message "
-                        f"({mtype}). Politely say you can only read text or photos here "
-                        "and a colleague will check the attachment.]"
-                    )
                     if sender:
-                        background.add_task(handle_message, sender, text, arrived_on)
+                        background.add_task(handle_unreadable_message, sender,
+                                            mtype or "unsupported", arrived_on)
     return {"status": "ok"}
