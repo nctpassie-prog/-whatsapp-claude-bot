@@ -19,6 +19,7 @@
 0851186538
 0871188294
 0851462959
+37360929700  # +373 60 929 700 (Moldova)
 
 # Our OWN bot numbers. Both are answered by the bot now, so if one ever messages
 # the other they would keep replying to each other forever. Never reply to these.
