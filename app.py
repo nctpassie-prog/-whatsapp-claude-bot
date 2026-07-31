@@ -291,9 +291,22 @@ def is_blocked(sender: str) -> bool:
 # ---------------------------------------------------------------- bookings
 BOOKING_RE = re.compile(r"<<<BOOKING\|(.*?)>>>", re.DOTALL)
 
+# Placeholders the bot sometimes puts in the reg field when the customer hasn't got
+# one yet (e.g. a fresh import awaiting VRT). Saving these would litter the contact
+# book with entries like "Valentine (PENDING)".
+_NOT_A_REG = {"PENDING", "NONE", "NA", "N/A", "UNKNOWN", "TBC", "TBA", "NOREG",
+              "NOTYET", "AWAITINGVRT", "VRT", "PENDINGVRT", "-", "?"}
+
 def clean_reg(reg: str) -> str:
-    """Normalise a car registration: no spaces or dashes, uppercase (e.g. 11D2547)."""
-    return (reg or "").strip().replace(" ", "").replace("-", "").upper()
+    """Normalise a car registration: no spaces or dashes, uppercase (e.g. 11D2547).
+
+    Returns "" for placeholders and anything with no digits — a real Irish reg
+    always contains numbers, so that filters out stray words safely.
+    """
+    cleaned = (reg or "").strip().replace(" ", "").replace("-", "").upper()
+    if not cleaned or cleaned in _NOT_A_REG or not any(ch.isdigit() for ch in cleaned):
+        return ""
+    return cleaned
 
 def process_booking(answer: str):
     """Pull the hidden booking marker out of Claude's reply.
@@ -1013,7 +1026,10 @@ def get_history(user: str) -> list[dict]:
             "SELECT role, content FROM messages WHERE wa_user = ? ORDER BY id DESC LIMIT ?",
             (user, MAX_HISTORY),
         ).fetchall()
-    return [{"role": r, "content": c} for r, c in reversed(rows)]
+    # Claude only understands user/assistant; a colleague's reply is still "the
+    # business speaking", so it maps to assistant for context purposes.
+    return [{"role": "assistant" if r == "staff" else r, "content": c}
+            for r, c in reversed(rows)]
 
 def is_paused(user: str) -> bool:
     with closing(db()) as conn:
@@ -1448,28 +1464,33 @@ def ask_claude(user: str, text: str) -> str:
             system_prompt += WELCOME_HINT
     return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
 
-def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
+def ask_claude_image(user: str, images: list, caption: str) -> str:
+    """Answer one or more photos in a single reply. `images` is [(base64, mime), …]."""
     note = (caption or "").strip()
-    save_message(user, "user", ("[Customer sent a photo] " + note).strip())
+    label = "[Customer sent a photo]" if len(images) == 1 else \
+            f"[Customer sent {len(images)} photos]"
+    save_message(user, "user", (label + " " + note).strip())
     history = get_history(user)
     system_prompt = (load_system_prompt() + availability_block() + contact_hint(user)
                      + customer_context(user))
     if len(history) <= 1:
         system_prompt += WELCOME_HINT
+    many = len(images) > 1
     prompt_text = note or (
-        "The customer sent this photo — it is most likely an NCT fail sheet or a photo of a "
-        "car fault/damage. Read it carefully and reply helpfully: for a fail sheet, list the "
-        "failed items in plain words and reassure them we can fix it (free inspection, written "
-        "quote before any work). Never invent prices. If the photo is unrelated or unclear, "
-        "politely ask them to describe what they need."
+        f"The customer sent {'these photos' if many else 'this photo'} — most likely an NCT "
+        "fail sheet or pictures of a car fault/damage. Read "
+        f"{'them all' if many else 'it'} carefully and reply with ONE single message "
+        f"covering {'everything they sent' if many else 'it'}. For a fail sheet, list the "
+        "failed items in plain words and reassure them we can fix it and prepare the car to "
+        "pass. Never invent prices. Do NOT describe each picture back to them one by one, "
+        "and do NOT keep saying what a photo is or isn't — just work out what they need and "
+        "help. If it's genuinely unclear, ask once, warmly, what they'd like done."
     )
-    messages = history[:-1] + [{
-        "role": "user",
-        "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": image_b64}},
-            {"type": "text", "text": prompt_text},
-        ],
-    }]
+    content = [{"type": "image",
+                "source": {"type": "base64", "media_type": m, "data": b}}
+               for b, m in images]
+    content.append({"type": "text", "text": prompt_text})
+    messages = history[:-1] + [{"role": "user", "content": content}]
     return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
 
 def ask_claude_pdf(user: str, pdf_b64: str, caption: str, filename: str = "") -> str:
@@ -1951,6 +1972,7 @@ h1{margin:0;font-size:18px}
  line-height:1.35;white-space:pre-wrap;word-wrap:break-word}
 .cust{background:#fff;margin-right:auto;border-top-left-radius:3px}
 .bot{background:#dcf8c6;margin-left:auto;border-top-right-radius:3px}
+.staff{background:#ffe9b3;margin-left:auto;border-top-right-radius:3px;border:1px solid #e8c877}
 .t{font-size:11px;color:#8a8a8a;margin-top:3px}
 .empty{color:#667;text-align:center;padding:40px 10px}
 """
@@ -1987,11 +2009,14 @@ def chats(token: str = Query(""), user: str = Query("")):
         who = f"+{esc(user)}"
         if cust and (cust[0] or cust[1]):
             who += " &middot; " + esc(" ".join(x for x in cust if x))
-        bubbles = "".join(
-            f'<div class="b {"bot" if r == "assistant" else "cust"}">{esc(c or "")}'
-            f'<div class="t">{"Bot" if r == "assistant" else "Customer"} &middot; {_fmt_ts(t)}</div></div>'
-            for r, c, t in rows
-        ) or '<div class="empty">No messages yet.</div>'
+        def bubble(r, c, t):
+            cls = {"assistant": "bot", "staff": "staff"}.get(r, "cust")
+            who_said = {"assistant": "🤖 Bot", "staff": "👤 Your team (WhatsApp app)"}.get(
+                r, "Customer")
+            return (f'<div class="b {cls}">{esc(c or "")}'
+                    f'<div class="t">{who_said} &middot; {_fmt_ts(t)}</div></div>')
+        bubbles = "".join(bubble(r, c, t) for r, c, t in rows) \
+            or '<div class="empty">No messages yet.</div>'
         body = (f'<header><a href="/chats?token={esc(token)}">&larr; All chats</a>'
                 f'<h1>{who}</h1></header><div class="wrap">{bubbles}</div>')
     else:  # list of conversations
@@ -2554,6 +2579,31 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
     except Exception:
         log.exception("Failed to alert owner about unreadable message from %s", sender)
 
+# Customers often fire off several photos in a row. Replying to each one separately
+# means a burst of near-identical messages, which reads as spam. Wait briefly, gather
+# whatever arrives, and answer them all in ONE reply.
+PHOTO_BATCH_SECONDS = float(os.environ.get("PHOTO_BATCH_SECONDS", "8"))
+MAX_PHOTOS_PER_REPLY = int(os.environ.get("MAX_PHOTOS_PER_REPLY", "6"))
+_photo_batches: dict = {}
+_photo_lock = threading.Lock()
+
+def _collect_photo(sender: str, media_id: str, caption: str) -> bool:
+    """Add a photo to this customer's batch. True if we should be the one to reply."""
+    now = time.time()
+    with _photo_lock:
+        batch = _photo_batches.setdefault(sender, {"items": [], "ts": 0.0})
+        batch["items"].append((media_id, caption))
+        batch["ts"] = now
+        return True
+
+def _take_photo_batch(sender: str, started: float):
+    """Claim the batch if nothing newer arrived while we waited."""
+    with _photo_lock:
+        batch = _photo_batches.get(sender)
+        if not batch or batch["ts"] > started:
+            return None  # a later photo arrived; that task will send the reply
+        return _photo_batches.pop(sender, {}).get("items", [])
+
 def handle_document_message(sender: str, media_id: str, caption: str,
                             filename: str = "", arrived_on: str = "") -> None:
     """Read a PDF the customer sent. Anything else still goes to a colleague."""
@@ -2628,17 +2678,34 @@ def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: s
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
-    try:
-        image_b64, mime = get_media(media_id)
-    except Exception:
-        log.exception("Failed to download WhatsApp media %s", media_id)
+    # Hold on briefly in case more photos are on the way, then answer them together.
+    started = time.time()
+    _collect_photo(sender, media_id, caption)
+    time.sleep(PHOTO_BATCH_SECONDS)
+    items = _take_photo_batch(sender, started)
+    if items is None:
+        return  # another photo landed; the later task replies for all of them
+    if len(items) > MAX_PHOTOS_PER_REPLY:
+        log.info("Customer %s sent %d photos; reading the first %d",
+                 sender, len(items), MAX_PHOTOS_PER_REPLY)
+        items = items[:MAX_PHOTOS_PER_REPLY]
+    images, captions = [], []
+    for mid, cap in items:
+        try:
+            b64, mime = get_media(mid)
+            images.append((b64, mime))
+        except Exception:
+            log.exception("Failed to download WhatsApp media %s", mid)
+        if cap:
+            captions.append(cap)
+    if not images:
         send_whatsapp(
             sender,
             "Sorry, I couldn't open that photo. Please try sending it again, "
             "or type out what you need and we'll help.",
         )
         return
-    answer = ask_claude_image(sender, image_b64, mime, caption)
+    answer = ask_claude_image(sender, images, " ".join(captions))
     send_whatsapp(sender, answer)
 
 @app.post("/webhook")
@@ -2679,8 +2746,11 @@ async def receive(request: Request, background: BackgroundTasks):
                     if customer:
                         mark_human_reply(customer)
                         body = (echo.get("text") or {}).get("body", "")
+                        # Stored as "staff", not "assistant", so the chat viewer can
+                        # show who really said it — otherwise a colleague's words look
+                        # like the bot's and reviewing the bot becomes guesswork.
                         save_message("".join(c for c in customer if c.isdigit()),
-                                     "assistant", body or "[colleague replied in the app]")
+                                     "staff", body or "[colleague replied in the app]")
                 continue
             # Delivery receipts (sent / delivered / read / failed). Nothing to reply to,
             # but this is the ONLY place WhatsApp explains why a message never landed,
