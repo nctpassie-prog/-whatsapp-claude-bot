@@ -1472,8 +1472,37 @@ def ask_claude_image(user: str, image_b64: str, mime: str, caption: str) -> str:
     }]
     return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
 
+def ask_claude_pdf(user: str, pdf_b64: str, caption: str, filename: str = "") -> str:
+    """Read a PDF the customer sent (usually an NCT fail sheet or a garage report)."""
+    note = (caption or "").strip()
+    save_message(user, "user",
+                 ("[Customer sent a document] " + (filename or "") + " " + note).strip())
+    history = get_history(user)
+    system_prompt = (load_system_prompt() + availability_block() + contact_hint(user)
+                     + customer_context(user))
+    if len(history) <= 1:
+        system_prompt += WELCOME_HINT
+    prompt_text = note or (
+        "The customer sent this document — it is most likely an NCT fail sheet, a test "
+        "report or a quote. Read it carefully and reply helpfully: for a fail sheet, list "
+        "the failed items in plain words and reassure them we can fix it and prepare the "
+        "car to pass. Never invent prices. If it is not something we can act on, ask "
+        "politely what they need. Never mention file types or that you are reading a file."
+    )
+    messages = history[:-1] + [{
+        "role": "user",
+        "content": [
+            {"type": "document",
+             "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+            {"type": "text", "text": prompt_text},
+        ],
+    }]
+    return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
+
 # ---------------------------------------------------------------- WhatsApp media
 _CLAUDE_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+# Claude can read PDFs directly; anything else still goes to a colleague.
+MAX_PDF_BYTES = 25 * 1024 * 1024
 
 def get_media(media_id: str):
     """Download a WhatsApp media file. Returns (base64_data, mime_type)."""
@@ -2525,6 +2554,41 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
     except Exception:
         log.exception("Failed to alert owner about unreadable message from %s", sender)
 
+def handle_document_message(sender: str, media_id: str, caption: str,
+                            filename: str = "", arrived_on: str = "") -> None:
+    """Read a PDF the customer sent. Anything else still goes to a colleague."""
+    if arrived_on:
+        _ctx_phone_id.set(arrived_on)
+    if is_blocked(sender) or is_paused(sender):
+        return
+    if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP) and (
+            not bot_enabled() or human_handling(sender)):
+        save_message(sender, "user", "[Customer sent a document]")
+        return
+    if not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP):
+        try:
+            record_customer(sender)
+        except Exception:
+            log.exception("Failed to record customer %s", sender)
+    try:
+        data, mime = get_media_bytes(media_id)
+    except Exception:
+        log.exception("Could not download document %s", media_id)
+        handle_unreadable_message(sender, "document", arrived_on)
+        return
+    if mime != "application/pdf" or len(data) > MAX_PDF_BYTES:
+        log.info("Document from %s is %s (%d bytes) — handing to a colleague",
+                 sender, mime, len(data))
+        handle_unreadable_message(sender, "document", arrived_on)
+        return
+    try:
+        reply = ask_claude_pdf(sender, base64.b64encode(data).decode(), caption, filename)
+    except Exception:
+        log.exception("Failed to read PDF from %s", sender)
+        handle_unreadable_message(sender, "document", arrived_on)
+        return
+    send_whatsapp(sender, reply, arrived_on)
+
 def handle_voice_message(sender: str, media_id: str, arrived_on: str = "") -> None:
     """Listen to a customer's voice note and answer it like any other message."""
     if arrived_on:
@@ -2657,6 +2721,13 @@ async def receive(request: Request, background: BackgroundTasks):
                     if sender and media_id:
                         background.add_task(handle_image_message, sender, media_id,
                                             caption, arrived_on)
+                elif mtype == "document":
+                    doc = msg.get("document", {}) or {}
+                    media_id = doc.get("id", "")
+                    if sender and media_id:
+                        background.add_task(handle_document_message, sender, media_id,
+                                            doc.get("caption", ""), doc.get("filename", ""),
+                                            arrived_on)
                 elif mtype in ("audio", "voice"):
                     media_id = (msg.get(mtype, {}) or {}).get("id", "")
                     if sender and media_id:
