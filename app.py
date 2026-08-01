@@ -1229,13 +1229,18 @@ def human_handling(user: str) -> bool:
 
 # ---------------------------------------------------------------- Claude
 WELCOME_HINT = (
-    "\n\nThis is the customer's FIRST message to us. Open with a VERY SHORT, friendly "
-    "one-line welcome in this exact style (translated into the customer's language): "
+    "\n\nThis is the customer's FIRST message to us here.\n"
+    "IF their message is just a greeting or vague (\"hi\", \"hello\", \"are you open?\"), "
+    "reply with ONE short friendly welcome line in this style (in their language): "
     "\"Hi \U0001F44B Welcome to NCTPass! Just message us here anytime and we'll help "
-    "straight away \U0001F44D — a service, NCT repair, or a quick question?\" Keep it to "
-    "that single line. If their first message already asks something specific, give that "
-    "one-line welcome and then answer their question. Do NOT add extra sentences about "
-    "our location, history or services."
+    "straight away \U0001F44D — a service, NCT repair, or a quick question?\"\n"
+    "BUT IF their first message already tells you what they want — especially if they "
+    "mention an existing booking, an appointment, a car they've dropped in, or any "
+    "specific question — do NOT use that welcome line at all. It makes us look like we "
+    "don't know them. Just greet them briefly and naturally (\"Hi! Of course —\") and get "
+    "straight to answering. NEVER paste the welcome line and then also answer, and NEVER "
+    "ask \"what do you need?\" when they have already told you.\n"
+    "Do NOT add extra sentences about our location, history or services."
 )
 
 OWNER_HINT = (
@@ -1452,9 +1457,14 @@ def _finish_reply(user: str, answer: str) -> str:
     save_message(user, "assistant", answer)
     return answer
 
-def ask_claude(user: str, text: str) -> str:
-    save_message(user, "user", text)
+def ask_claude(user: str, text: str, transcript_note: str = "") -> str:
+    """`transcript_note` is what gets stored in the chat history instead of `text` —
+    used when `text` is an internal instruction (e.g. 'customer sent a sticker'), so
+    the owner reading the conversation sees a clean note, not our own wording."""
+    save_message(user, "user", transcript_note or text)
     messages = get_history(user)
+    if transcript_note:  # let Claude see the real instruction, not the tidy label
+        messages = messages[:-1] + [{"role": "user", "content": text}]
     system_prompt = load_system_prompt() + availability_block()
     if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
         system_prompt += OWNER_HINT
@@ -2467,7 +2477,7 @@ def valid_signature(body: bytes, signature: str) -> bool:
     expected = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
-def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
+def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note: str = "") -> None:
     if arrived_on:
         _ctx_phone_id.set(arrived_on)  # reply from the number it came in on
     if is_blocked(sender):
@@ -2505,7 +2515,7 @@ def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
     if not is_owner and not bot_enabled():
         # Master switch is off: record everything, reply to nobody.
         log.info("Bot is OFF; recording message from %s without replying", sender)
-        save_message(sender, "user", text)
+        save_message(sender, "user", transcript_note or text)
         record_customer(sender)
         return
     if lowered == PAUSE_KEYWORD:
@@ -2517,13 +2527,13 @@ def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
         return
     if is_paused(sender):
         log.info("Chat with %s is paused; skipping auto-reply", sender)
-        save_message(sender, "user", text)
+        save_message(sender, "user", transcript_note or text)
         return
     if not is_owner and human_handling(sender):
         # A colleague is already dealing with this customer in the app. We stay out of
         # the conversation, but keep watching in case it turns sour.
         log.info("Human is handling %s; skipping auto-reply", sender)
-        save_message(sender, "user", text)
+        save_message(sender, "user", transcript_note or text)
         record_customer(sender)
         try:
             check_escalation(sender)
@@ -2536,7 +2546,7 @@ def handle_message(sender: str, text: str, arrived_on: str = "") -> None:
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
-    answer = ask_claude(sender, text)
+    answer = ask_claude(sender, text, transcript_note)
     send_whatsapp(sender, answer)
 
 # Things a customer sends that carry REAL content we can't read (a fail sheet PDF,
@@ -2565,7 +2575,9 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
                   "they need. NEVER mention files, attachments, formats, or anything you "
                   "can or cannot read, and do NOT promise that anyone will look at "
                   "anything. Sound like a friendly person at the garage.]")
-    handle_message(sender, prompt, arrived_on)
+    note = (f"[Customer sent a {what}]" if real
+            else "[Customer sent a sticker or reaction]")
+    handle_message(sender, prompt, arrived_on, transcript_note=note)
     if not real:
         return  # nothing to chase — no alert, or every sticker would ping the phones
     if OWNER_WHATSAPP and sender == OWNER_WHATSAPP:
