@@ -1416,6 +1416,15 @@ def _finish_reply(user: str, answer: str) -> str:
             answer = NOT_OPEN_MSG.get(
                 reminder_lang_code(booking.get("lang", "")), NOT_OPEN_MSG["en"]
             ).format(date=opens.strftime("%A %d %B") if opens else "")
+            # The owner may well want to squeeze this one in — never let a customer
+            # who wants us SOONER walk away without him hearing about it.
+            try:
+                alert_owner(user, "⏳ Customer wants a date we're not taking yet",
+                            f"They asked for {booking.get('date', 'an earlier date')} "
+                            f"({booking.get('car', '')} {booking.get('reg', '')} — "
+                            f"{booking.get('need', '')}). Squeeze them in?")
+            except Exception:
+                log.exception("Failed to alert owner about an early-date request")
             save_message(user, "assistant", answer)
             return answer
         if not is_owner and day_is_full(booking.get("date", "")):
