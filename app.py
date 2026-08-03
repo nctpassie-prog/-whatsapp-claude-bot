@@ -653,6 +653,15 @@ def db() -> sqlite3.Connection:
         " name TEXT, phone TEXT, car TEXT, reg TEXT, need TEXT,"
         " time_text TEXT, date TEXT, created_ts REAL)"
     )
+    # Belt and braces against double-booking the same car on the same day: even if a
+    # code path slips past the check in save_booking, the database itself refuses.
+    # Partial index so blank regs (not yet known) never collide with each other.
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_booking_day_reg "
+                     "ON bookings (date, UPPER(TRIM(reg))) "
+                     "WHERE TRIM(COALESCE(reg,'')) <> ''")
+    except sqlite3.OperationalError:
+        pass  # older SQLite without partial-index support, or duplicates still present
     # Columns added after the table already existed in the persistent DB.
     for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''"),
                      ("review_sent", "review_sent INTEGER DEFAULT 0")):
@@ -946,16 +955,21 @@ def save_booking(fields: dict) -> bool:
             log.info("Duplicate booking ignored: %s %s on %s", reg or phone, date_, date_)
             record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
             return False
-    with closing(db()) as conn, conn:
-        conn.execute(
-            "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang, created_ts)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                fields.get("name", ""), fields.get("phone", ""), fields.get("car", ""),
-                reg, fields.get("need", ""), fields.get("time", ""),
-                fields.get("date", ""), fields.get("lang", ""), time.time(),
-            ),
-        )
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang,"
+                " created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    fields.get("name", ""), fields.get("phone", ""), fields.get("car", ""),
+                    reg, fields.get("need", ""), fields.get("time", ""),
+                    fields.get("date", ""), fields.get("lang", ""), time.time(),
+                ),
+            )
+    except sqlite3.IntegrityError:  # the unique index caught a double-booking
+        log.info("Duplicate booking blocked by index: %s on %s", reg, date_)
+        record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
+        return False
     # Save/enrich the customer contact record (name + number + reg).
     record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
     return True
@@ -2196,7 +2210,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe"}
+                     "calbackfill", "caltest", "dedupe", "caltidy"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2634,6 +2648,56 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "caltidy":
+        # List every event in the next 60 days, delete exact duplicates (same day +
+        # same title) and any leftover bot test events, then report what remains.
+        if not calendar_enabled():
+            return {"error": "Calendar not connected."}
+        tok = _google_access_token("calendar")
+        headers = {"Authorization": f"Bearer {tok}"}
+        start = now_local().date()
+        end = start + timedelta(days=60)
+        items, page = [], ""
+        try:
+            for _ in range(10):
+                params = {"timeMin": f"{start}T00:00:00Z", "timeMax": f"{end}T23:59:59Z",
+                          "singleEvents": "true", "orderBy": "startTime", "maxResults": 250}
+                if page:
+                    params["pageToken"] = page
+                r = httpx.get(
+                    f"https://www.googleapis.com/calendar/v3/calendars/"
+                    f"{quote(GOOGLE_CALENDAR_ID)}/events",
+                    params=params, headers=headers, timeout=30)
+                if r.status_code >= 300:
+                    return {"error": f"list failed {r.status_code}", "body": r.text[:300]}
+                data = r.json()
+                items.extend(data.get("items", []))
+                page = data.get("nextPageToken", "")
+                if not page:
+                    break
+        except Exception as exc:
+            return {"error": str(exc)[:300]}
+        seen, deleted, kept = set(), [], []
+        for ev in items:
+            summary = (ev.get("summary") or "").strip()
+            day = ((ev.get("start") or {}).get("dateTime")
+                   or (ev.get("start") or {}).get("date") or "")[:10]
+            is_test = "bot test event" in summary.lower()
+            key = (day, summary)
+            if is_test or key in seen:
+                try:
+                    dr = httpx.delete(
+                        f"https://www.googleapis.com/calendar/v3/calendars/"
+                        f"{quote(GOOGLE_CALENDAR_ID)}/events/{ev.get('id')}",
+                        headers=headers, timeout=30)
+                    if dr.status_code < 300:
+                        deleted.append(f"{day} {summary}")
+                        continue
+                except Exception:
+                    log.exception("Could not delete calendar event")
+            seen.add(key)
+            kept.append(f"{day} {summary}")
+        return {"deleted": deleted, "remaining": kept}
     if action == "dedupe":
         # Remove duplicate bookings (same day + same car/phone), keeping the earliest,
         # and clear the matching duplicate calendar events.
