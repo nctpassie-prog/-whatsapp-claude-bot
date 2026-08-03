@@ -146,6 +146,10 @@ CALENDAR_ACCOUNT = os.environ.get("CALENDAR_ACCOUNT", "") or BOOKING_EMAIL_TO
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts"
+# Calendar is authorised SEPARATELY because it lives on a different Google account
+# (the bookings inbox) from the contacts, so each keeps its own refresh token.
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 # Marker stored against a customer whose number the owner already has saved in their
 # own Google Contacts — we leave those alone rather than rename or duplicate them.
 GOOGLE_SKIP = "SKIP_ALREADY_IN_CONTACTS"
@@ -344,6 +348,53 @@ def calendar_link(title: str, details: str, date_str: str = "") -> str:
         url += f"&authuser={quote(CALENDAR_ACCOUNT)}"
     return url
 
+def calendar_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
+                and get_setting("google_calendar_refresh_token"))
+
+def create_calendar_event(fields: dict) -> bool:
+    """Put the booking straight into the bookings Google Calendar.
+
+    Every booking used to rely on someone tapping an 'add to calendar' link, so most
+    never made it in. Never raises — a calendar problem must not break a booking.
+    """
+    if not calendar_enabled():
+        return False
+    date_str = (fields.get("date") or "").strip()
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        log.info("Booking has no usable date (%r); no calendar event", date_str)
+        return False
+    car = fields.get("car", "")
+    reg = clean_reg(fields.get("reg", ""))
+    name = fields.get("name", "")
+    body = {
+        "summary": " ".join(x for x in [name or "NCTPass booking", "-", car, reg] if x),
+        "description": (
+            f"Car: {car}\nReg: {reg}\nNeed: {fields.get('need', '')}\n"
+            f"Name: {name}\nPhone: {fields.get('phone', '')}\n"
+            f"Came in on: {line_label()}\n\nDrop-off 9-11am. Added by the NCTPass bot."),
+        # Drop-off window, in Irish time regardless of where the server runs.
+        "start": {"dateTime": f"{d:%Y-%m-%d}T09:00:00", "timeZone": "Europe/Dublin"},
+        "end": {"dateTime": f"{d:%Y-%m-%d}T11:00:00", "timeZone": "Europe/Dublin"},
+    }
+    try:
+        token = _google_access_token("calendar")
+        if not token:
+            return False
+        r = httpx.post(
+            f"https://www.googleapis.com/calendar/v3/calendars/"
+            f"{quote(GOOGLE_CALENDAR_ID)}/events",
+            headers={"Authorization": f"Bearer {token}"}, json=body, timeout=30)
+        if r.status_code < 300:
+            log.info("Calendar event created for %s on %s", reg or name, date_str)
+            return True
+        log.warning("Calendar event failed %s: %s", r.status_code, (r.text or "")[:300])
+    except Exception:
+        log.exception("Could not create calendar event")
+    return False
+
 def notify_owner_booking(fields: dict) -> None:
     """Send the owner a booking summary (Telegram + WhatsApp) with a calendar link."""
     car = fields.get("car", "")
@@ -362,9 +413,17 @@ def notify_owner_booking(fields: dict) -> None:
         f"Came in on: {line_label()}"
     )
     title = f"NCTPass booking: {car} {reg}".strip()
-    cal_link = calendar_link(title, summary, fields.get("date", ""))
-    note = ("\U0001F514 New booking request\n\n" + summary +
-            "\n\nAdd to Google Calendar:\n" + cal_link)
+    in_calendar = False
+    try:
+        in_calendar = create_calendar_event(fields)
+    except Exception:
+        log.exception("Calendar event creation failed")
+    note = "\U0001F514 New booking request\n\n" + summary
+    if in_calendar:
+        note += "\n\n\U0001F4C5 Added to your bookings calendar automatically."
+    else:
+        note += ("\n\nAdd to Google Calendar:\n"
+                 + calendar_link(title, summary, fields.get("date", "")))
     try:
         send_telegram(note)
     except Exception:
@@ -669,9 +728,12 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
 def google_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and get_setting("google_refresh_token"))
 
-def _google_access_token() -> str:
+def _google_token_key(kind: str) -> str:
+    return "google_calendar_refresh_token" if kind == "calendar" else "google_refresh_token"
+
+def _google_access_token(kind: str = "contacts") -> str:
     """Swap the stored long-lived refresh token for a short-lived access token."""
-    refresh = get_setting("google_refresh_token")
+    refresh = get_setting(_google_token_key(kind))
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and refresh):
         return ""
     r = httpx.post("https://oauth2.googleapis.com/token", data={
@@ -2213,7 +2275,7 @@ def contacts_vcf(token: str = Query("")):
                     headers={"Content-Disposition": 'attachment; filename="nctpass-customers.vcf"'})
 
 @app.get("/google/connect")
-def google_connect(token: str = Query("")):
+def google_connect(token: str = Query(""), what: str = Query("contacts")):
     """Owner visits this once to authorise Google Contacts. Redirects to Google's
     consent screen; Google then calls /google/callback with the code."""
     if not VERIFY_TOKEN or token != VERIFY_TOKEN:
@@ -2222,14 +2284,16 @@ def google_connect(token: str = Query("")):
         return Response("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Railway first.",
                         status_code=400)
     redirect_uri = PUBLIC_URL.rstrip("/") + GOOGLE_REDIRECT_PATH
+    kind = "calendar" if what.lower().startswith("cal") else "contacts"
+    scope = GOOGLE_CALENDAR_SCOPE if kind == "calendar" else GOOGLE_SCOPE
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
         f"?client_id={quote(GOOGLE_CLIENT_ID)}"
         f"&redirect_uri={quote(redirect_uri)}"
         "&response_type=code"
-        f"&scope={quote(GOOGLE_SCOPE)}"
+        f"&scope={quote(scope)}"
         "&access_type=offline&prompt=consent"
-        f"&state={quote(VERIFY_TOKEN)}"
+        f"&state={quote(VERIFY_TOKEN + '|' + kind)}"
     )
     return RedirectResponse(auth_url)
 
@@ -2237,7 +2301,9 @@ def google_connect(token: str = Query("")):
 def google_callback(code: str = Query(""), state: str = Query(""), error: str = Query("")):
     """Google redirects here after the owner clicks Allow. We swap the code for a
     long-lived refresh token and store it, so contact-saving works from then on."""
-    if state != VERIFY_TOKEN:
+    expected, _, kind = state.partition("|")
+    kind = kind or "contacts"
+    if expected != VERIFY_TOKEN:
         return Response("Bad state — please start again from /google/connect.", status_code=403)
     if error:
         return Response(f"Google returned: {error}", status_code=400)
@@ -2262,7 +2328,11 @@ def google_callback(code: str = Query(""), state: str = Query(""), error: str = 
             "Connected, but Google did not return a refresh token. Remove NCTPass at "
             "myaccount.google.com/permissions, then open /google/connect again.",
             status_code=400)
-    set_setting("google_refresh_token", refresh)
+    set_setting(_google_token_key(kind), refresh)
+    if kind == "calendar":
+        return Response("✅ Google Calendar is connected. You can close this page — "
+                        "new bookings will now appear in your bookings calendar "
+                        "automatically.")
     return Response("✅ Google Contacts is connected. You can close this page — new "
                     "customers will now be saved automatically.")
 
@@ -2530,8 +2600,26 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"google_client_id_set": bool(GOOGLE_CLIENT_ID),
                 "google_client_secret_set": bool(GOOGLE_CLIENT_SECRET),
                 "authorised": bool(get_setting("google_refresh_token")),
+                "calendar_connected": calendar_enabled(),
+                "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "calbackfill":
+        # Put existing upcoming bookings into the calendar (they were only ever
+        # 'add to calendar' links before, so most were never added).
+        if not calendar_enabled():
+            return {"error": "Calendar not connected. Open /google/connect?what=calendar"}
+        today_iso = now_local().date().isoformat()
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT name, phone, car, reg, need, date FROM bookings "
+                "WHERE date >= ? ORDER BY date", (today_iso,)).fetchall()
+        done = []
+        for name, phone, car, reg, need, date_ in rows:
+            ok = create_calendar_event({"name": name, "phone": phone, "car": car,
+                                        "reg": reg, "need": need, "date": date_})
+            done.append({"date": date_, "who": name or phone, "reg": reg, "added": ok})
+        return {"upcoming_bookings": len(rows), "results": done}
     if action == "gsyncall":
         # Push every existing customer who has a name or reg into Google Contacts.
         if not google_enabled():
