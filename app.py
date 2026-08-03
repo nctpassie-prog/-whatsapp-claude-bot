@@ -1336,7 +1336,10 @@ def _call_claude(messages: list, system_prompt: str) -> str:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 500,
+                # Generous headroom: a reply cut off mid-marker leaks '<<<HANDOVER|…'
+                # to the customer AND loses the alert, because the closing >>> never
+                # arrives for the parser to match.
+                "max_tokens": int(os.environ.get("MAX_REPLY_TOKENS", "1200")),
                 "system": system_prompt,
                 "messages": messages,
             },
@@ -1355,6 +1358,11 @@ def _call_claude(messages: list, system_prompt: str) -> str:
 
 ALL_MARKERS_RE = re.compile(
     r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER)\|.*?>>>", re.DOTALL)
+# The same markers but WITHOUT a closing '>>>' — i.e. the reply ran out of tokens
+# part-way through writing one. Anchored to the end so it can only ever match a
+# genuine tail fragment, never a complete marker earlier in the text.
+TRUNCATED_MARKER_RE = re.compile(
+    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER)\|(?:(?!>>>).)*$", re.DOTALL)
 
 def visible_text(answer: str) -> str:
     """What the customer would actually see once the hidden markers are removed."""
@@ -1380,6 +1388,22 @@ def _call_claude_visible(messages: list, system_prompt: str, user: str = "") -> 
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
+    # A reply can be cut off mid-marker (token limit), leaving '<<<HANDOVER|reason=…'
+    # with no closing '>>>'. The normal parsers need the '>>>' so they miss it and the
+    # fragment goes out to the customer. Catch that here, before anything else.
+    truncated = TRUNCATED_MARKER_RE.search(answer)
+    if truncated:
+        kind = truncated.group(1)
+        log.warning("Reply to %s was cut off mid-%s marker — stripping it", user, kind)
+        answer = TRUNCATED_MARKER_RE.sub("", answer).strip()
+        if kind in ("HANDOVER", "FEEDBACK", "UNKNOWN") and not (
+                OWNER_WHATSAPP and user == OWNER_WHATSAPP):
+            try:
+                alert_owner(user, "🙋 A customer needs you to follow up",
+                            "The bot's note was cut short — check the chat for what "
+                            "they asked.")
+            except Exception:
+                log.exception("Failed to alert owner about truncated marker")
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     if booking:
