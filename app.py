@@ -925,8 +925,27 @@ def customers_list(limit: int = 20) -> str:
         lines.append(f"{i}. " + " · ".join(bits))
     return "\n".join(lines)
 
-def save_booking(fields: dict) -> None:
+def save_booking(fields: dict) -> bool:
+    """Store a booking. Returns False if it was a duplicate and nothing was saved.
+
+    The same car was being written twice for one day (the booking marker can be
+    emitted more than once in a conversation), which inflated the day's count and
+    made the bot turn real customers away from days that were not actually full.
+    """
     reg = clean_reg(fields.get("reg", ""))  # store reg without spaces or dashes
+    date_ = (fields.get("date") or "").strip()
+    phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
+    if date_:
+        with closing(db()) as conn:
+            dupe = conn.execute(
+                "SELECT id FROM bookings WHERE date = ? AND ("
+                " (TRIM(COALESCE(reg,'')) <> '' AND UPPER(TRIM(reg)) = ?)"
+                " OR (? <> '' AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?))",
+                (date_, reg, phone, "%" + phone[-9:] if phone else "\x00")).fetchone()
+        if dupe:
+            log.info("Duplicate booking ignored: %s %s on %s", reg or phone, date_, date_)
+            record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
+            return False
     with closing(db()) as conn, conn:
         conn.execute(
             "INSERT INTO bookings (name, phone, car, reg, need, time_text, date, lang, created_ts)"
@@ -939,6 +958,7 @@ def save_booking(fields: dict) -> None:
         )
     # Save/enrich the customer contact record (name + number + reg).
     record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
+    return True
 
 def bookings_for(day: str) -> str:
     """day = 'today' or 'tomorrow'. Returns a formatted list for the owner."""
@@ -1500,18 +1520,22 @@ def _finish_reply(user: str, answer: str) -> str:
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
             save_message(user, "assistant", answer)
             return answer
+        is_new = True
         try:
-            save_booking(booking)
+            is_new = save_booking(booking)
         except Exception:
             log.exception("Failed to save booking")
-        try:
-            notify_owner_booking(booking)
-        except Exception:
-            log.exception("Failed to notify owner of booking")
-        try:
-            email_booking(booking)
-        except Exception:
-            log.exception("Failed to email booking")
+        # A repeat of a booking we already hold must not alert, email or make a
+        # second calendar entry — that is what filled the diary with doubles.
+        if is_new:
+            try:
+                notify_owner_booking(booking)
+            except Exception:
+                log.exception("Failed to notify owner of booking")
+            try:
+                email_booking(booking)
+            except Exception:
+                log.exception("Failed to email booking")
     answer, customer = process_customer(answer)
     if customer and not is_owner:
         try:
@@ -2172,7 +2196,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest"}
+                     "calbackfill", "caltest", "dedupe"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2610,6 +2634,48 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "dedupe":
+        # Remove duplicate bookings (same day + same car/phone), keeping the earliest,
+        # and clear the matching duplicate calendar events.
+        removed, cal_removed = [], []
+        with closing(db()) as conn, conn:
+            rows = conn.execute(
+                "SELECT id, name, phone, reg, date FROM bookings ORDER BY id").fetchall()
+            seen = {}
+            for bid, name, phone, reg, date_ in rows:
+                digits = "".join(c for c in str(phone or "") if c.isdigit())
+                key = (date_, (reg or "").upper().strip() or digits[-9:])
+                if not date_ or not key[1]:
+                    continue
+                if key in seen:
+                    conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
+                    removed.append({"date": date_, "who": name or phone, "reg": reg})
+                else:
+                    seen[key] = bid
+        if calendar_enabled() and removed:
+            try:
+                tok = _google_access_token("calendar")
+                headers = {"Authorization": f"Bearer {tok}"}
+                for dup in removed:
+                    d = dup["date"]
+                    r = httpx.get(
+                        f"https://www.googleapis.com/calendar/v3/calendars/"
+                        f"{quote(GOOGLE_CALENDAR_ID)}/events",
+                        params={"timeMin": f"{d}T00:00:00Z", "timeMax": f"{d}T23:59:59Z",
+                                "q": (dup["reg"] or dup["who"] or ""), "singleEvents": "true"},
+                        headers=headers, timeout=30)
+                    items = r.json().get("items", []) if r.status_code < 300 else []
+                    for extra in items[1:]:  # keep the first, drop the rest
+                        dr = httpx.delete(
+                            f"https://www.googleapis.com/calendar/v3/calendars/"
+                            f"{quote(GOOGLE_CALENDAR_ID)}/events/{extra.get('id')}",
+                            headers=headers, timeout=30)
+                        if dr.status_code < 300:
+                            cal_removed.append(extra.get("summary", ""))
+            except Exception:
+                log.exception("Could not tidy duplicate calendar events")
+        return {"duplicate_bookings_removed": removed,
+                "duplicate_calendar_events_removed": cal_removed}
     if action == "caltest":
         # Show exactly what Google says when we try to create an event.
         out = {"connected": calendar_enabled(), "calendar_id": GOOGLE_CALENDAR_ID}
