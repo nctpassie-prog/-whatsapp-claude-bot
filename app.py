@@ -2172,7 +2172,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill"}
+                     "calbackfill", "caltest"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2610,6 +2610,27 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "caltest":
+        # Show exactly what Google says when we try to create an event.
+        out = {"connected": calendar_enabled(), "calendar_id": GOOGLE_CALENDAR_ID}
+        try:
+            tok = _google_access_token("calendar")
+            out["got_access_token"] = bool(tok)
+            if tok:
+                d = (now_local().date() + timedelta(days=7)).isoformat()
+                r = httpx.post(
+                    f"https://www.googleapis.com/calendar/v3/calendars/"
+                    f"{quote(GOOGLE_CALENDAR_ID)}/events",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    json={"summary": "NCTPass bot test event",
+                          "start": {"dateTime": f"{d}T09:00:00", "timeZone": "Europe/Dublin"},
+                          "end": {"dateTime": f"{d}T11:00:00", "timeZone": "Europe/Dublin"}},
+                    timeout=30)
+                out["http"] = r.status_code
+                out["body"] = (r.text or "")[:600]
+        except Exception as exc:
+            out["error"] = str(exc)[:300]
+        return out
     if action == "calbackfill":
         # Put existing upcoming bookings into the calendar (they were only ever
         # 'add to calendar' links before, so most were never added).
