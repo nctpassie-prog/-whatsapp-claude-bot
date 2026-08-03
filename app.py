@@ -622,6 +622,12 @@ def db() -> sqlite3.Connection:
     # When we last warned the owner about a chat, so we don't spam them.
     conn.execute("CREATE TABLE IF NOT EXISTS alerts ("
                  " wa_user TEXT PRIMARY KEY, ts REAL)")
+    # When we chased an unanswered alert, so a customer waiting on a person doesn't
+    # get forgotten and the owner gets reminded once (not every hour).
+    try:
+        conn.execute("ALTER TABLE alerts ADD COLUMN chased_ts REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # What we actually charged for a job, logged by the owner after the work.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS charges ("
@@ -1902,6 +1908,80 @@ def _make_followup(user: str) -> str:
         return ""
     return text
 
+ALERT_CHASE_HOURS = float(os.environ.get("ALERT_CHASE_HOURS", "3"))
+
+CHASE_SYSTEM = (
+    "You are the NCTPass car garage's WhatsApp assistant. A customer asked something "
+    "that had to be passed to a person, and nobody has replied to them yet. Write ONE "
+    "short, warm message apologising for the wait and letting them know we're still on "
+    "it, and asking whether they'd still like us to sort it. Keep it to one or two "
+    "lines, in the customer's own language. NEVER quote a price, never promise a date "
+    "or a specific answer, never invent anything, and never mention systems, alerts or "
+    "colleagues being busy. If a follow-up would be inappropriate (they already said "
+    "they're not interested, the matter is clearly closed, or it was a complaint that "
+    "needs a person not a bot), reply with exactly SKIP."
+)
+
+def _make_chase(user: str) -> str:
+    history = get_history(user)
+    if not history:
+        return ""
+    messages = history + [{"role": "user", "content":
+                           "(Internal: nobody has come back to this customer yet. Write "
+                           "the check-in per your rules, or reply SKIP.)"}]
+    raw = _call_claude(messages, CHASE_SYSTEM) or ""
+    text = re.sub(r"<<<.*?>>>", "", raw).strip()
+    if not text or text.upper().startswith("SKIP"):
+        return ""
+    return text
+
+def chase_unresolved_alerts() -> None:
+    """Chase alerts nobody has acted on.
+
+    An alert means a customer is waiting on a person. If no colleague has replied a
+    few hours later, remind the owner AND check back with the customer, so nobody is
+    left hanging on a promise that someone would come back to them.
+    """
+    if not bot_enabled():
+        return
+    now = now_local()
+    if not (9 <= now.hour < 20):  # don't message customers at night
+        return
+    nowts = time.time()
+    cutoff = nowts - ALERT_CHASE_HOURS * 3600
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_user, ts FROM alerts WHERE ts <= ? AND ts >= ? "
+            "AND COALESCE(chased_ts, 0) < ts", (cutoff, nowts - 24 * 3600)).fetchall()
+    for user, alert_ts in rows:
+        try:
+            if is_blocked(user) or is_paused(user) or (
+                    OWNER_WHATSAPP and user == OWNER_WHATSAPP):
+                continue
+            with closing(db()) as conn:
+                staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                                     (user,)).fetchone()
+                booked = conn.execute(
+                    "SELECT 1 FROM bookings WHERE created_ts >= ? AND phone LIKE ?",
+                    (alert_ts, "%" + user[-9:])).fetchone()
+            handled = (staff and (staff[0] or 0) > alert_ts) or booked
+            with closing(db()) as conn, conn:  # mark either way; only chase once
+                conn.execute("UPDATE alerts SET chased_ts = ? WHERE wa_user = ?",
+                             (nowts, user))
+            if handled:
+                continue
+            hours = int((nowts - alert_ts) / 3600)
+            alert_owner(user, "⏰ Still waiting — nobody has replied",
+                        f"It's been about {hours}h since this needed someone. "
+                        "The customer has been sent a holding message.")
+            text = _make_chase(user)
+            if text:
+                send_whatsapp(user, text)
+                save_message(user, "assistant", text)
+                log.info("Chased unanswered alert for %s (%dh)", user, hours)
+        except Exception:
+            log.exception("Failed to chase unresolved alert for %s", user)
+
 def _maybe_followup(user: str, nowts: float) -> None:
     if is_blocked(user) or (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
         return
@@ -1975,6 +2055,10 @@ def reminder_loop() -> None:
         except Exception:
             log.exception("Review loop error")
         try:
+            chase_unresolved_alerts()
+        except Exception:
+            log.exception("Alert chase error")
+        try:
             send_weekly_gap_report()
         except Exception:
             log.exception("Gap report error")
@@ -2022,7 +2106,8 @@ h1{margin:0;font-size:18px}
 
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
-READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus"}
+READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
+                     "waiting"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2240,6 +2325,25 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "customers": [{"number": n, "name": nm or "(none)", "reg": rg or "(none)",
                                "google": gstate(gr)}
                               for n, nm, rg, gr in rows]}
+    if action == "waiting":
+        # Customers who needed a person — and whether anyone has replied since.
+        nowts = time.time()
+        out = []
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_user, ts, COALESCE(chased_ts,0) FROM alerts "
+                "ORDER BY ts DESC LIMIT 30").fetchall()
+            for u, ts, chased in rows:
+                staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                                     (u,)).fetchone()
+                replied = bool(staff and (staff[0] or 0) > ts)
+                out.append({"customer": customer_label(u),
+                            "alerted": _fmt_ts(ts),
+                            "hours_ago": round((nowts - ts) / 3600, 1),
+                            "someone_replied": replied,
+                            "chased": bool(chased and chased >= ts)})
+        return {"waiting": [r for r in out if not r["someone_replied"]],
+                "handled": [r for r in out if r["someone_replied"]]}
     if action == "weeklytest":
         # Send this week's report right now, ignoring the day/hour schedule.
         send_weekly_gap_report(force=True)
