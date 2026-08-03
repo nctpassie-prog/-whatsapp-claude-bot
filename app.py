@@ -2169,7 +2169,10 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
-                     "waiting"}
+                     "waiting",
+                     # Writes, but only ever adds the owner's OWN bookings to the
+                     # owner's OWN calendar — it cannot delete or expose anything.
+                     "calbackfill"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
