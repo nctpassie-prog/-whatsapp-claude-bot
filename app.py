@@ -2278,7 +2278,10 @@ def contacts_vcf(token: str = Query("")):
 def google_connect(token: str = Query(""), what: str = Query("contacts")):
     """Owner visits this once to authorise Google Contacts. Redirects to Google's
     consent screen; Google then calls /google/callback with the code."""
-    if not VERIFY_TOKEN or token != VERIFY_TOKEN:
+    # The review key is enough to START this: all it does is redirect to Google's own
+    # consent screen. Nothing can actually be granted without signing into the Google
+    # account and pressing Allow, which only the owner can do.
+    if not can_review(token):
         return Response(status_code=403)
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
         return Response("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Railway first.",
@@ -2293,7 +2296,7 @@ def google_connect(token: str = Query(""), what: str = Query("contacts")):
         "&response_type=code"
         f"&scope={quote(scope)}"
         "&access_type=offline&prompt=consent"
-        f"&state={quote(VERIFY_TOKEN + '|' + kind)}"
+        f"&state={quote(token + '|' + kind)}"
     )
     return RedirectResponse(auth_url)
 
@@ -2303,7 +2306,7 @@ def google_callback(code: str = Query(""), state: str = Query(""), error: str = 
     long-lived refresh token and store it, so contact-saving works from then on."""
     expected, _, kind = state.partition("|")
     kind = kind or "contacts"
-    if expected != VERIFY_TOKEN:
+    if not can_review(expected):  # must match the key that started the flow
         return Response("Bad state — please start again from /google/connect.", status_code=403)
     if error:
         return Response(f"Google returned: {error}", status_code=400)
