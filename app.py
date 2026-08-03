@@ -2677,27 +2677,45 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     break
         except Exception as exc:
             return {"error": str(exc)[:300]}
-        seen, deleted, kept = set(), [], []
+        # The same booking exists under two different titles (the old "NCTPass
+        # booking: …" link format and the newer "Name - Car Reg"), so matching on the
+        # title alone leaves duplicates behind. Instead: remove everything WE created
+        # — identified only by our own markers, so the owner's own entries are never
+        # touched — then rebuild from the deduplicated bookings table.
+        deleted, left_alone = [], []
         for ev in items:
             summary = (ev.get("summary") or "").strip()
+            desc = (ev.get("description") or "")
             day = ((ev.get("start") or {}).get("dateTime")
                    or (ev.get("start") or {}).get("date") or "")[:10]
-            is_test = "bot test event" in summary.lower()
-            key = (day, summary)
-            if is_test or key in seen:
-                try:
-                    dr = httpx.delete(
-                        f"https://www.googleapis.com/calendar/v3/calendars/"
-                        f"{quote(GOOGLE_CALENDAR_ID)}/events/{ev.get('id')}",
-                        headers=headers, timeout=30)
-                    if dr.status_code < 300:
-                        deleted.append(f"{day} {summary}")
-                        continue
-                except Exception:
-                    log.exception("Could not delete calendar event")
-            seen.add(key)
-            kept.append(f"{day} {summary}")
-        return {"deleted": deleted, "remaining": kept}
+            ours = ("Added by the NCTPass bot" in desc
+                    or summary.startswith("NCTPass booking:")
+                    or "bot test event" in summary.lower())
+            if not ours:
+                left_alone.append(f"{day} {summary}")
+                continue
+            try:
+                dr = httpx.delete(
+                    f"https://www.googleapis.com/calendar/v3/calendars/"
+                    f"{quote(GOOGLE_CALENDAR_ID)}/events/{ev.get('id')}",
+                    headers=headers, timeout=30)
+                if dr.status_code < 300:
+                    deleted.append(f"{day} {summary}")
+            except Exception:
+                log.exception("Could not delete calendar event")
+        # Rebuild from the diary — one event per booking, no duplicates possible.
+        rebuilt = []
+        today_iso = now_local().date().isoformat()
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT name, phone, car, reg, need, date FROM bookings "
+                "WHERE date >= ? ORDER BY date", (today_iso,)).fetchall()
+        for name, phone, car, reg, need, date_ in rows:
+            if create_calendar_event({"name": name, "phone": phone, "car": car,
+                                      "reg": reg, "need": need, "date": date_}):
+                rebuilt.append(f"{date_} {name or phone} {reg or ''}".strip())
+        return {"removed": deleted, "rebuilt": rebuilt, "your_own_events_untouched":
+                len(left_alone)}
     if action == "dedupe":
         # Remove duplicate bookings (same day + same car/phone), keeping the earliest,
         # and clear the matching duplicate calendar events.
