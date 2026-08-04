@@ -2216,6 +2216,70 @@ def send_due_followups() -> None:
         except Exception:
             log.exception("Follow-up failed for %s", user)
 
+DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
+
+def send_daily_briefing(force: bool = False) -> None:
+    """Every morning: who's in today, and who is still waiting on a person.
+
+    WhatsApp gives no way to mark a chat unread again, so instead of relying on the
+    owner spotting them in the app, the outstanding jobs come to him in one message.
+    """
+    now = now_local()
+    if not force and now.hour != DAILY_BRIEF_HOUR:
+        return
+    if not force and get_setting("last_brief") == now.date().isoformat():
+        return  # already sent today
+    set_setting("last_brief", now.date().isoformat())
+    today_iso = now.date().isoformat()
+    tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
+    nowts = time.time()
+    with closing(db()) as conn:
+        today_rows = conn.execute(
+            "SELECT name, car, reg, need FROM bookings WHERE date = ?", (today_iso,)).fetchall()
+        tom_rows = conn.execute(
+            "SELECT name, car, reg, need FROM bookings WHERE date = ?", (tomorrow_iso,)).fetchall()
+        alerts = conn.execute(
+            "SELECT a.wa_user, a.ts FROM alerts a ORDER BY a.ts DESC LIMIT 40").fetchall()
+        waiting = []
+        for u, ts in alerts:
+            staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                                 (u,)).fetchone()
+            if not (staff and (staff[0] or 0) > ts):
+                waiting.append((u, ts))
+    parts = [f"☀️ Good morning — {now.strftime('%A %d %B')}", ""]
+    if today_rows:
+        parts.append(f"📅 IN TODAY ({len(today_rows)}) — drop-off 9-11am:")
+        for name, car, reg, need in today_rows:
+            parts.append(f"  • {name or '(no name)'} — {car} {reg} — {need}")
+    else:
+        parts.append("📅 Nothing booked in today.")
+    if tom_rows:
+        parts.append("")
+        parts.append(f"➡️ Tomorrow: {len(tom_rows)} booked in.")
+    if waiting:
+        parts.append("")
+        parts.append(f"⚠️ STILL WAITING ON YOU ({len(waiting)}):")
+        for u, ts in waiting[:12]:
+            hrs = int((nowts - ts) / 3600)
+            when = f"{hrs}h" if hrs < 48 else f"{hrs // 24} days"
+            parts.append(f"  • {customer_label(u)} — waiting {when}")
+        parts.append("")
+        parts.append("Reply to these in WhatsApp, or they'll keep waiting.")
+    else:
+        parts.append("")
+        parts.append("✅ Nobody waiting on a reply — all clear.")
+    body = "\n".join(parts)
+    try:
+        send_telegram(body)
+    except Exception:
+        log.exception("Failed to send the daily briefing to Telegram")
+    try:
+        send_email(f"NCTPass — {now.strftime('%a %d %b')} briefing", body,
+                   OWNER_EMAIL or BOOKING_EMAIL_TO)
+    except Exception:
+        log.exception("Failed to email the daily briefing")
+    log.info("Daily briefing sent (%d in today, %d waiting)", len(today_rows), len(waiting))
+
 def reminder_loop() -> None:
     while True:
         try:
@@ -2230,6 +2294,10 @@ def reminder_loop() -> None:
             send_due_reviews()
         except Exception:
             log.exception("Review loop error")
+        try:
+            send_daily_briefing()
+        except Exception:
+            log.exception("Daily briefing error")
         try:
             chase_unresolved_alerts()
         except Exception:
@@ -2286,7 +2354,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2534,6 +2602,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                             "chased": bool(chased and chased >= ts)})
         return {"waiting": [r for r in out if not r["someone_replied"]],
                 "handled": [r for r in out if r["someone_replied"]]}
+    if action == "brieftest":
+        send_daily_briefing(force=True)
+        return {"sent": True, "to_telegram": telegram_chat_ids()}
     if action == "weeklytest":
         # Send this week's report right now, ignoring the day/hour schedule.
         send_weekly_gap_report(force=True)
@@ -2974,6 +3045,9 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
     # Owner-only commands.
     if is_owner and lowered.lstrip("#/ ") in ("today", "tomorrow"):
         send_whatsapp(sender, bookings_for(lowered.lstrip("#/ ")))
+        return
+    if is_owner and lowered.lstrip("#/ ") in ("waiting", "todo", "briefing", "brief"):
+        send_daily_briefing(force=True)
         return
     if is_owner and lowered.lstrip("#/ ") in ("customers", "customer"):
         send_whatsapp(sender, customers_list())
