@@ -388,12 +388,76 @@ def create_calendar_event(fields: dict) -> bool:
             f"{quote(GOOGLE_CALENDAR_ID)}/events",
             headers={"Authorization": f"Bearer {token}"}, json=body, timeout=30)
         if r.status_code < 300:
+            event_id = r.json().get("id", "")
             log.info("Calendar event created for %s on %s", reg or name, date_str)
-            return True
+            # Remember it so a cancellation can delete the right entry later.
+            if event_id and (reg or fields.get("phone")):
+                try:
+                    with closing(db()) as conn, conn:
+                        conn.execute(
+                            "UPDATE bookings SET cal_event_id = ? WHERE date = ? AND "
+                            "(UPPER(TRIM(COALESCE(reg,''))) = ? OR phone = ?)",
+                            (event_id, date_str, reg, fields.get("phone", "")))
+                except Exception:
+                    log.exception("Could not store calendar event id")
+            return event_id or True
         log.warning("Calendar event failed %s: %s", r.status_code, (r.text or "")[:300])
     except Exception:
         log.exception("Could not create calendar event")
     return False
+
+CANCEL_RE = re.compile(r"<<<CANCEL\|(.*?)>>>", re.DOTALL)
+
+def process_cancel(answer: str):
+    """Pull the hidden cancellation marker out of the reply."""
+    m = CANCEL_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = CANCEL_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k.strip().lower()] = v.strip()
+    return clean, fields
+
+def cancel_booking(user: str, fields: dict) -> dict:
+    """Cancel a customer's booking: free the slot and remove the calendar entry."""
+    digits = "".join(ch for ch in str(user) if ch.isdigit())
+    reg = clean_reg(fields.get("reg", ""))
+    date_ = (fields.get("date") or "").strip()
+    today_iso = now_local().date().isoformat()
+    where, args = ["date >= ?"], [today_iso]
+    if date_:
+        where, args = ["date = ?"], [date_]
+    if reg:
+        where.append("UPPER(TRIM(COALESCE(reg,''))) = ?"); args.append(reg)
+    else:  # fall back to their phone number
+        where.append("REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?")
+        args.append("%" + digits[-9:])
+    with closing(db()) as conn:
+        rows = conn.execute(
+            f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
+            f"WHERE {' AND '.join(where)}", args).fetchall()
+    if not rows:
+        log.info("Cancellation requested by %s but no matching booking found", user)
+        return {"cancelled": 0}
+    removed = []
+    for bid, name, car, breg, bdate, ev_id in rows:
+        with closing(db()) as conn, conn:
+            conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
+        removed.append({"name": name, "car": car, "reg": breg, "date": bdate})
+        if ev_id and calendar_enabled():
+            try:
+                tok = _google_access_token("calendar")
+                httpx.delete(
+                    f"https://www.googleapis.com/calendar/v3/calendars/"
+                    f"{quote(GOOGLE_CALENDAR_ID)}/events/{ev_id}",
+                    headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+            except Exception:
+                log.exception("Could not remove calendar event for cancellation")
+    log.info("Cancelled %d booking(s) for %s", len(removed), user)
+    return {"cancelled": len(removed), "bookings": removed}
 
 def notify_owner_booking(fields: dict) -> None:
     """Send the owner a booking summary (Telegram + WhatsApp) with a calendar link."""
@@ -664,7 +728,9 @@ def db() -> sqlite3.Connection:
         pass  # older SQLite without partial-index support, or duplicates still present
     # Columns added after the table already existed in the persistent DB.
     for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''"),
-                     ("review_sent", "review_sent INTEGER DEFAULT 0")):
+                     ("review_sent", "review_sent INTEGER DEFAULT 0"),
+                     # Remembered so a cancellation can remove the right calendar entry.
+                     ("cal_event_id", "cal_event_id TEXT DEFAULT ''")):
         try:
             conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -1459,12 +1525,12 @@ def _call_claude(messages: list, system_prompt: str) -> str:
         )
 
 ALL_MARKERS_RE = re.compile(
-    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER)\|.*?>>>", re.DOTALL)
+    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL)\|.*?>>>", re.DOTALL)
 # The same markers but WITHOUT a closing '>>>' — i.e. the reply ran out of tokens
 # part-way through writing one. Anchored to the end so it can only ever match a
 # genuine tail fragment, never a complete marker earlier in the text.
 TRUNCATED_MARKER_RE = re.compile(
-    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER)\|(?:(?!>>>).)*$", re.DOTALL)
+    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL)\|(?:(?!>>>).)*$", re.DOTALL)
 
 def visible_text(answer: str) -> str:
     """What the customer would actually see once the hidden markers are removed."""
@@ -1550,6 +1616,16 @@ def _finish_reply(user: str, answer: str) -> str:
                 email_booking(booking)
             except Exception:
                 log.exception("Failed to email booking")
+    answer, cancel = process_cancel(answer)
+    if cancel and not is_owner:
+        try:
+            result = cancel_booking(user, cancel)
+            for b in result.get("bookings", []):
+                alert_owner(user, "❌ Booking cancelled",
+                            f"{b.get('name','')} {b.get('car','')} {b.get('reg','')} "
+                            f"on {b.get('date','')} — the slot is free again.")
+        except Exception:
+            log.exception("Failed to cancel booking for %s", user)
     answer, customer = process_customer(answer)
     if customer and not is_owner:
         try:
@@ -2648,6 +2724,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "cancel":
+        # Manually cancel a booking: ?action=cancel&date=<phone or reg>
+        who = (date or "").strip()
+        if not who:
+            return {"error": "Pass a phone number or reg, e.g. ?action=cancel&date=353874042032"}
+        digits = "".join(c for c in who if c.isdigit())
+        looks_like_phone = len(digits) >= 9 and digits == who.strip().lstrip("+")
+        res = cancel_booking(digits if looks_like_phone else "",
+                             {} if looks_like_phone else {"reg": who})
+        return res
     if action == "caltidy":
         # List every event in the next 60 days, delete exact duplicates (same day +
         # same title) and any leftover bot test events, then report what remains.
