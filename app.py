@@ -2978,6 +2978,23 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
     if is_owner and lowered.lstrip("#/ ") in ("customers", "customer"):
         send_whatsapp(sender, customers_list())
         return
+    # "cancel 161D22222" or "cancel 0871234567" — frees the slot and clears the
+    # calendar, so the owner never has to go hunting for an admin page.
+    if is_owner and lowered.lstrip("#/ ").startswith("cancel "):
+        who = text.strip().lstrip("#/ ")[7:].strip()
+        digits = "".join(c for c in who if c.isdigit())
+        is_phone = len(digits) >= 9 and not any(c.isalpha() for c in who)
+        res = cancel_booking(digits if is_phone else "",
+                             {} if is_phone else {"reg": who})
+        if res.get("cancelled"):
+            lines = [f"• {b.get('name','')} {b.get('car','')} {b.get('reg','')} "
+                     f"on {b.get('date','')}".strip() for b in res.get("bookings", [])]
+            send_whatsapp(sender, "✅ Cancelled and the slot is free again:\n"
+                          + "\n".join(lines))
+        else:
+            send_whatsapp(sender, f"I couldn't find a booking for '{who}'. "
+                                  "Try the car reg, or the customer's phone number.")
+        return
     # Master off switch — owner only, takes effect immediately.
     if is_owner and lowered.lstrip("#/ ").replace("-", " ") in (
             "bot off", "stop bot", "off"):
