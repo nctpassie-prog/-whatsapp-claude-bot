@@ -2471,7 +2471,12 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate", "closeday"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
+                     "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
+                     "closeday",
+                     # Managing alert recipients is no more exposing than the review key
+                     # already is — it can read every conversation regardless.
+                     "tgadd", "tgremove"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
