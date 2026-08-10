@@ -2361,7 +2361,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2609,6 +2609,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                             "chased": bool(chased and chased >= ts)})
         return {"waiting": [r for r in out if not r["someone_replied"]],
                 "handled": [r for r in out if r["someone_replied"]]}
+    if action == "isblocked":
+        bl = load_blocklist()
+        probe = "".join(c for c in date if c.isdigit())
+        return {"number": probe, "blocked": is_blocked(probe) if probe else None,
+                "blocklist_entries": len(bl), "blocklist_file": str(BASE_DIR / "blocklist.txt"),
+                "file_exists": (BASE_DIR / "blocklist.txt").exists(),
+                "sample": sorted(bl)[:20]}
     if action == "where":
         # Everywhere alerts, bookings and follow-ups are sent, and whether each
         # channel can actually deliver.
