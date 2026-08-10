@@ -2784,6 +2784,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         days = closed_dates(); days.add(iso)
         set_setting("closed_dates", ",".join(sorted(d for d in days if d)))
         return {"closed": sorted(closed_dates())}
+    if action == "templates":
+        out = []
+        for waba in ("1713722639843344", "236685551234423"):
+            try:
+                r = httpx.get(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                              "message_templates",
+                              params={"fields": "name,language,status", "limit": 30},
+                              headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                              timeout=30)
+                data = r.json().get("data", []) if r.status_code < 300 else []
+                out.append({"waba": waba[-6:], "templates": [
+                    {"name": t.get("name"), "lang": t.get("language"),
+                     "status": t.get("status")} for t in data]})
+            except Exception as exc:
+                out.append({"waba": waba[-6:], "error": str(exc)[:200]})
+        return {"accounts": out}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from, in each language our customers speak. Templates live per-account AND
