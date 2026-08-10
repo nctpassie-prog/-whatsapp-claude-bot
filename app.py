@@ -1340,9 +1340,11 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     excerpt = conversation_excerpt(user)
     if excerpt:
         parts.append("\n--- conversation ---\n" + excerpt)
-    # Use the READ-ONLY key in shared links: alerts go to several phones, and the
-    # master key must never ride along in a message anyone can forward.
-    parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+    # Two links: wa.me opens the real WhatsApp chat to REPLY; the web link shows the
+    # full history. Web link carries the READ-ONLY key — alerts go to several phones,
+    # and the master key must never ride along in a message anyone can forward.
+    parts.append(f"\n💬 Reply in WhatsApp: https://wa.me/{user}")
+    parts.append(f"📜 Full history: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}"
                  f"&user={user}")
     body = "\n".join(parts)
     alert_targets = list(dict.fromkeys(
