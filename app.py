@@ -2786,33 +2786,54 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"closed": sorted(closed_dates())}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
-        # from. Templates live per-account, so 085 and 086 each need their own.
-        wabas = [w.strip() for w in (date or
-                 "1713722639843344,236685551234423").split(",") if w.strip()]
-        body_text = ("Hi {{1}}, just a reminder that your {{2}} ({{3}}) is booked in "
-                     "with NCTPass tomorrow. Please drop the car in between {{4}} and "
-                     "we'll message you when it's ready. Reply here if you need to "
-                     "change anything.")
-        payload = {
-            "name": REMINDER_TEMPLATE,
-            "language": REMINDER_LANG,
-            "category": "UTILITY",
-            "components": [{
-                "type": "BODY", "text": body_text,
-                "example": {"body_text": [["John", "VW Golf", "161D22222", "9 and 11am"]]},
-            }],
+        # from, in each language our customers speak. Templates live per-account AND
+        # per-language, so every combination needs its own submission.
+        # ?date=ro,ru  limits to those languages; default is all of them.
+        bodies = {
+            "en": ("Hi {{1}}, just a reminder that your {{2}} ({{3}}) is booked in "
+                   "with NCTPass tomorrow. Please drop the car in between {{4}} and "
+                   "we'll message you when it's ready. Reply here if you need to "
+                   "change anything.",
+                   ["John", "VW Golf", "161D22222", "9 and 11am"]),
+            "ro": ("Bună {{1}}, vă reamintim că {{2}} ({{3}}) este programată la "
+                   "NCTPass mâine. Vă rugăm să aduceți mașina între {{4}} și vă vom "
+                   "scrie când este gata. Răspundeți aici dacă doriți să schimbați "
+                   "ceva.",
+                   ["Ion", "VW Golf", "161D22222", "9 și 11 dimineața"]),
+            "ru": ("Здравствуйте, {{1}}! Напоминаем, что ваш {{2}} ({{3}}) записан в "
+                   "NCTPass на завтра. Пожалуйста, пригоните машину между {{4}}, и мы "
+                   "напишем вам, когда она будет готова. Ответьте здесь, если нужно "
+                   "что-то изменить.",
+                   ["Иван", "VW Golf", "161D22222", "9 и 11 утра"]),
+            "lt": ("Sveiki, {{1}}! Primename, kad jūsų {{2}} ({{3}}) užregistruotas "
+                   "NCTPass rytoj. Atvežkite automobilį tarp {{4}}, o mes parašysime, "
+                   "kai jis bus paruoštas. Atsakykite čia, jei norite ką nors "
+                   "pakeisti.",
+                   ["Jonas", "VW Golf", "161D22222", "9 ir 11 ryto"]),
         }
+        langs = [l.strip() for l in (date or "en,ro,ru,lt").split(",")
+                 if l.strip() in bodies]
+        wabas = ["1713722639843344", "236685551234423"]
         out = []
         for waba in wabas:
-            try:
-                r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
-                               "message_templates",
-                               headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-                               json=payload, timeout=30)
-                out.append({"waba": waba, "http": r.status_code,
-                            "body": (r.text or "")[:400]})
-            except Exception as exc:
-                out.append({"waba": waba, "error": str(exc)[:300]})
+            for lang in langs:
+                text_, example = bodies[lang]
+                payload = {
+                    "name": REMINDER_TEMPLATE,
+                    "language": lang,
+                    "category": "UTILITY",
+                    "components": [{"type": "BODY", "text": text_,
+                                    "example": {"body_text": [example]}}],
+                }
+                try:
+                    r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                                   "message_templates",
+                                   headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                                   json=payload, timeout=30)
+                    out.append({"waba": waba[-6:], "lang": lang, "http": r.status_code,
+                                "body": (r.text or "")[:200]})
+                except Exception as exc:
+                    out.append({"waba": waba[-6:], "lang": lang, "error": str(exc)[:200]})
         return {"template": REMINDER_TEMPLATE, "results": out}
     if action == "remindercheck":
         # Who is due a reminder, and what WhatsApp actually says if we try to send one.
