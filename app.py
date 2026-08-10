@@ -753,6 +753,12 @@ def db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE customers ADD COLUMN google_resource TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Which of our business numbers this customer messages, so background sends
+    # (reminders, follow-ups) go out on the right one.
+    try:
+        conn.execute("ALTER TABLE customers ADD COLUMN last_phone_id TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # Simple key/value settings that must survive restarts (e.g. the master off switch).
     conn.execute("CREATE TABLE IF NOT EXISTS settings ("
                  " key TEXT PRIMARY KEY, value TEXT)")
@@ -799,6 +805,15 @@ def record_customer(number: str, name: str = "", reg: str = "") -> bool:
                 "UPDATE customers SET name = ?, reg = ?, last_ts = ? WHERE wa_number = ?",
                 (name or row[0], reg or row[1], now, number),
             )
+    # Remember which of our numbers they message, for later background sends.
+    pid = _ctx_phone_id.get()
+    if pid:
+        try:
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE customers SET last_phone_id = ? WHERE wa_number = ?",
+                             (pid, number))
+        except Exception:
+            log.exception("Could not record which number %s messaged", number)
     # When we actually learned a name or reg, push it to Google Contacts in the
     # background so it never slows down the customer reply (and never breaks it if
     # Google is down or not set up yet).
@@ -1840,14 +1855,36 @@ def transcribe_audio(media_id: str) -> str:
 _ctx_phone_id: "contextvars.ContextVar[str]" = contextvars.ContextVar("phone_id", default="")
 
 def default_send_phone_id() -> str:
-    """Which business number to send from when the caller didn't say."""
+    """Which business number to send from when the caller didn't say.
+
+    PHONE_NUMBER_ID is a stale leftover, so it must be the LAST resort: once a
+    second number was connected the old 'only one allowed number' shortcut stopped
+    applying, and background sends (reminders, chases) silently fell through to a
+    dead id and were rejected.
+    """
     if _ctx_phone_id.get():
         return _ctx_phone_id.get()
     if SEND_PHONE_ID:
         return SEND_PHONE_ID
-    if len(ALLOWED_PHONE_IDS) == 1:
-        return next(iter(ALLOWED_PHONE_IDS))
+    if ALLOWED_PHONE_IDS:
+        return sorted(ALLOWED_PHONE_IDS)[0]
     return PHONE_NUMBER_ID
+
+def phone_id_for_customer(number: str) -> str:
+    """The business number this customer last messaged, so replies go back on it."""
+    digits = "".join(ch for ch in str(number) if ch.isdigit())
+    if not digits:
+        return ""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT COALESCE(last_phone_id,'') FROM customers "
+                               "WHERE wa_number = ?", (digits,)).fetchone()
+        pid = (row[0] if row else "") or ""
+        if pid and (not ALLOWED_PHONE_IDS or pid in ALLOWED_PHONE_IDS):
+            return pid
+    except Exception:
+        log.exception("Could not look up the number %s last used", number)
+    return ""
 
 def line_label(phone_id: str = "") -> str:
     """Which of our business numbers this conversation is on, in words."""
@@ -1869,6 +1906,10 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
     if not (text and text.strip()):
         log.info("Skipping empty message to %s", to)
         return
+    # Background jobs (reminders, chases, follow-ups) have no webhook context, so
+    # fall back to whichever of our numbers this customer actually messages.
+    if not from_phone_id and not _ctx_phone_id.get():
+        from_phone_id = phone_id_for_customer(to)
     url, token = send_endpoint(from_phone_id)
     try:
         r = httpx.post(
