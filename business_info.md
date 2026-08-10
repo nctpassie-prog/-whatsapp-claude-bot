@@ -374,6 +374,10 @@ Availability / capacity (important — how to talk about slots):
   often within a couple of hours. We'll confirm a time when you book.
 - Q: Do you give a guarantee / warranty?
   A: Yes — all our repairs come with a 12-month parts and labour guarantee.
+- Q: Do you have Russian / Ukrainian / Romanian speaking staff? Can I speak my language?
+  A: Yes! Our team speaks English, Russian, Ukrainian, Romanian (Moldovan) and
+  Lithuanian — you're welcome to message or talk to us in any of these and you'll
+  be looked after in your own language.
 - Q: Do you work on my make of car?
   A: Yes, we service and repair all makes and models.
 - Q: What is your labour rate / how much do you charge per hour?
