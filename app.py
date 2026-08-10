@@ -1239,7 +1239,7 @@ def conversation_excerpt(user: str, limit: int = 6) -> str:
             (user, limit)).fetchall()
     lines = []
     for role, content in reversed(rows):
-        who = "Us" if role == "assistant" else "Customer"
+        who = {"assistant": "Bot", "staff": "Your team"}.get(role, "Customer")
         text = " ".join((content or "").split())
         if len(text) > 160:
             text = text[:157] + "..."
@@ -2225,6 +2225,39 @@ def send_due_followups() -> None:
 
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
+def send_waiting_conversations(limit: int = 10) -> int:
+    """Send each still-waiting customer to Telegram as its OWN message.
+
+    One message per customer so each can be read, actioned and ticked off, rather
+    than a single wall of text that's easy to skim past.
+    """
+    nowts = time.time()
+    with closing(db()) as conn:
+        alerts = conn.execute(
+            "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
+        waiting = []
+        for u, ts in alerts:
+            staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                                 (u,)).fetchone()
+            if not (staff and (staff[0] or 0) > ts):
+                waiting.append((u, ts))
+    sent = 0
+    for user, ts in waiting[:limit]:
+        hrs = (nowts - ts) / 3600
+        waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)} days"
+        body = (f"⏰ WAITING {waited}\n"
+                f"{customer_label(user)}\n\n"
+                f"{conversation_excerpt(user, 8) or '(no messages)'}\n\n"
+                f"Open chat: https://wa.me/{user}")
+        try:
+            send_telegram(body)
+            sent += 1
+        except Exception:
+            log.exception("Could not send waiting conversation for %s", user)
+    if not waiting:
+        send_telegram("✅ Nobody is waiting on a reply right now.")
+    return sent
+
 def send_daily_briefing(force: bool = False) -> None:
     """Every morning: who's in today, and who is still waiting on a person.
 
@@ -2361,7 +2394,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2649,6 +2682,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                "taking yet", "nobody replied after 3h", "cancellations",
                                "morning briefing (8am)", "weekly report (Mon 9am)"],
         }
+    if action == "sendwaiting":
+        n = send_waiting_conversations()
+        return {"conversations_sent": n, "to": telegram_chat_ids()}
     if action == "brieftest":
         send_daily_briefing(force=True)
         return {"sent": True, "to_telegram": telegram_chat_ids()}
@@ -3141,6 +3177,10 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         except Exception:
             log.exception("Could not read Telegram updates")
         send_whatsapp(sender, "\n".join(lines))
+        return
+    if is_owner and lowered.lstrip("#/ ") in ("chats", "conversations", "waiting chats"):
+        n = send_waiting_conversations()
+        send_whatsapp(sender, f"Sent {n} waiting conversation(s) to your Telegram.")
         return
     if is_owner and lowered.lstrip("#/ ") in ("waiting", "todo", "briefing", "brief"):
         send_daily_briefing(force=True)
