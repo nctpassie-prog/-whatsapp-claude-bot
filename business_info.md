@@ -401,6 +401,9 @@ Availability / capacity (important — how to talk about slots):
 - Q: Do you have a courtesy car?
   A: Yes — we can provide a free replacement car while we work on yours, subject
   to availability. Just ask when you book.
+- Q: Can you order the part in advance, before I bring the car in?
+  A: Yes — give us the car's make, model, year and reg and what's needed, and we
+  can order the part in advance so it's ready for your booked day.
 - Q: Can I supply my own parts?
   A: Yes, you're welcome to supply your own parts and we'll fit them. Note: parts
   you supply aren't covered by our guarantee — only parts we supply are.
