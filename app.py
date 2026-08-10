@@ -2493,7 +2493,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday",
+                     "templates", "closeday", "clearwaiting",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -2889,6 +2889,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out["test_send"] = {"error": str(exc)[:300]}
         return out
+    if action == "clearwaiting":
+        # Wipe the waiting list so tomorrow starts fresh (owner declared the backlog
+        # handled). New alerts build the list again from scratch.
+        with closing(db()) as conn, conn:
+            n = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            conn.execute("DELETE FROM alerts")
+        return {"cleared": n, "note": "Waiting list is empty - starting fresh."}
     if action == "sendwaiting":
         n = send_waiting_conversations()
         return {"conversations_sent": n, "to": telegram_chat_ids()}
