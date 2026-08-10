@@ -2231,10 +2231,25 @@ def chase_unresolved_alerts() -> None:
             if handled:
                 continue
             hours = int((nowts - alert_ts) / 3600)
-            alert_owner(user, "⏰ Still waiting — nobody has replied",
-                        f"It's been about {hours}h since this needed someone. "
-                        "The customer has been sent a holding message.")
+            # Notify the owner DIRECTLY — never via alert_owner, which resets the
+            # alert timestamp and made the chaser re-fire the identical apology every
+            # three hours (Holly got the same message four times in one day).
+            try:
+                send_telegram(f"⏰ Still waiting — nobody has replied\n"
+                              f"{customer_label(user)}\n"
+                              f"It's been about {hours}h. The customer has been sent "
+                              f"a holding message.\nOpen chat: https://wa.me/{user}")
+            except Exception:
+                log.exception("Failed to notify owner about unanswered alert")
             text = _make_chase(user)
+            # Belt and braces: never send the customer the same line twice in a row.
+            with closing(db()) as conn:
+                last = conn.execute(
+                    "SELECT content FROM messages WHERE wa_user = ? AND role = "
+                    "'assistant' ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+            if text and last and (last[0] or "").strip() == text.strip():
+                log.info("Chase for %s identical to last message — skipping", user)
+                text = ""
             if text:
                 send_whatsapp(user, text)
                 save_message(user, "assistant", text)
