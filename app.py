@@ -2354,7 +2354,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -3045,6 +3045,55 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
     # Owner-only commands.
     if is_owner and lowered.lstrip("#/ ") in ("today", "tomorrow"):
         send_whatsapp(sender, bookings_for(lowered.lstrip("#/ ")))
+        return
+    # Manage who gets Telegram alerts, from the owner's own phone:
+    #   "telegram"            -> who is on the list, and anyone waiting to be added
+    #   "telegram add <id>"   -> add them
+    #   "telegram remove <id>" -> take them off
+    if is_owner and lowered.lstrip("#/ ").startswith("telegram"):
+        rest = text.strip().lstrip("#/ ")[8:].strip()
+        if rest.lower().startswith("add "):
+            new_id = "".join(c for c in rest[4:] if c.isdigit() or c == "-")
+            current = [c.strip() for c in (get_setting("telegram_chat_ids") or "").split(",")
+                       if c.strip()]
+            if new_id and new_id not in current and new_id not in TELEGRAM_CHAT_IDS:
+                current.append(new_id)
+                set_setting("telegram_chat_ids", ",".join(current))
+                send_telegram("👋 You've been added to NCTPass alerts.")
+            send_whatsapp(sender, "✅ Now alerting: " + ", ".join(telegram_chat_ids()))
+            return
+        if rest.lower().startswith("remove "):
+            drop = "".join(c for c in rest[7:] if c.isdigit() or c == "-")
+            current = [c.strip() for c in (get_setting("telegram_chat_ids") or "").split(",")
+                       if c.strip() and c.strip() != drop]
+            set_setting("telegram_chat_ids", ",".join(current))
+            send_whatsapp(sender, "✅ Now alerting: " + (", ".join(telegram_chat_ids()) or "nobody"))
+            return
+        # Plain "telegram" — show the list plus anyone who has messaged the bot but
+        # isn't receiving alerts yet, so they can be added with one message.
+        lines = ["📣 Getting alerts: " + (", ".join(telegram_chat_ids()) or "nobody")]
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          timeout=20)
+            pending = {}
+            for upd in r.json().get("result", []):
+                chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
+                cid = str(chat.get("id", ""))
+                if cid and cid not in telegram_chat_ids():
+                    pending[cid] = (chat.get("first_name") or chat.get("title") or "") + \
+                                   (f" (@{chat['username']})" if chat.get("username") else "")
+            if pending:
+                lines.append("")
+                lines.append("Waiting to be added — reply 'telegram add <number>':")
+                for cid, who in pending.items():
+                    lines.append(f"  • {who or 'unknown'} → {cid}")
+            else:
+                lines.append("")
+                lines.append("Nobody new. Ask them to open t.me/Nctpass_bot, tap START "
+                             "and send a message, then check here again.")
+        except Exception:
+            log.exception("Could not read Telegram updates")
+        send_whatsapp(sender, "\n".join(lines))
         return
     if is_owner and lowered.lstrip("#/ ") in ("waiting", "todo", "briefing", "brief"):
         send_daily_briefing(force=True)
