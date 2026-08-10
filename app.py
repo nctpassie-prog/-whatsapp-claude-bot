@@ -3226,6 +3226,10 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
 # a video of a noise). Worth a human looking. Stickers, reactions, polls and the
 # like carry nothing — never promise a colleague will "check the attachment" for those.
 REAL_ATTACHMENTS = {"document", "video", "audio", "voice"}
+# Only answer one sticker/reaction per customer per window, so a burst of them
+# doesn't produce a burst of identical replies.
+STICKER_QUIET_SECONDS = float(os.environ.get("STICKER_QUIET_SECONDS", "600"))
+_sticker_seen: dict = {}
 
 def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> None:
     """A customer sent something the bot can't open.
@@ -3235,6 +3239,14 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
     information — promising a colleague there is a lie, so we just ask them to type it.
     """
     real = what in REAL_ATTACHMENTS
+    if not real:
+        # Stickers and reactions often arrive in a burst. Answering each one sends
+        # the same line over and over, which reads like a broken machine.
+        last = _sticker_seen.get(sender, 0)
+        if time.time() - last < STICKER_QUIET_SECONDS:
+            log.info("Ignoring repeat sticker/reaction from %s", sender)
+            return
+        _sticker_seen[sender] = time.time()
     if real:
         prompt = (f"[Customer sent a {what}. Thank them warmly for sending it and say "
                   "one of the team will look at it and come straight back to them. "
@@ -3464,6 +3476,12 @@ async def receive(request: Request, background: BackgroundTasks):
                 if is_group_chat(sender) or msg.get("group_id") or \
                         is_group_chat((msg.get("context") or {}).get("group_id", "")):
                     log.info("Ignoring group message from %s", sender)
+                    continue
+                # Hard gate: a blocked number must never reach ANY handler. The
+                # individual handlers check too, but a blocked number was still
+                # answered, so the check belongs here at the door as well.
+                if is_blocked(sender):
+                    log.info("Blocked number %s — ignoring %s", sender, msg.get("type"))
                     continue
                 mtype = msg.get("type")
                 if mtype == "text":
