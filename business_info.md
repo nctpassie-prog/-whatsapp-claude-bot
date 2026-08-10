@@ -138,6 +138,9 @@ NCT preparation, headlight alignment and so on) keep answering normally with the
 usual "from €X plus VAT" starting prices. Do not make the bot vague about routine
 work — that would just annoy customers who know what they want.
 - Exhaust back-pressure pipe clean: from €50
+- Exhaust welding: charged by time at our labour rate (from €80/hour + VAT) — the
+  price depends on how bad the damage is, so never give a total. Invite them in for
+  the free inspection and a written quote before any work.
 - Glow plugs: from €80 plus labour
 - Spark plugs (iridium): from €70 plus labour
 - Injector replacement: from €250
