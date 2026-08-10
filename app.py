@@ -1340,7 +1340,10 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
     excerpt = conversation_excerpt(user)
     if excerpt:
         parts.append("\n--- conversation ---\n" + excerpt)
-    parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={VERIFY_TOKEN}&user={user}")
+    # Use the READ-ONLY key in shared links: alerts go to several phones, and the
+    # master key must never ride along in a message anyone can forward.
+    parts.append(f"\nFull chat: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+                 f"&user={user}")
     body = "\n".join(parts)
     alert_targets = list(dict.fromkeys(
         [n for n in recipients] + ALERT_NUMBERS))  # owner/manager + any extra alert numbers
