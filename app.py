@@ -2394,7 +2394,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2682,6 +2682,39 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                "taking yet", "nobody replied after 3h", "cancellations",
                                "morning briefing (8am)", "weekly report (Mon 9am)"],
         }
+    if action == "remindercheck":
+        # Who is due a reminder, and what WhatsApp actually says if we try to send one.
+        tomorrow = (now_local().date() + timedelta(days=1)).isoformat()
+        with closing(db()) as conn:
+            due = conn.execute(
+                "SELECT name, phone, car, reg, COALESCE(reminded,0) FROM bookings "
+                "WHERE date = ?", (tomorrow,)).fetchall()
+        out = {"tomorrow": tomorrow, "bookings_tomorrow": len(due),
+               "already_reminded": sum(1 for d in due if d[4]),
+               "template": REMINDER_TEMPLATE, "enabled": REMINDER_ENABLED,
+               "customers": [{"name": n, "reg": r, "reminded": bool(x)}
+                             for n, p, c, r, x in due]}
+        if due and date == "send":  # ?action=remindercheck&date=send to actually try
+            n, p, c, r, _ = due[0]
+            try:
+                url, tok = send_endpoint()
+                resp = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
+                                  json={"messaging_product": "whatsapp", "to": p,
+                                        "type": "template",
+                                        "template": {"name": REMINDER_TEMPLATE,
+                                                     "language": {"code": REMINDER_LANG},
+                                                     "components": [{"type": "body",
+                                                      "parameters": [
+                                                       {"type": "text", "text": n or "there"},
+                                                       {"type": "text", "text": c or "your car"},
+                                                       {"type": "text", "text": r or ""},
+                                                       {"type": "text", "text": "9-11am"}]}]}},
+                                  timeout=30)
+                out["test_send"] = {"to": p, "http": resp.status_code,
+                                    "body": (resp.text or "")[:500]}
+            except Exception as exc:
+                out["test_send"] = {"error": str(exc)[:300]}
+        return out
     if action == "sendwaiting":
         n = send_waiting_conversations()
         return {"conversations_sent": n, "to": telegram_chat_ids()}
