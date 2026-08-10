@@ -1934,9 +1934,12 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
 # ---------------------------------------------------------------- reminders
 def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
     try:
+        # Send from the number this customer actually messages — reminders run in a
+        # background thread with no webhook context.
+        url, tok = send_endpoint(phone_id_for_customer(to))
         r = httpx.post(
-            send_endpoint()[0],
-            headers={"Authorization": f"Bearer {send_endpoint()[1]}"},
+            url,
+            headers={"Authorization": f"Bearer {tok}"},
             json={
                 "messaging_product": "whatsapp",
                 "to": to,
@@ -2435,7 +2438,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2723,6 +2726,36 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                "taking yet", "nobody replied after 3h", "cancellations",
                                "morning briefing (8am)", "weekly report (Mon 9am)"],
         }
+    if action == "mktemplate":
+        # Create the appointment reminder template on every WhatsApp account we send
+        # from. Templates live per-account, so 085 and 086 each need their own.
+        wabas = [w.strip() for w in (date or
+                 "1713722639843344,236685551234423").split(",") if w.strip()]
+        body_text = ("Hi {{1}}, just a reminder that your {{2}} ({{3}}) is booked in "
+                     "with NCTPass tomorrow. Please drop the car in between {{4}} and "
+                     "we'll message you when it's ready. Reply here if you need to "
+                     "change anything.")
+        payload = {
+            "name": REMINDER_TEMPLATE,
+            "language": REMINDER_LANG,
+            "category": "UTILITY",
+            "components": [{
+                "type": "BODY", "text": body_text,
+                "example": {"body_text": [["John", "VW Golf", "161D22222", "9 and 11am"]]},
+            }],
+        }
+        out = []
+        for waba in wabas:
+            try:
+                r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                               "message_templates",
+                               headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                               json=payload, timeout=30)
+                out.append({"waba": waba, "http": r.status_code,
+                            "body": (r.text or "")[:400]})
+            except Exception as exc:
+                out.append({"waba": waba, "error": str(exc)[:300]})
+        return {"template": REMINDER_TEMPLATE, "results": out}
     if action == "remindercheck":
         # Who is due a reminder, and what WhatsApp actually says if we try to send one.
         tomorrow = (now_local().date() + timedelta(days=1)).isoformat()
