@@ -2354,7 +2354,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2602,6 +2602,39 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                             "chased": bool(chased and chased >= ts)})
         return {"waiting": [r for r in out if not r["someone_replied"]],
                 "handled": [r for r in out if r["someone_replied"]]}
+    if action == "where":
+        # Everywhere alerts, bookings and follow-ups are sent, and whether each
+        # channel can actually deliver.
+        tg = telegram_chat_ids()
+        names = {}
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          timeout=15)
+            for upd in r.json().get("result", []):
+                chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
+                if chat.get("id") is not None:
+                    names[str(chat["id"])] = (chat.get("first_name") or chat.get("title") or "") \
+                        + (f" (@{chat['username']})" if chat.get("username") else "")
+        except Exception:
+            pass
+        wa_on = OWNER_WHATSAPP_ALERTS or not telegram_enabled()
+        return {
+            "telegram": [{"chat_id": c, "who": names.get(c, "(added earlier)"),
+                          "delivers": True} for c in tg] or "nobody",
+            "email": {"to": OWNER_EMAIL or BOOKING_EMAIL_TO,
+                      "delivers": bool(RESEND_API_KEY)},
+            "whatsapp": {"numbers": [n for n in [OWNER_WHATSAPP, MANAGER_WHATSAPP] if n]
+                                    + ALERT_NUMBERS,
+                         "enabled": wa_on,
+                         "delivers": False,
+                         "why": "Meta blocks bot-initiated WhatsApp messages without a "
+                                "payment method on the account (error 131042), so these "
+                                "are switched off."},
+            "what_gets_sent": ["new bookings", "customer needs a human / unhappy",
+                               "customer chasing their car", "wants a date we're not "
+                               "taking yet", "nobody replied after 3h", "cancellations",
+                               "morning briefing (8am)", "weekly report (Mon 9am)"],
+        }
     if action == "brieftest":
         send_daily_briefing(force=True)
         return {"sent": True, "to_telegram": telegram_chat_ids()}
