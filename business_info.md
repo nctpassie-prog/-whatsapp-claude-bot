@@ -374,6 +374,11 @@ Availability / capacity (important — how to talk about slots):
   often within a couple of hours. We'll confirm a time when you book.
 - Q: Do you give a guarantee / warranty?
   A: Yes — all our repairs come with a 12-month parts and labour guarantee.
+- Q: If the NCT retest fails after your repair, do you fix it for free?
+  A: If the retest fails on something we repaired — our mistake — we put it right
+  free of charge under our 12-month guarantee. If it fails on a different, new item
+  that wasn't part of our repair, that's a separate job and we'll quote you for it
+  before any work as usual.
 - Q: Do you have Russian / Ukrainian / Romanian speaking staff? Can I speak my language?
   A: Yes! Our team speaks English, Russian, Ukrainian, Romanian (Moldovan) and
   Lithuanian — you're welcome to message or talk to us in any of these and you'll
