@@ -1082,8 +1082,41 @@ def bookings_for(day: str) -> str:
     return "\n".join(lines)
 
 # ---------------------------------------------------------------- capacity
+def parse_day(text_in: str) -> str:
+    """Turn '15 august', 'aug 15', '15/8' or '2026-08-15' into YYYY-MM-DD."""
+    s = (text_in or "").strip().lower().replace(",", " ")
+    today = now_local().date()
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
+    except Exception:
+        pass
+    for fmt in ("%d %B", "%d %b", "%B %d", "%b %d", "%d/%m", "%d-%m"):
+        try:
+            d = datetime.strptime(s, fmt).date().replace(year=today.year)
+            if d < today:  # a month already gone means they mean next year
+                d = d.replace(year=today.year + 1)
+            return d.isoformat()
+        except Exception:
+            continue
+    for fmt in ("%d %B %Y", "%d %b %Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except Exception:
+            continue
+    return ""
+
+def closed_dates() -> set:
+    """Specific dates the owner has closed (holidays, staff off, already too busy)."""
+    raw = get_setting("closed_dates") or os.environ.get("CLOSED_DATES", "")
+    return {d.strip() for d in raw.split(",") if d.strip()}
+
 def day_capacity(d) -> int:
-    """Max bookings for a given date: 9 Mon-Fri, 4 Saturday, 0 (closed) Sunday."""
+    """Max bookings for a given date: 9 Mon-Fri, 4 Saturday, 0 (closed) Sunday.
+
+    A date the owner has closed has no capacity at all, whatever day it falls on.
+    """
+    if d.isoformat() in closed_dates():
+        return 0
     wd = d.weekday()  # Mon=0 .. Sun=6
     if wd == 5:
         return 4
@@ -2438,7 +2471,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "waiting",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
-                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate"}
+                     "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat", "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate", "closeday"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -2726,6 +2759,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                "taking yet", "nobody replied after 3h", "cancellations",
                                "morning briefing (8am)", "weekly report (Mon 9am)"],
         }
+    if action == "closeday":
+        iso = parse_day(date) or date.strip()
+        days = closed_dates(); days.add(iso)
+        set_setting("closed_dates", ",".join(sorted(d for d in days if d)))
+        return {"closed": sorted(closed_dates())}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from. Templates live per-account, so 085 and 086 each need their own.
@@ -3284,6 +3322,37 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         except Exception:
             log.exception("Could not read Telegram updates")
         send_whatsapp(sender, "\n".join(lines))
+        return
+    # "close 15 august" / "open 15 august" — stop or resume taking bookings for a day.
+    if is_owner and lowered.lstrip("#/ ").split(" ")[0] in ("close", "open", "closed"):
+        cmd = lowered.lstrip("#/ ").split(" ")[0]
+        rest = text.strip().lstrip("#/ ").split(" ", 1)[1].strip() if " " in text.strip() else ""
+        if cmd == "closed" and not rest:
+            days = sorted(closed_dates())
+            send_whatsapp(sender, ("🚫 Closed for bookings:\n" + "\n".join(days))
+                          if days else "No days are closed — normal capacity everywhere.")
+            return
+        iso = parse_day(rest)
+        if not iso:
+            send_whatsapp(sender, "Which day? Try 'close 15 august' or 'close 2026-08-15'.")
+            return
+        days = closed_dates()
+        pretty = datetime.strptime(iso, "%Y-%m-%d").strftime("%A %d %B")
+        if cmd == "open":
+            days.discard(iso)
+            set_setting("closed_dates", ",".join(sorted(days)))
+            send_whatsapp(sender, f"✅ {pretty} is open for bookings again.")
+        else:
+            days.add(iso)
+            set_setting("closed_dates", ",".join(sorted(days)))
+            with closing(db()) as conn:
+                n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?",
+                                 (iso,)).fetchone()[0]
+            msg = f"🚫 No more bookings will be taken for {pretty}."
+            if n:
+                msg += (f"\n\n⚠️ You already have {n} booked in that day. They are still "
+                        "in the diary — send 'cancel <reg>' for any you want to move.")
+            send_whatsapp(sender, msg)
         return
     if is_owner and lowered.lstrip("#/ ") in ("chats", "conversations", "waiting chats"):
         n = send_waiting_conversations()
