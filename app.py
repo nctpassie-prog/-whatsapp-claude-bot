@@ -1328,7 +1328,7 @@ def _post_alert_template(to: str, one_liner: str) -> tuple:
     log.info("Alert template -> %s: HTTP %s %s", to, r.status_code, body)
     return r.status_code, body
 
-def alert_owner(user: str, headline: str, reason: str = "") -> None:
+def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = True) -> None:
     """Send the owner (and manager, if set) a short note plus the conversation."""
     recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
@@ -1378,10 +1378,15 @@ def alert_owner(user: str, headline: str, reason: str = "") -> None:
             log.warning("Owner alert email failed: %s", detail)
     except Exception:
         log.exception("Failed to email owner alert")
-    with closing(db()) as conn, conn:
-        conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
-                     "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
-                     (user, time.time()))
+    # Purely informational alerts (e.g. "booking cancelled" — the bot already
+    # finished the conversation) must not join the waiting list or get chased:
+    # they made closed conversations look unanswered and triggered pointless
+    # check-ins to happy customers.
+    if needs_reply:
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
+                         "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
+                         (user, time.time()))
 
 def alerted_recently(user: str) -> bool:
     """True if we already warned the owner about this chat lately."""
@@ -1683,7 +1688,8 @@ def _finish_reply(user: str, answer: str) -> str:
             for b in result.get("bookings", []):
                 alert_owner(user, "❌ Booking cancelled",
                             f"{b.get('name','')} {b.get('car','')} {b.get('reg','')} "
-                            f"on {b.get('date','')} — the slot is free again.")
+                            f"on {b.get('date','')} — the slot is free again.",
+                            needs_reply=False)
         except Exception:
             log.exception("Failed to cancel booking for %s", user)
     answer, customer = process_customer(answer)
