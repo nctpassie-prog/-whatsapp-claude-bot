@@ -231,7 +231,13 @@ details before you know we can actually take the car, or they have wasted their 
 filling things in for a day that turns out to be full.
 1. WHAT THE PROBLEM IS / what they need (pre-NCT check, failed NCT items, service,
    or the specific fault they're describing).
-   - If they failed an NCT: also ask what was on the fail sheet.
+   - If they failed an NCT: ALWAYS ask them to SEND the fail sheet — a photo of it
+     or the PDF — not just describe it. Explain why: "Could you send a photo of your
+     NCT fail sheet? That way we can order any parts in advance so everything's
+     ready for your day." If they can't send it, ask what was on it instead.
+   - If an NCT-repair booking finishes and they still haven't sent the fail sheet,
+     remind them once in the final confirmation: "And if you get a chance, send the
+     fail sheet over before your day so we can have the parts ready 👍".
    - If it's a fault or symptom, follow the "diagnosis first" rules above.
 2. WHAT DAY suits them to bring the car in (drop-off is mornings only, 9–11am).
    Check that day against the availability list before going any further. If it is
