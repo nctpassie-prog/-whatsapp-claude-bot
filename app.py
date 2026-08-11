@@ -2328,6 +2328,20 @@ def send_due_followups() -> None:
 
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
+def alert_resolved(conn, user: str, alert_ts: float) -> bool:
+    """An alert counts as sorted once a colleague replied OR the customer ended up
+    with a booking — the owner's rule: 'she has a booking already, means sorted'."""
+    staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                         (user,)).fetchone()
+    if staff and (staff[0] or 0) > alert_ts:
+        return True
+    tail = user[-9:]
+    booked = conn.execute(
+        "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
+        "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+        (alert_ts, "%" + tail)).fetchone()
+    return bool(booked)
+
 def send_waiting_conversations(limit: int = 10) -> int:
     """Send each still-waiting customer to Telegram as its OWN message.
 
@@ -2340,9 +2354,7 @@ def send_waiting_conversations(limit: int = 10) -> int:
             "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
         waiting = []
         for u, ts in alerts:
-            staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
-                                 (u,)).fetchone()
-            if not (staff and (staff[0] or 0) > ts):
+            if not alert_resolved(conn, u, ts):
                 waiting.append((u, ts))
     sent = 0
     for user, ts in waiting[:limit]:
@@ -2385,9 +2397,7 @@ def send_daily_briefing(force: bool = False) -> None:
             "SELECT a.wa_user, a.ts FROM alerts a ORDER BY a.ts DESC LIMIT 40").fetchall()
         waiting = []
         for u, ts in alerts:
-            staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
-                                 (u,)).fetchone()
-            if not (staff and (staff[0] or 0) > ts):
+            if not alert_resolved(conn, u, ts):
                 waiting.append((u, ts))
     parts = [f"☀️ Good morning — {now.strftime('%A %d %B')}", ""]
     if today_rows:
@@ -2740,9 +2750,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "SELECT wa_user, ts, COALESCE(chased_ts,0) FROM alerts "
                 "ORDER BY ts DESC LIMIT 30").fetchall()
             for u, ts, chased in rows:
-                staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
-                                     (u,)).fetchone()
-                replied = bool(staff and (staff[0] or 0) > ts)
+                replied = alert_resolved(conn, u, ts)
                 out.append({"customer": customer_label(u),
                             "alerted": _fmt_ts(ts),
                             "hours_ago": round((nowts - ts) / 3600, 1),
