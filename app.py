@@ -1113,7 +1113,7 @@ def closed_dates() -> set:
     return {d.strip() for d in raw.split(",") if d.strip()}
 
 def day_capacity(d) -> int:
-    """Max bookings for a given date: 9 Mon-Fri, 4 Saturday, 0 (closed) Sunday.
+    """Max bookings for a given date: 10 Mon-Fri, 4 Saturday, 0 (closed) Sunday.
 
     A date the owner has closed has no capacity at all, whatever day it falls on.
     """
@@ -1124,7 +1124,7 @@ def day_capacity(d) -> int:
         return 4
     if wd == 6:
         return 0
-    return 9
+    return 10
 
 def day_is_full(date_str: str) -> bool:
     """True if the given YYYY-MM-DD date already has no free slots."""
@@ -1215,7 +1215,7 @@ def availability_block() -> str:
             "questions and give prices as normal — only the booking date is restricted."
         )
     return (opening_note +
-        "\n\nBOOKING AVAILABILITY — capacity is 9 jobs Mon-Fri; Saturday is GENERAL SERVICES "
+        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri (aim for about 5 full services, 3 NCT-fail repairs and 2 of anything); Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "

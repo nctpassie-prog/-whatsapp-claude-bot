@@ -339,8 +339,10 @@ Drop-off and collection (important):
 
 Availability / capacity (important — how to talk about slots):
 - We have a LIMITED number of slots each day.
-  Monday–Friday: up to 9 jobs, made up of about 2 NCT-fail repairs, 1 AC re-gas,
-  1 brakes job and 5 general services.
+  Monday–Friday: up to 10 jobs a day, aiming for roughly 5 full services,
+  3 NCT-fail repairs, and 2 slots for anything else (diagnostics, brakes, AC,
+  small jobs). The mix is a guide — prefer steering towards it, but never turn a
+  customer away while the day still has free slots.
   Saturday: GENERAL SERVICES ONLY — up to 4 cars. On Saturday we do NOT do repairs
   (no brakes, NCT-fail repairs, wheel bearings, AC re-gas, diagnostics, etc.). If a
   customer wants a repair on a Saturday, politely explain Saturday is for general
