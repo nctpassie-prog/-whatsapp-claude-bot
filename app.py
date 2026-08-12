@@ -2559,7 +2559,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -2733,7 +2733,9 @@ def google_callback(code: str = Query(""), state: str = Query(""), error: str = 
                     "customers will now be saved automatically.")
 
 @app.get("/admin")
-def admin(token: str = Query(""), action: str = Query("status"), date: str = Query("")):
+def admin(token: str = Query(""), action: str = Query("status"), date: str = Query(""),
+          name: str = Query(""), phone: str = Query(""), car: str = Query(""),
+          reg: str = Query(""), need: str = Query("")):
     """Owner/dev tool (guarded by VERIFY_TOKEN). ?action=status | clear&date=YYYY-MM-DD|all.
 
     The read-only REVIEW_TOKEN is accepted for the reporting actions only — anything
@@ -2920,6 +2922,17 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 except Exception as exc:
                     out.append({"waba": waba[-6:], "lang": lang, "error": str(exc)[:200]})
         return {"template": REMINDER_TEMPLATE, "results": out}
+    if action == "addbooking":
+        # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
+        # diary, calendar, job sheet and day-before reminder all know about it.
+        if not (date and (reg or phone)):
+            return {"error": "Need at least date and a reg or phone."}
+        fields = {"name": name, "phone": phone, "car": car, "reg": reg,
+                  "need": need, "date": date.strip(), "time": "", "lang": ""}
+        added = save_booking(fields)
+        cal = create_calendar_event(fields) if added else False
+        return {"added": bool(added), "calendar": bool(cal),
+                "note": "duplicate - already in the diary" if not added else "booked"}
     if action == "day":
         # Full job list for a date: ?action=day&date=YYYY-MM-DD (default tomorrow).
         try:
