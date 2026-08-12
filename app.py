@@ -58,7 +58,7 @@ PAUSE_KEYWORD = os.environ.get("PAUSE_KEYWORD", "#stop").lower()
 RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
 # Coexistence: hours the bot stays quiet in a chat after a colleague replies
 # from the WhatsApp Business app (so it never talks over staff).
-AUTO_RESUME_HOURS = float(os.environ.get("AUTO_RESUME_HOURS", "24"))
+AUTO_RESUME_HOURS = float(os.environ.get("AUTO_RESUME_HOURS", "3"))
 # Don't warn the owner about the same chat more often than this.
 ALERT_COOLDOWN_HOURS = float(os.environ.get("ALERT_COOLDOWN_HOURS", "6"))
 # Public base URL, used to link the owner straight to a chat.
@@ -1451,43 +1451,53 @@ def clear_human_takeover(user: str) -> None:
     with closing(db()) as conn, conn:
         conn.execute("DELETE FROM human_takeover WHERE wa_user = ?", (user,))
 
-COURTESY_SYSTEM = (
-    "You are the NCTPass car garage's WhatsApp assistant. A colleague is handling this "
-    "conversation, so normally you stay silent. Look at the customer's LAST message "
-    "only. If it is a simple wrap-up that needs no knowledge and no decision — a "
-    "thank-you, a goodbye, an 'ok', or a status update with no question (e.g. 'car is "
-    "starting fine now, I'll monitor and let you know') — reply with ONE short, warm "
-    "closing line in the customer's language, e.g. thanking them for letting us know "
-    "and inviting them to message any time if anything comes up. NEVER quote prices, "
-    "never promise dates or callbacks, never answer technical questions. If their "
-    "message asks ANYTHING, raises a new issue, or a colleague should see it, reply "
-    "with exactly SKIP."
+ASSIST_WHILE_STAFF = (
+    "\n\nSPECIAL SITUATION: a COLLEAGUE is personally handling this conversation, so "
+    "you only step in for things that help without getting in their way. Look at the "
+    "customer's LAST message only.\n"
+    "- If it is a simple wrap-up (a thank-you, a goodbye, an 'ok', or a status update "
+    "with no question): reply with ONE short warm closing line in their language, "
+    "inviting them to message any time.\n"
+    "- If it is a SIMPLE GENERAL question you can answer with certainty from the "
+    "business information — opening hours, address/directions, the 9-11am drop-off "
+    "window, the guarantee, what languages we speak, whether we do a type of work, "
+    "how booking works, a standard 'from' price for a DIFFERENT service than the one "
+    "the colleague is discussing: answer briefly and warmly.\n"
+    "- Reply with exactly SKIP if it is about the specific job, price or arrangement "
+    "the colleague is discussing, a new fault, a complaint, a negotiation, or anything "
+    "you are not fully certain of. NEVER contradict or repeat what the colleague said, "
+    "never quote a price for their job under discussion, and never promise dates, "
+    "times or callbacks — the colleague owns those."
 )
 
 def _maybe_courtesy_close(user: str) -> None:
-    """Close a wrapped-up conversation politely even while a colleague owns the chat.
+    """While a colleague owns the chat, still handle the easy things.
 
-    A customer who ends with 'thanks, I'll let you know' deserves a one-line
-    acknowledgement, not silence. Skipped if a colleague replied in the last 30
-    minutes (they're clearly active) — the bot must not talk over live staff."""
+    Owner's rule: the bot may 'talk over staff' for simple problems — wrap-up
+    thank-yous and general questions (hours, address, drop-off window...). Skipped
+    only if a colleague replied in the last 10 minutes (actively typing). Anything
+    about the colleague's actual job/price/arrangement comes back SKIP from Claude.
+    After AUTO_RESUME_HOURS of staff silence the bot resumes fully anyway."""
     with closing(db()) as conn:
         row = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
                            (user,)).fetchone()
-    if row and time.time() - (row[0] or 0) < 1800:
-        return  # a colleague is actively in the conversation right now
+    if row and time.time() - (row[0] or 0) < 600:
+        return  # a colleague replied moments ago — they have it
     history = get_history(user)
     if not history or history[-1]["role"] != "user":
         return
+    system_prompt = load_system_prompt() + availability_block() + ASSIST_WHILE_STAFF
     raw = _call_claude(history + [{"role": "user", "content":
-                                   "(Internal: apply your rules to the customer's last "
-                                   "message — one closing line, or SKIP.)"}],
-                       COURTESY_SYSTEM) or ""
+                                   "(Internal: apply the SPECIAL SITUATION rules to "
+                                   "the customer's last message — answer the simple "
+                                   "thing or close warmly, else SKIP.)"}],
+                       system_prompt) or ""
     reply = re.sub(r"<<<.*?>>>", "", raw).strip()
-    if not reply or reply.upper().startswith("SKIP") or len(reply) > 300:
+    if not reply or reply.upper().startswith("SKIP") or len(reply) > 600:
         return
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
-    log.info("Courtesy close sent to %s", user)
+    log.info("Assisted while staff handling: %s", user)
 
 def human_handling(user: str) -> bool:
     """True while a colleague is dealing with this customer, so the bot keeps out.
