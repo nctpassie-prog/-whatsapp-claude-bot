@@ -2511,7 +2511,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting",
+                     "templates", "closeday", "clearwaiting", "day",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -2872,6 +2872,19 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 except Exception as exc:
                     out.append({"waba": waba[-6:], "lang": lang, "error": str(exc)[:200]})
         return {"template": REMINDER_TEMPLATE, "results": out}
+    if action == "day":
+        # Full job list for a date: ?action=day&date=YYYY-MM-DD (default tomorrow).
+        try:
+            target = datetime.strptime((date or "").strip(), "%Y-%m-%d").date()
+        except Exception:
+            target = now_local().date() + timedelta(days=1)
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT name, phone, car, reg, need FROM bookings WHERE date = ? "
+                "ORDER BY id", (target.isoformat(),)).fetchall()
+        return {"date": target.isoformat(),
+                "cars": [{"name": n or "(no name)", "car": c, "reg": rg,
+                          "job": nd, "phone": p} for n, p, c, rg, nd in rows]}
     if action == "remindercheck":
         # Who is due a reminder, and what WhatsApp actually says if we try to send one.
         tomorrow = (now_local().date() + timedelta(days=1)).isoformat()
