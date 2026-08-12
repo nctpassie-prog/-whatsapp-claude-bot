@@ -2313,6 +2313,60 @@ def _make_chase(user: str) -> str:
         return ""
     return text
 
+STAFF_STALL_HOURS = float(os.environ.get("STAFF_STALL_HOURS", "1"))
+
+def sweep_stalled_staff_chats() -> None:
+    """Owner's rule: an hour after a staff conversation stalls with the customer
+    still waiting — finish it if it's simple, otherwise remind the owner.
+
+    Runs hourly; each stalled message is acted on once (the window check keeps it
+    from re-firing every hour for the same message)."""
+    if not bot_enabled():
+        return
+    now = now_local()
+    if not (9 <= now.hour < 20):
+        return
+    nowts = time.time()
+    lo = nowts - 2 * STAFF_STALL_HOURS * 3600   # act once: 1h-2h old only
+    hi = nowts - STAFF_STALL_HOURS * 3600
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT ht.wa_user, ht.ts FROM human_takeover ht WHERE ht.ts >= ?",
+            (nowts - AUTO_RESUME_HOURS * 3600,)).fetchall()
+        stalled = []
+        for user, staff_ts in rows:
+            last = conn.execute(
+                "SELECT role, content, ts FROM messages WHERE wa_user = ? "
+                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+            if not last or last[0] != "user":
+                continue  # nothing pending from the customer
+            if not (lo <= (last[2] or 0) < hi):
+                continue  # too fresh, or already swept in an earlier pass
+            stalled.append((user, last[1] or ""))
+    for user, last_text in stalled:
+        try:
+            if is_blocked(user) or is_paused(user):
+                continue
+            before = None
+            with closing(db()) as conn:
+                r = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
+                                 "role = 'assistant'", (user,)).fetchone()
+                before = r[0]
+            _maybe_courtesy_close(user)  # answers the simple thing, or does nothing
+            with closing(db()) as conn:
+                r = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
+                                 "role = 'assistant'", (user,)).fetchone()
+            if r[0] > before:
+                log.info("Stalled staff chat finished by bot: %s", user)
+                continue
+            snippet = " ".join(last_text.split())[:140]
+            send_telegram("⏳ Staff conversation stalled — customer waiting "
+                          f"{int(STAFF_STALL_HOURS)}h+\n{customer_label(user)}\n"
+                          f"Last message: \"{snippet}\"\n"
+                          f"💬 Reply: https://wa.me/{user}")
+        except Exception:
+            log.exception("Stalled-chat sweep failed for %s", user)
+
 def chase_unresolved_alerts() -> None:
     """Chase alerts nobody has acted on.
 
@@ -2558,6 +2612,10 @@ def reminder_loop() -> None:
             send_daily_briefing()
         except Exception:
             log.exception("Daily briefing error")
+        try:
+            sweep_stalled_staff_chats()
+        except Exception:
+            log.exception("Stalled staff chat sweep error")
         try:
             chase_unresolved_alerts()
         except Exception:
