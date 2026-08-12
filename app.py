@@ -1499,6 +1499,63 @@ def _maybe_courtesy_close(user: str) -> None:
     save_message(user, "assistant", reply)
     log.info("Assisted while staff handling: %s", user)
 
+# Words that suggest a booking may have just been agreed in a staff conversation —
+# a cheap gate so we only spend an API call when it could matter.
+BOOKINGISH_RE = re.compile(
+    r"\b(book|booked|booking|appoint|done|confirm|see you|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|come in|bring|drop)\b|\d{1,2}\s*(st|nd|rd|th|am|pm)",
+    re.IGNORECASE)
+
+WATCH_BOOKING_SYSTEM = (
+    "You are watching a WhatsApp conversation between a car garage's customer and a "
+    "COLLEAGUE (a human member of staff). Your ONLY job: decide whether a booking has "
+    "just been clearly AGREED between them — a specific day plus a car or job, with "
+    "confirmation from both sides (e.g. customer: 'yes book me for 21st', staff: "
+    "'Done'). If YES, output ONLY one line in exactly this format and nothing else:\n"
+    "<<<BOOKING|car=...|reg=...|need=...|date=YYYY-MM-DD|time=...|name=...|phone=...|lang=..>>>\n"
+    "Work out the real calendar date. Leave unknown fields empty. If no booking was "
+    "clearly agreed, or it is only being discussed, output exactly SKIP."
+)
+
+def watch_staff_booking(user: str) -> None:
+    """Silently log a booking that staff agreed in chat, so nothing is lost.
+
+    The bot stays out of staff conversations, but staying silent must not mean the
+    diary, calendar, reminder and job sheet never hear about the car."""
+    try:
+        history = get_history(user)
+        if not history:
+            return
+        raw = _call_claude(history + [{"role": "user", "content":
+                                       "(Internal: apply your rules — the booking "
+                                       "line, or SKIP.)"}], WATCH_BOOKING_SYSTEM) or ""
+        m = BOOKING_RE.search(raw)
+        if not m:
+            return
+        fields = {}
+        for part in m.group(1).split("|"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                fields[k.strip().lower()] = v.strip()
+        if not fields.get("date"):
+            return
+        fields.setdefault("phone", user)
+        if not fields.get("phone"):
+            fields["phone"] = user
+        added = save_booking(fields)  # dedupe inside — safe to run repeatedly
+        if not added:
+            return
+        create_calendar_event(fields)
+        send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
+                      f"{fields.get('name','')} — {fields.get('car','')} "
+                      f"{fields.get('reg','')}\n{fields.get('need','')}\n"
+                      f"Date: {fields.get('date','')} (9-11am)\n"
+                      "It's in the diary and calendar; the reminder will go out "
+                      "automatically.")
+        log.info("Staff-agreed booking logged for %s on %s", user, fields.get("date"))
+    except Exception:
+        log.exception("watch_staff_booking failed for %s", user)
+
 def human_handling(user: str) -> bool:
     """True while a colleague is dealing with this customer, so the bot keeps out.
 
@@ -3593,6 +3650,11 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
             _maybe_courtesy_close(sender)
         except Exception:
             log.exception("Courtesy close failed for %s", sender)
+        # The customer may be the one sealing a staff-offered booking ("yes book me
+        # for the 21st") — watch for that here too, not just on the staff side.
+        if BOOKINGISH_RE.search(text):
+            threading.Thread(target=watch_staff_booking, args=(sender,),
+                             daemon=True).start()
         return
     if not is_owner:  # remember the customer (alerting about new ones is off by default)
         try:
@@ -3827,8 +3889,14 @@ async def receive(request: Request, background: BackgroundTasks):
                         # Stored as "staff", not "assistant", so the chat viewer can
                         # show who really said it — otherwise a colleague's words look
                         # like the bot's and reviewing the bot becomes guesswork.
-                        save_message("".join(c for c in customer if c.isdigit()),
+                        digits = "".join(c for c in customer if c.isdigit())
+                        save_message(digits,
                                      "staff", body or "[colleague replied in the app]")
+                        # A colleague may have just AGREED a booking in this chat
+                        # ("Done", "see you Thursday") — watch for it and log it, or
+                        # the diary, reminders and job sheet never hear about the car.
+                        if body and BOOKINGISH_RE.search(body):
+                            background.add_task(watch_staff_booking, digits)
                 continue
             # Delivery receipts (sent / delivered / read / failed). Nothing to reply to,
             # but this is the ONLY place WhatsApp explains why a message never landed,
