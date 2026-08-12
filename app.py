@@ -1451,6 +1451,44 @@ def clear_human_takeover(user: str) -> None:
     with closing(db()) as conn, conn:
         conn.execute("DELETE FROM human_takeover WHERE wa_user = ?", (user,))
 
+COURTESY_SYSTEM = (
+    "You are the NCTPass car garage's WhatsApp assistant. A colleague is handling this "
+    "conversation, so normally you stay silent. Look at the customer's LAST message "
+    "only. If it is a simple wrap-up that needs no knowledge and no decision — a "
+    "thank-you, a goodbye, an 'ok', or a status update with no question (e.g. 'car is "
+    "starting fine now, I'll monitor and let you know') — reply with ONE short, warm "
+    "closing line in the customer's language, e.g. thanking them for letting us know "
+    "and inviting them to message any time if anything comes up. NEVER quote prices, "
+    "never promise dates or callbacks, never answer technical questions. If their "
+    "message asks ANYTHING, raises a new issue, or a colleague should see it, reply "
+    "with exactly SKIP."
+)
+
+def _maybe_courtesy_close(user: str) -> None:
+    """Close a wrapped-up conversation politely even while a colleague owns the chat.
+
+    A customer who ends with 'thanks, I'll let you know' deserves a one-line
+    acknowledgement, not silence. Skipped if a colleague replied in the last 30
+    minutes (they're clearly active) — the bot must not talk over live staff."""
+    with closing(db()) as conn:
+        row = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
+                           (user,)).fetchone()
+    if row and time.time() - (row[0] or 0) < 1800:
+        return  # a colleague is actively in the conversation right now
+    history = get_history(user)
+    if not history or history[-1]["role"] != "user":
+        return
+    raw = _call_claude(history + [{"role": "user", "content":
+                                   "(Internal: apply your rules to the customer's last "
+                                   "message — one closing line, or SKIP.)"}],
+                       COURTESY_SYSTEM) or ""
+    reply = re.sub(r"<<<.*?>>>", "", raw).strip()
+    if not reply or reply.upper().startswith("SKIP") or len(reply) > 300:
+        return
+    send_whatsapp(user, reply)
+    save_message(user, "assistant", reply)
+    log.info("Courtesy close sent to %s", user)
+
 def human_handling(user: str) -> bool:
     """True while a colleague is dealing with this customer, so the bot keeps out.
 
@@ -3518,7 +3556,9 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         return
     if not is_owner and human_handling(sender):
         # A colleague is already dealing with this customer in the app. We stay out of
-        # the conversation, but keep watching in case it turns sour.
+        # the conversation, but keep watching in case it turns sour — and if the
+        # customer is just wrapping up ("thanks, I'll monitor and let you know"),
+        # close the conversation warmly instead of leaving them hanging in silence.
         log.info("Human is handling %s; skipping auto-reply", sender)
         save_message(sender, "user", transcript_note or text)
         record_customer(sender)
@@ -3526,6 +3566,10 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
             check_escalation(sender)
         except Exception:
             log.exception("Escalation check failed for %s", sender)
+        try:
+            _maybe_courtesy_close(sender)
+        except Exception:
+            log.exception("Courtesy close failed for %s", sender)
         return
     if not is_owner:  # remember the customer (alerting about new ones is off by default)
         try:
