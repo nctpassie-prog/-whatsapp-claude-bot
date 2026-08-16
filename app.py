@@ -75,7 +75,7 @@ NEW_CUSTOMER_ALERT = os.environ.get("NEW_CUSTOMER_ALERT", "0") == "1"
 GAP_REPORT_WEEKDAY = int(os.environ.get("GAP_REPORT_WEEKDAY", "0"))  # Monday
 GAP_REPORT_HOUR = int(os.environ.get("GAP_REPORT_HOUR", "9"))        # 9am Irish time
 # Don't accept bookings before this date (YYYY-MM-DD). Blank = no restriction.
-BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-08-17").strip()
+BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-08-24").strip()
 # SAFETY LOCK: only answer messages that arrive on these WhatsApp numbers
 # (comma-separated phone_number_ids). Anything arriving on any other number —
 # e.g. the owner's private line — is ignored completely. Blank = allow all.
