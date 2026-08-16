@@ -3068,9 +3068,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     continue
                 while d < now_local().date() - timedelta(days=45):
                     d = d.replace(year=d.year + 1)
-                with closing(db()) as conn, conn:
-                    conn.execute("UPDATE bookings SET date = ? WHERE id = ?",
-                                 (d.isoformat(), bid))
+                try:
+                    with closing(db()) as conn, conn:
+                        conn.execute("UPDATE bookings SET date = ? WHERE id = ?",
+                                     (d.isoformat(), bid))
+                except sqlite3.IntegrityError:
+                    # The corrected date already holds a proper booking for this car —
+                    # the past-dated row is just a duplicate. Remove it.
+                    with closing(db()) as conn, conn:
+                        conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
+                    fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
+                                  "removed": "duplicate of an existing correct booking"})
+                    continue
                 f = {"name": name, "phone": phone_, "car": car_, "reg": reg_,
                      "need": need_, "date": d.isoformat()}
                 cal = False
