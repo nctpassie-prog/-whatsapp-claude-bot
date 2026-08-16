@@ -3062,18 +3062,26 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "WHERE date < ? ORDER BY date", ((now_local().date() - timedelta(days=45)).isoformat(),)).fetchall()
         for bid, name, phone_, car_, reg_, need_, d_ in rows:
             try:
-                d = datetime.strptime(d_, "%Y-%m-%d").date()
-            except Exception:
-                continue
-            while d < now_local().date() - timedelta(days=45):
-                d = d.replace(year=d.year + 1)
-            with closing(db()) as conn, conn:
-                conn.execute("UPDATE bookings SET date = ? WHERE id = ?", (d.isoformat(), bid))
-            f = {"name": name, "phone": phone_, "car": car_, "reg": reg_, "need": need_, "date": d.isoformat()}
-            cal = False
-            if d >= now_local().date():
-                cal = bool(create_calendar_event(f))
-            fixed.append({"who": name or phone_, "reg": reg_, "was": d_, "now": d.isoformat(), "calendar": cal})
+                try:
+                    d = datetime.strptime(d_, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                while d < now_local().date() - timedelta(days=45):
+                    d = d.replace(year=d.year + 1)
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE bookings SET date = ? WHERE id = ?",
+                                 (d.isoformat(), bid))
+                f = {"name": name, "phone": phone_, "car": car_, "reg": reg_,
+                     "need": need_, "date": d.isoformat()}
+                cal = False
+                if d >= now_local().date():
+                    cal = bool(create_calendar_event(f))
+                fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
+                              "now": d.isoformat(), "calendar": cal})
+            except Exception as exc:
+                log.exception("fixdates failed for booking %s", bid)
+                fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
+                              "error": str(exc)[:200]})
         return {"fixed": fixed}
     if action == "addbooking":
         # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
