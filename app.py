@@ -1033,6 +1033,20 @@ def save_booking(fields: dict) -> bool:
     """
     reg = clean_reg(fields.get("reg", ""))  # store reg without spaces or dashes
     date_ = (fields.get("date") or "").strip()
+    # Sanity: Claude occasionally writes LAST YEAR's date ("21 August" -> 2025-08-21),
+    # which silently buries the booking — no reminder, no job sheet, invisible slot.
+    # A booking can never be in the past: roll it forward to the next real occurrence.
+    try:
+        d = datetime.strptime(date_, "%Y-%m-%d").date()
+        today = now_local().date()
+        while d < today - timedelta(days=1):
+            d = d.replace(year=d.year + 1)
+        if d.isoformat() != date_:
+            log.warning("Booking date %s was in the past — corrected to %s", date_, d)
+            date_ = d.isoformat()
+            fields["date"] = date_
+    except Exception:
+        pass  # unparseable/blank date is handled elsewhere
     phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
     if date_:
         with closing(db()) as conn:
@@ -2674,7 +2688,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "fixdates",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3037,6 +3051,30 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 except Exception as exc:
                     out.append({"waba": waba[-6:], "lang": lang, "error": str(exc)[:200]})
         return {"template": REMINDER_TEMPLATE, "results": out}
+    if action == "fixdates":
+        # Repair bookings stored with a clearly-wrong past year: roll forward to the
+        # next real occurrence and recreate the calendar event.
+        today_iso = now_local().date().isoformat()
+        fixed = []
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT id, name, phone, car, reg, need, date FROM bookings "
+                "WHERE date < ? ORDER BY date", ((now_local().date() - timedelta(days=45)).isoformat(),)).fetchall()
+        for bid, name, phone_, car_, reg_, need_, d_ in rows:
+            try:
+                d = datetime.strptime(d_, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            while d < now_local().date() - timedelta(days=45):
+                d = d.replace(year=d.year + 1)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET date = ? WHERE id = ?", (d.isoformat(), bid))
+            f = {"name": name, "phone": phone_, "car": car_, "reg": reg_, "need": need_, "date": d.isoformat()}
+            cal = False
+            if d >= now_local().date():
+                cal = bool(create_calendar_event(f))
+            fixed.append({"who": name or phone_, "reg": reg_, "was": d_, "now": d.isoformat(), "calendar": cal})
+        return {"fixed": fixed}
     if action == "addbooking":
         # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
         # diary, calendar, job sheet and day-before reminder all know about it.
