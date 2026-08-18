@@ -1688,12 +1688,96 @@ def contact_hint(user: str) -> str:
         "Put that number in the booking's phone field."
     )
 
-def _call_claude(messages: list, system_prompt) -> str:
+# ---- Gemini (Google) — the cheaper alternative brain, behind a safety switch.
+# gemini_mode setting: "off" (default) | "test" (owner's own chats only) | "all".
+# On ANY Gemini failure the call silently falls back to Claude, so a customer can
+# never be stranded by the experiment.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip()
+
+def gemini_mode() -> str:
+    return (get_setting("gemini_mode", "off") or "off").strip().lower()
+
+def _use_gemini(user) -> bool:
+    if not GEMINI_API_KEY:
+        return False
+    mode = gemini_mode()
+    if mode == "all":
+        return True
+    if mode == "test":
+        return bool(user) and bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
+    return False
+
+def _gemini_parts(content) -> list:
+    """Translate one message's content (our Anthropic shapes) to Gemini parts."""
+    if isinstance(content, str):
+        return [{"text": content}] if content.strip() else []
+    parts = []
+    for block in content:
+        btype = block.get("type")
+        if btype == "text" and (block.get("text") or "").strip():
+            parts.append({"text": block["text"]})
+        elif btype in ("image", "document"):
+            src = block.get("source") or {}
+            if src.get("type") == "base64" and src.get("data"):
+                parts.append({"inline_data": {
+                    "mime_type": src.get("media_type", "application/octet-stream"),
+                    "data": src["data"]}})
+    return parts
+
+def _call_gemini(messages: list, system_prompt) -> str:
+    """Raises on any failure — the caller falls back to Claude."""
+    if isinstance(system_prompt, tuple):
+        system_text = (system_prompt[0] or "") + (system_prompt[1] or "")
+    else:
+        system_text = system_prompt or ""
+    contents = []
+    for m in messages:
+        role = "model" if m.get("role") == "assistant" else "user"
+        parts = _gemini_parts(m.get("content"))
+        if not parts:
+            continue
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].extend(parts)  # Gemini prefers alternating roles
+        else:
+            contents.append({"role": role, "parts": parts})
+    if not contents:
+        raise ValueError("no content to send")
+    resp = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY,
+                 "content-type": "application/json"},
+        json={"system_instruction": {"parts": [{"text": system_text}]},
+              "contents": contents,
+              "generationConfig": {
+                  "maxOutputTokens": int(os.environ.get("MAX_REPLY_TOKENS", "1200"))}},
+        timeout=90,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    cands = data.get("candidates") or []
+    if not cands:
+        raise ValueError(f"Gemini returned no candidates: {str(data)[:200]}")
+    text = "".join(p.get("text", "")
+                   for p in (cands[0].get("content") or {}).get("parts") or [])
+    if not text.strip():
+        raise ValueError("Gemini returned empty text")
+    return text.strip()
+
+def _call_claude(messages: list, system_prompt, user: str = "") -> str:
     """system_prompt: a plain string, or (static, dynamic) where the static part —
     the knowledge base and standing rules, identical for every customer — is marked
     for Anthropic's prompt caching. Cached repeats cost ~90% less on input, and with
     hundreds of conversations a day resending the whole price list every message was
-    the single biggest cost in the project."""
+    the single biggest cost in the project.
+
+    When the Gemini switch is on for this user, Google answers instead — with an
+    automatic fall-through to Claude on any error."""
+    if _use_gemini(user):
+        try:
+            return _call_gemini(messages, system_prompt)
+        except Exception:
+            log.exception("Gemini call failed — falling back to Claude")
     if isinstance(system_prompt, tuple):
         static, dynamic = system_prompt
         system = [{"type": "text", "text": static,
@@ -1712,6 +1796,8 @@ def _call_claude(messages: list, system_prompt) -> str:
             },
             json={
                 "model": ANTHROPIC_MODEL,
+            "gemini": {"mode": gemini_mode(), "key": bool(GEMINI_API_KEY),
+                       "model": GEMINI_MODEL},
                 # Generous headroom: a reply cut off mid-marker leaks '<<<HANDOVER|…'
                 # to the customer AND loses the alert, because the closing >>> never
                 # arrives for the parser to match.
@@ -1754,7 +1840,7 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
     """Call Claude, and if the reply has no visible words (only hidden markers, or
     nothing at all), ask once more. Stops customers getting silence or a holding line
     when a real answer was possible."""
-    answer = _call_claude(messages, system_prompt)
+    answer = _call_claude(messages, system_prompt, user)
     if visible_text(answer):
         return answer
     log.warning("Claude returned no visible text for %s (raw=%r) — retrying once",
@@ -1763,7 +1849,7 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
         retry = (system_prompt[0], (system_prompt[1] or "") + RETRY_NUDGE)
     else:
         retry = system_prompt + RETRY_NUDGE
-    return _call_claude(messages, retry)
+    return _call_claude(messages, retry, user)
 
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
@@ -2718,7 +2804,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3122,6 +3208,15 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
                               "error": str(exc)[:200]})
         return {"fixed": fixed}
+    if action == "gemini":
+        # Flip the Gemini switch: ?action=gemini&date=off|test|all (blank = show).
+        want = (date or "").strip().lower()
+        if want in ("off", "test", "all"):
+            set_setting("gemini_mode", want)
+        return {"gemini_mode": gemini_mode(), "key_loaded": bool(GEMINI_API_KEY),
+                "gemini_model": GEMINI_MODEL,
+                "note": "test = owner chats only; all = every customer; "
+                        "any Gemini error falls back to Claude automatically"}
     if action == "addbooking":
         # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
         # diary, calendar, job sheet and day-before reminder all know about it.
