@@ -416,6 +416,57 @@ def create_calendar_event(fields: dict) -> bool:
     return False
 
 CANCEL_RE = re.compile(r"<<<CANCEL\|(.*?)>>>", re.DOTALL)
+INVOICE_RE = re.compile(r"<<<INVOICE\|(.*?)>>>", re.DOTALL)
+
+def process_invoice(answer: str):
+    """Pull the hidden invoice-request marker out of the reply."""
+    m = INVOICE_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = INVOICE_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k.strip().lower()] = v.strip()
+    return clean, fields
+
+def send_invoice_request(user: str, fields: dict) -> None:
+    """Email the accountant a customer's invoice request, and note it on Telegram.
+
+    The customer's WhatsApp number rides along automatically — the bot never asks
+    for a phone number."""
+    to = get_setting("invoice_email", "").strip()
+    body = (
+        "Invoice request from a WhatsApp customer:\n\n"
+        f"Make out to: {fields.get('name', '(not given)')}\n"
+        f"Car reg:     {fields.get('reg', '(not given)')}\n"
+        f"Send to:     {fields.get('email', '(not given)')}\n"
+        f"Job/visit:   {fields.get('job', '(not given)')}\n"
+        f"Customer phone: +{user}\n\n"
+        f"Conversation: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}&user={user}\n"
+    )
+    ok, err = (False, "no accountant email configured")
+    if to:
+        ok, err = send_email(f"Invoice request — {fields.get('reg', '')} "
+                             f"{fields.get('name', '')}", body, to=to)
+    if not ok:
+        log.warning("Invoice email not sent (%s) — falling back to owner email", err)
+        send_email(f"Invoice request — {fields.get('reg', '')}", body)
+    # Best-effort WhatsApp copy to the accountant. Business-initiated WhatsApp only
+    # delivers inside a 24h window of the recipient's last message, so this works
+    # when the accountant chats with the line; email above is the reliable channel.
+    wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
+    if wa:
+        try:
+            send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body)
+        except Exception:
+            log.exception("Invoice WhatsApp to accountant failed")
+    send_telegram("🧾 Invoice request\n"
+                  f"{fields.get('name', '?')} — {fields.get('reg', '?')}\n"
+                  f"Email: {fields.get('email', '?')}\n"
+                  + ("Sent to accountant ✓" if ok and to else
+                     "⚠️ No accountant email set — sent to your own inbox instead"))
 
 def process_cancel(answer: str):
     """Pull the hidden cancellation marker out of the reply."""
@@ -1819,12 +1870,12 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
         )
 
 ALL_MARKERS_RE = re.compile(
-    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL)\|.*?>>>", re.DOTALL)
+    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE)\|.*?>>>", re.DOTALL)
 # The same markers but WITHOUT a closing '>>>' — i.e. the reply ran out of tokens
 # part-way through writing one. Anchored to the end so it can only ever match a
 # genuine tail fragment, never a complete marker earlier in the text.
 TRUNCATED_MARKER_RE = re.compile(
-    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL)\|(?:(?!>>>).)*$", re.DOTALL)
+    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE)\|(?:(?!>>>).)*$", re.DOTALL)
 
 def visible_text(answer: str) -> str:
     """What the customer would actually see once the hidden markers are removed."""
@@ -1914,6 +1965,12 @@ def _finish_reply(user: str, answer: str) -> str:
                 email_booking(booking)
             except Exception:
                 log.exception("Failed to email booking")
+    answer, invoice = process_invoice(answer)
+    if invoice and not is_owner:
+        try:
+            send_invoice_request(user, invoice)
+        except Exception:
+            log.exception("Failed to process invoice request for %s", user)
     answer, cancel = process_cancel(answer)
     if cancel and not is_owner:
         try:
@@ -2804,7 +2861,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3208,6 +3265,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
                               "error": str(exc)[:200]})
         return {"fixed": fixed}
+    if action == "invoicemail":
+        # Set where invoice requests go: ?action=invoicemail&date=accountant@x.ie
+        want = (date or "").strip()
+        if want:
+            set_setting("invoice_email", want)
+        return {"invoice_email": get_setting("invoice_email", "") or "(not set - falls back to owner email)",
+                "invoice_whatsapp": get_setting("invoice_whatsapp", "") or "(not set)"}
+    if action == "invoicewhatsapp":
+        want = (date or "").strip()
+        if want:
+            set_setting("invoice_whatsapp", want)
+        return {"invoice_whatsapp": get_setting("invoice_whatsapp", "") or "(not set)"}
     if action == "gemini":
         # Flip the Gemini switch: ?action=gemini&date=off|test|all (blank = show).
         want = (date or "").strip().lower()
