@@ -11,7 +11,7 @@ Env vars required (see .env.example):
   APP_SECRET            - Meta app secret (webhook signature check)
   ANTHROPIC_API_KEY     - Claude API key
 Optional:
-  ANTHROPIC_MODEL       - default: claude-sonnet-4-5
+  ANTHROPIC_MODEL       - default: claude-haiku-4-5
   MAX_HISTORY           - messages of context per user (default 20)
   PAUSE_KEYWORD         - owner sends this word to pause bot for a chat (default: #stop)
   RESUME_KEYWORD        - resume word (default: #start)
@@ -52,7 +52,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "change-me")
 REVIEW_TOKEN = os.environ.get("REVIEW_TOKEN", "")
 APP_SECRET = os.environ.get("APP_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 PAUSE_KEYWORD = os.environ.get("PAUSE_KEYWORD", "#stop").lower()
 RESUME_KEYWORD = os.environ.get("RESUME_KEYWORD", "#start").lower()
