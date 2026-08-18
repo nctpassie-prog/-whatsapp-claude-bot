@@ -1506,7 +1506,7 @@ def _maybe_courtesy_close(user: str) -> None:
     history = get_history(user)
     if not history or history[-1]["role"] != "user":
         return
-    system_prompt = load_system_prompt() + availability_block() + ASSIST_WHILE_STAFF
+    system_prompt = (load_system_prompt(), availability_block() + ASSIST_WHILE_STAFF)
     raw = _call_claude(history + [{"role": "user", "content":
                                    "(Internal: apply the SPECIAL SITUATION rules to "
                                    "the customer's last message — answer the simple "
@@ -1688,7 +1688,20 @@ def contact_hint(user: str) -> str:
         "Put that number in the booking's phone field."
     )
 
-def _call_claude(messages: list, system_prompt: str) -> str:
+def _call_claude(messages: list, system_prompt) -> str:
+    """system_prompt: a plain string, or (static, dynamic) where the static part —
+    the knowledge base and standing rules, identical for every customer — is marked
+    for Anthropic's prompt caching. Cached repeats cost ~90% less on input, and with
+    hundreds of conversations a day resending the whole price list every message was
+    the single biggest cost in the project."""
+    if isinstance(system_prompt, tuple):
+        static, dynamic = system_prompt
+        system = [{"type": "text", "text": static,
+                   "cache_control": {"type": "ephemeral"}}]
+        if dynamic:
+            system.append({"type": "text", "text": dynamic})
+    else:
+        system = system_prompt
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -1703,7 +1716,7 @@ def _call_claude(messages: list, system_prompt: str) -> str:
                 # to the customer AND loses the alert, because the closing >>> never
                 # arrives for the parser to match.
                 "max_tokens": int(os.environ.get("MAX_REPLY_TOKENS", "1200")),
-                "system": system_prompt,
+                "system": system,
                 "messages": messages,
             },
             timeout=90,
@@ -1737,7 +1750,7 @@ RETRY_NUDGE = (
     "hidden <<<...>>> line this time — just the message the customer should read."
 )
 
-def _call_claude_visible(messages: list, system_prompt: str, user: str = "") -> str:
+def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
     """Call Claude, and if the reply has no visible words (only hidden markers, or
     nothing at all), ask once more. Stops customers getting silence or a holding line
     when a real answer was possible."""
@@ -1746,7 +1759,11 @@ def _call_claude_visible(messages: list, system_prompt: str, user: str = "") -> 
         return answer
     log.warning("Claude returned no visible text for %s (raw=%r) — retrying once",
                 user or "?", (answer or "")[:300])
-    return _call_claude(messages, system_prompt + RETRY_NUDGE)
+    if isinstance(system_prompt, tuple):
+        retry = (system_prompt[0], (system_prompt[1] or "") + RETRY_NUDGE)
+    else:
+        retry = system_prompt + RETRY_NUDGE
+    return _call_claude(messages, retry)
 
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
@@ -1876,14 +1893,17 @@ def ask_claude(user: str, text: str, transcript_note: str = "") -> str:
     messages = get_history(user)
     if transcript_note:  # let Claude see the real instruction, not the tidy label
         messages = messages[:-1] + [{"role": "user", "content": text}]
-    system_prompt = load_system_prompt() + availability_block()
+    # The knowledge base is identical for everyone — cache it. Per-customer parts
+    # (availability, their history, hints) stay dynamic.
+    dynamic = availability_block()
     if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
-        system_prompt += OWNER_HINT
+        dynamic += OWNER_HINT
     else:
-        system_prompt += contact_hint(user) + customer_context(user)
+        dynamic += contact_hint(user) + customer_context(user)
         if len(messages) <= 1:  # first message we've ever seen from this customer
-            system_prompt += WELCOME_HINT
-    return _finish_reply(user, _call_claude_visible(messages, system_prompt, user))
+            dynamic += WELCOME_HINT
+    return _finish_reply(user, _call_claude_visible(
+        messages, (load_system_prompt(), dynamic), user))
 
 def ask_claude_image(user: str, images: list, caption: str) -> str:
     """Answer one or more photos in a single reply. `images` is [(base64, mime), …]."""
@@ -1892,10 +1912,10 @@ def ask_claude_image(user: str, images: list, caption: str) -> str:
             f"[Customer sent {len(images)} photos]"
     save_message(user, "user", (label + " " + note).strip())
     history = get_history(user)
-    system_prompt = (load_system_prompt() + availability_block() + contact_hint(user)
-                     + customer_context(user))
+    dynamic = availability_block() + contact_hint(user) + customer_context(user)
     if len(history) <= 1:
-        system_prompt += WELCOME_HINT
+        dynamic += WELCOME_HINT
+    system_prompt = (load_system_prompt(), dynamic)
     many = len(images) > 1
     prompt_text = note or (
         f"The customer sent {'these photos' if many else 'this photo'} — most likely an NCT "
@@ -1920,10 +1940,10 @@ def ask_claude_pdf(user: str, pdf_b64: str, caption: str, filename: str = "") ->
     save_message(user, "user",
                  ("[Customer sent a document] " + (filename or "") + " " + note).strip())
     history = get_history(user)
-    system_prompt = (load_system_prompt() + availability_block() + contact_hint(user)
-                     + customer_context(user))
+    dynamic = availability_block() + contact_hint(user) + customer_context(user)
     if len(history) <= 1:
-        system_prompt += WELCOME_HINT
+        dynamic += WELCOME_HINT
+    system_prompt = (load_system_prompt(), dynamic)
     prompt_text = note or (
         "The customer sent this document — it is most likely an NCT fail sheet, a test "
         "report or a quote. Read it carefully and reply helpfully: for a fail sheet, list "
