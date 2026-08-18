@@ -2861,7 +2861,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3265,6 +3265,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 fixed.append({"who": name or phone_, "reg": reg_, "was": d_,
                               "error": str(exc)[:200]})
         return {"fixed": fixed}
+    if action == "invoicetest":
+        # Send a demo invoice request through the real pipeline.
+        send_invoice_request("353860000000", {
+            "name": "TEST - Murphy Motors Ltd", "reg": "12D34567",
+            "email": "test@example.com", "job": "Front brake pads, 18 Aug"})
+        return {"sent": True, "to_email": get_setting("invoice_email", "") or "(owner inbox fallback)",
+                "to_whatsapp": get_setting("invoice_whatsapp", "") or "(not set)"}
     if action == "invoicemail":
         # Set where invoice requests go: ?action=invoicemail&date=accountant@x.ie
         want = (date or "").strip()
