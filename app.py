@@ -1041,8 +1041,14 @@ def save_booking(fields: dict) -> bool:
         today = now_local().date()
         while d < today - timedelta(days=1):
             d = d.replace(year=d.year + 1)
+        # And the same mistake forwards: "13 August" once became 2027-08-13. Nobody
+        # books a garage more than ~13 months out, so pull absurd years back too.
+        while d > today + timedelta(days=396):
+            d = d.replace(year=d.year - 1)
+        if d < today - timedelta(days=1):  # pulled back into the past -> next occurrence
+            d = d.replace(year=d.year + 1)
         if d.isoformat() != date_:
-            log.warning("Booking date %s was in the past — corrected to %s", date_, d)
+            log.warning("Booking date %s had a wrong year — corrected to %s", date_, d)
             date_ = d.isoformat()
             fields["date"] = date_
     except Exception:
@@ -1527,8 +1533,11 @@ WATCH_BOOKING_SYSTEM = (
     "confirmation from both sides (e.g. customer: 'yes book me for 21st', staff: "
     "'Done'). If YES, output ONLY one line in exactly this format and nothing else:\n"
     "<<<BOOKING|car=...|reg=...|need=...|date=YYYY-MM-DD|time=...|name=...|phone=...|lang=..>>>\n"
-    "Work out the real calendar date. Leave unknown fields empty. If no booking was "
-    "clearly agreed, or it is only being discussed, output exactly SKIP."
+    "Work out the real calendar date — it must be TODAY or in the FUTURE, never a "
+    "past day being talked about. Leave unknown fields empty. Output exactly SKIP "
+    "when: no booking was clearly agreed; it is only being discussed; the car is "
+    "ALREADY at the garage; or they are talking about the status, collection or "
+    "history of existing work. Only a NEW future appointment counts."
 )
 
 def watch_staff_booking(user: str) -> None:
@@ -2688,7 +2697,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "fixdates",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
