@@ -2686,6 +2686,7 @@ def health() -> dict:
             "review_key_loaded": bool(REVIEW_TOKEN),
             "review_key_len": len(REVIEW_TOKEN),
             "master_key_len": len(VERIFY_TOKEN),
+            "model": ANTHROPIC_MODEL,
             "voice_notes": ("deepgram" if DEEPGRAM_API_KEY
                             else "openai" if OPENAI_API_KEY else "not set up")}
 
