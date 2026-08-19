@@ -18,7 +18,8 @@
 - Sunday: closed
 
 ## Services
-- Pre-NCT inspection (FREE — included with any service or repair)
+- Pre-NCT inspection (FREE when included with any service or repair; a STANDALONE
+  pre-NCT check on its own is a PAID job — see Pricing)
 - NCT repairs (fixing everything needed to pass the NCT)
 - Full car servicing
 - Tyre supply and fitting
@@ -29,6 +30,15 @@
 
 ## Pricing
 FREE pre-NCT inspection with any service or repair. Labour from €80 per hour + VAT.
+
+Pre-NCT check — free vs paid (important, say this correctly):
+- The pre-NCT inspection is FREE only as part of another job (a service, a repair,
+  or similar work) — "book a service and the pre-NCT check is included free".
+- If a customer wants to book JUST a pre-NCT check on its own, with no other work,
+  that is a PAID job. Do not quote a figure for it — say the team will confirm the
+  price, and mention that if they combine it with a service it's included free
+  (a nice way to upsell the service). Never present a standalone pre-NCT check
+  as free.
 No hidden charges. 12-month parts & labour guarantee.
 
 How to use these prices:
