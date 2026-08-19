@@ -378,6 +378,18 @@ def create_calendar_event(fields: dict) -> bool:
     car = fields.get("car", "")
     reg = clean_reg(fields.get("reg", ""))
     name = fields.get("name", "")
+    # Owner's colour code, so the day's mix is visible at a glance in the calendar:
+    # RED (Tomato, 11) = general service work; YELLOW (Banana, 5) = NCT repairs.
+    # Everything else (diagnostics, brakes, AC, one-off jobs) keeps the default.
+    need_lc = (fields.get("need") or "").lower()
+    color = ""
+    if any(w in need_lc for w in ("fail", "retest")):
+        color = "5"   # clearly NCT-repair work
+    elif any(w in need_lc for w in ("service", "servicing", "oil change",
+                                    "oil and filter", "oil & filter")):
+        color = "11"  # a service — even with a free pre-NCT check attached
+    elif "nct" in need_lc:
+        color = "5"
     body = {
         "summary": " ".join(x for x in [name or "NCTPass booking", "-", car, reg] if x),
         "description": (
@@ -388,6 +400,8 @@ def create_calendar_event(fields: dict) -> bool:
         "start": {"dateTime": f"{d:%Y-%m-%d}T09:00:00", "timeZone": "Europe/Dublin"},
         "end": {"dateTime": f"{d:%Y-%m-%d}T11:00:00", "timeZone": "Europe/Dublin"},
     }
+    if color:
+        body["colorId"] = color
     try:
         token = _google_access_token("calendar")
         if not token:
