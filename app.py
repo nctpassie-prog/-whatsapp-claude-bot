@@ -1847,8 +1847,6 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-            "gemini": {"mode": gemini_mode(), "key": bool(GEMINI_API_KEY),
-                       "model": GEMINI_MODEL},
                 # Generous headroom: a reply cut off mid-marker leaks '<<<HANDOVER|…'
                 # to the customer AND loses the alert, because the closing >>> never
                 # arrives for the parser to match.
@@ -2830,6 +2828,8 @@ def health() -> dict:
             "review_key_len": len(REVIEW_TOKEN),
             "master_key_len": len(VERIFY_TOKEN),
             "model": ANTHROPIC_MODEL,
+            "gemini": {"mode": gemini_mode(), "key": bool(GEMINI_API_KEY),
+                       "model": GEMINI_MODEL},
             "voice_notes": ("deepgram" if DEEPGRAM_API_KEY
                             else "openai" if OPENAI_API_KEY else "not set up")}
 
