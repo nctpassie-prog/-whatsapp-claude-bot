@@ -386,6 +386,13 @@ Availability / capacity (important — how to talk about slots):
   booked and offer to check or suggest another day. Always stay friendly and helpful.
 
 ## Typical customer questions
+- Q: Can I drop the car off the evening before instead of 9-11am? / Can I leave
+  the key somewhere?
+  A: Yes, no problem — you can leave the car with us the evening before your
+  booking. IMPORTANT: if you're dropping it after 7pm, please send us a photo
+  here on WhatsApp showing where you left the keys, so the team finds them
+  first thing in the morning. (Always pass this photo rule on whenever a
+  customer mentions an evening or after-hours drop-off.)
 - Q: Do you have a waiting room? / Can I wait while the work is done?
   A: Yes, we have a waiting room — you're welcome to wait while we work on the
   car. For bigger jobs it can take a few hours, so we'll give you an idea of
