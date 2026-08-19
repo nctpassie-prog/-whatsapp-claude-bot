@@ -1326,10 +1326,12 @@ def availability_block() -> str:
         iso = d.isoformat()
         left = max(0, cap - taken.get(iso, 0))
         # Owner's rule: on weekdays the LAST 2 slots of every day are reserved for
-        # general services. Non-service work (repairs, diagnostics, NCT jobs) may
-        # only use cap-2; services can use every slot.
+        # general services — but only while the day is still far enough away for a
+        # service customer to claim them. Within 3 days of the date, unclaimed
+        # service slots are released to any job (an empty slot earns nothing).
         if d.weekday() < 5:
-            nonservice_left = max(0, (cap - 2) - nonservice.get(iso, 0))
+            reserve = 2 if (d - today).days > 3 else 0
+            nonservice_left = max(0, (cap - reserve) - nonservice.get(iso, 0))
         else:
             nonservice_left = 0  # Saturday is services-only anyway
         nonservice_left = min(nonservice_left, left)
@@ -1352,7 +1354,7 @@ def availability_block() -> str:
             "questions and give prices as normal — only the booking date is restricted."
         )
     return (opening_note +
-        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day with repair space (services can always be booked on any open day). Saturday is GENERAL SERVICES "
+        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES while the day is more than 3 days away: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day that shows repair space (services can always be booked on any open day). Within 3 days of a date the reservation is released automatically and the list simply shows the real space — always trust the numbers in the list. Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
