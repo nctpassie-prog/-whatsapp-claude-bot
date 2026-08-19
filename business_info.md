@@ -386,6 +386,10 @@ Availability / capacity (important — how to talk about slots):
   booked and offer to check or suggest another day. Always stay friendly and helpful.
 
 ## Typical customer questions
+- Q: Do you have a waiting room? / Can I wait while the work is done?
+  A: Yes, we have a waiting room — you're welcome to wait while we work on the
+  car. For bigger jobs it can take a few hours, so we'll give you an idea of
+  the time when you drop off.
 - Q: How much to fix what failed the NCT?
   A: Depends on the fail items — bring the NCT fail sheet, inspection is free
   and you get an itemised quote before we do anything. Labour from €80/h.
