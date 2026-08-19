@@ -1304,10 +1304,17 @@ def availability_block() -> str:
     today = now_local().date()
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT date, COUNT(*) FROM bookings WHERE date >= ? GROUP BY date",
+            "SELECT date, need FROM bookings WHERE date >= ?",
             (today.isoformat(),),
         ).fetchall()
-    taken = {d: c for d, c in rows}
+    taken, nonservice = {}, {}
+    for d, need in rows:
+        taken[d] = taken.get(d, 0) + 1
+        nl = (need or "").lower()
+        is_service = any(w in nl for w in ("service", "servicing", "oil change",
+                                           "oil and filter", "oil & filter"))
+        if not is_service:
+            nonservice[d] = nonservice.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     lines = []
@@ -1316,8 +1323,25 @@ def availability_block() -> str:
         cap = day_capacity(d)
         if cap == 0:
             continue  # closed Sundays
-        left = max(0, cap - taken.get(d.isoformat(), 0))
-        lines.append(f"{d.strftime('%a %d %b')}: " + ("FULL" if left == 0 else f"{left} slot(s) left"))
+        iso = d.isoformat()
+        left = max(0, cap - taken.get(iso, 0))
+        # Owner's rule: on weekdays the LAST 2 slots of every day are reserved for
+        # general services. Non-service work (repairs, diagnostics, NCT jobs) may
+        # only use cap-2; services can use every slot.
+        if d.weekday() < 5:
+            nonservice_left = max(0, (cap - 2) - nonservice.get(iso, 0))
+        else:
+            nonservice_left = 0  # Saturday is services-only anyway
+        nonservice_left = min(nonservice_left, left)
+        if left == 0:
+            lines.append(f"{d.strftime('%a %d %b')}: FULL")
+        elif nonservice_left == 0 and d.weekday() < 5:
+            lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left — "
+                         "SERVICE BOOKINGS ONLY (repairs/diagnostics/NCT are full "
+                         "this day, offer the next day for those)")
+        else:
+            lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left "
+                         f"({nonservice_left} usable for repairs/diagnostics/NCT)")
     opening_note = ""
     if opens and opens > today:
         opening_note = (
@@ -1328,7 +1352,7 @@ def availability_block() -> str:
             "questions and give prices as normal — only the booking date is restricted."
         )
     return (opening_note +
-        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri (aim for about 5 full services, 3 NCT-fail repairs and 2 of anything); Saturday is GENERAL SERVICES "
+        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day with repair space (services can always be booked on any open day). Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
