@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Query, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -2929,7 +2929,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3241,6 +3241,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"accounts": out}
+    if action == "retelltoken":
+        want = (date or "").strip()
+        if want:
+            set_setting("retell_token", want)
+        return {"retell_token_set": bool(get_setting("retell_token", "")),
+                "endpoint": f"{PUBLIC_URL}/retell/fn?token=<the token>"}
     if action == "mkinvoicetemplate":
         # Submit the invoice_request template so the bot can reach the accountant
         # at any time, outside the 24h customer-service window.
@@ -4266,6 +4272,103 @@ def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: s
         return
     answer = ask_claude_image(sender, images, " ".join(captions))
     send_whatsapp(sender, answer)
+
+# ---------------------------------------------------------------- voice agent (Retell)
+# The phone answerer's hands: Retell's voice agent calls these mid-conversation to
+# check the diary and create bookings, so the PHONE and the WHATSAPP bot share one
+# diary, one set of rules, one alert channel. Secured by a shared token (settings
+# key retell_token) that lives only in the Retell dashboard config and our DB.
+
+def _retell_ok(request: Request) -> bool:
+    want = get_setting("retell_token", "")
+    got = request.query_params.get("token", "")
+    return bool(want) and hmac.compare_digest(want, got)
+
+def _voice_availability() -> str:
+    """Compact availability summary for the voice agent to read out."""
+    today = now_local().date()
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT date, need FROM bookings WHERE date >= ?",
+                            (today.isoformat(),)).fetchall()
+    taken, nonservice = {}, {}
+    for d, need in rows:
+        taken[d] = taken.get(d, 0) + 1
+        nl = (need or "").lower()
+        if not any(w in nl for w in ("service", "servicing", "oil change",
+                                     "oil and filter", "oil & filter")):
+            nonservice[d] = nonservice.get(d, 0) + 1
+    opens = bookings_open_from()
+    start = max(today, opens) if opens else today
+    out = []
+    for i in range(14):
+        d = start + timedelta(days=i)
+        cap = day_capacity(d)
+        if cap == 0:
+            continue
+        iso = d.isoformat()
+        left = max(0, cap - taken.get(iso, 0))
+        reserve = 2 if (d.weekday() < 5 and (d - today).days > 3) else 0
+        ns_left = min(left, max(0, (cap - reserve) - nonservice.get(iso, 0))) \
+            if d.weekday() < 5 else 0
+        if left == 0:
+            continue
+        out.append({"date": iso, "day": d.strftime("%A"),
+                    "slots_for_services": left,
+                    "slots_for_repairs_diagnostics_nct": ns_left,
+                    "saturday_services_only": d.weekday() == 5})
+    return out
+
+@app.post("/retell/fn")
+async def retell_function(request: Request):
+    """Retell custom-function webhook: one endpoint, dispatch on the function name."""
+    if not _retell_ok(request):
+        return JSONResponse({"error": "bad token"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+    fn = (payload.get("name") or request.query_params.get("fn") or "").strip()
+    args = payload.get("args") or {}
+    call = payload.get("call") or {}
+    caller = "".join(ch for ch in str(call.get("from_number", "")) if ch.isdigit())
+    log.info("Retell fn=%s args=%s caller=%s", fn, str(args)[:300], caller)
+
+    if fn == "check_availability":
+        return {"open_days": _voice_availability(),
+                "note": "Drop-off is mornings 9 to 11am. Closed Sunday."}
+
+    if fn == "book_appointment":
+        fields = {"name": (args.get("name") or "").strip(),
+                  "phone": "".join(ch for ch in str(args.get("phone") or caller)
+                                   if ch.isdigit()) or caller,
+                  "car": (args.get("car") or "").strip(),
+                  "reg": (args.get("reg") or "").strip(),
+                  "need": (args.get("job") or args.get("need") or "").strip(),
+                  "date": (args.get("date") or "").strip(), "time": "", "lang": ""}
+        if not fields["date"]:
+            return {"booked": False, "reason": "no date given"}
+        added = save_booking(fields)
+        if added:
+            try:
+                create_calendar_event(fields)
+            except Exception:
+                log.exception("Voice booking calendar event failed")
+            send_telegram("📞 PHONE BOOKING (voice agent)\n"
+                          f"{fields['name']} — {fields['car']} {fields['reg']}\n"
+                          f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
+                          f"Caller: +{fields['phone']}")
+            return {"booked": True, "date": fields["date"],
+                    "confirm": "Booked. Drop-off between 9 and 11am."}
+        return {"booked": False,
+                "reason": "duplicate - this car already has a booking that day"}
+
+    if fn == "take_message":
+        send_telegram("📞 PHONE MESSAGE (voice agent)\n"
+                      f"From: {args.get('name', '?')} +{caller or args.get('phone', '?')}\n"
+                      f"{args.get('message', '')}")
+        return {"ok": True, "confirm": "Message passed to the team."}
+
+    return JSONResponse({"error": f"unknown function {fn!r}"}, status_code=400)
 
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
