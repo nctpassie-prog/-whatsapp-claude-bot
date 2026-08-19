@@ -445,6 +445,30 @@ def process_invoice(answer: str):
             fields[k.strip().lower()] = v.strip()
     return clean, fields
 
+INVOICE_TEMPLATE = "invoice_request"
+
+def send_invoice_template(to: str, fields: dict, user: str) -> bool:
+    """Template message to the accountant — deliverable at ANY time, no 24h window."""
+    params = [fields.get("name") or "(no name)",
+              fields.get("reg") or "-",
+              (fields.get("job") or "(not given)") + f" / customer +{user}",
+              fields.get("email") or "(not given)"]
+    try:
+        url, tok = send_endpoint(phone_id_for_customer(to))
+        r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
+                       json={"messaging_product": "whatsapp", "to": to,
+                             "type": "template",
+                             "template": {"name": INVOICE_TEMPLATE,
+                                          "language": {"code": "en"},
+                                          "components": [{"type": "body",
+                                                          "parameters": [{"type": "text", "text": p}
+                                                                         for p in params]}]}},
+                       timeout=30)
+        return r.status_code < 300
+    except Exception:
+        log.exception("Invoice template send failed")
+        return False
+
 def send_invoice_request(user: str, fields: dict) -> None:
     """Email the accountant a customer's invoice request, and note it on Telegram.
 
@@ -472,6 +496,10 @@ def send_invoice_request(user: str, fields: dict) -> None:
     # when the accountant chats with the line; email above is the reliable channel.
     wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
     if wa:
+        # Template first (deliverable any time once approved); plain message as a
+        # bonus copy — it only lands inside her 24h reply window.
+        if not send_invoice_template(wa, fields, user):
+            log.warning("Invoice template not delivered — trying plain message")
         try:
             send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body)
         except Exception:
@@ -2875,7 +2903,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3187,6 +3215,31 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"accounts": out}
+    if action == "mkinvoicetemplate":
+        # Submit the invoice_request template so the bot can reach the accountant
+        # at any time, outside the 24h customer-service window.
+        payload = {
+            "name": INVOICE_TEMPLATE, "language": "en", "category": "UTILITY",
+            "components": [{"type": "BODY",
+                            "text": ("Invoice request from NCTPass: {{1}}, reg {{2}}. "
+                                     "Job/details: {{3}}. Please email the invoice "
+                                     "to: {{4}}. Reply here if you need more info."),
+                            "example": {"body_text": [["Ellen Sadlier", "132D9882",
+                                                       "2019 service / customer +353851949017",
+                                                       "ellen@example.com"]]}}],
+        }
+        out = []
+        for waba in ("1713722639843344", "236685551234423"):
+            try:
+                r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                               "message_templates",
+                               headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                               json=payload, timeout=30)
+                out.append({"waba": waba[-6:], "http": r.status_code,
+                            "body": (r.text or "")[:200]})
+            except Exception as exc:
+                out.append({"waba": waba[-6:], "error": str(exc)[:200]})
+        return {"template": INVOICE_TEMPLATE, "results": out}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from, in each language our customers speak. Templates live per-account AND
