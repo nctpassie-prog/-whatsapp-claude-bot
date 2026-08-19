@@ -27,6 +27,12 @@
 - Diagnostics and engine fault code reading
 - Emission testing and repair
 - Headlight repair and alignment
+- Headlight beam stickers / conversion for imported cars (e.g. German/UK imports
+  that fail the NCT on headlamp aim): YES we do this. Fitting the stickers plus
+  full beam adjustment is from €80 + VAT when the customer brings their own
+  stickers. If they don't have stickers yet, we can still sort the beam — the
+  team confirms the price for supplying them. A very common NCT fail on imports —
+  offer to book them in.
 
 ## Pricing
 FREE pre-NCT inspection with any service or repair. Labour from €80 per hour + VAT.
