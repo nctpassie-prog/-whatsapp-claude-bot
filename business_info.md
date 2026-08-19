@@ -228,6 +228,7 @@ If a customer asks for any of these, say politely and clearly that it is not som
 do, so they don't waste time waiting. Do not invent a recommendation or name another
 garage. Then offer what we CAN help with (service, NCT prep, repairs) if it's relevant.
 - Wheel refurbishment / alloy wheel repair or refinishing — we do NOT do this.
+- Underseal / underbody rust-proofing (cars or vans) — we do NOT do this.
 - Electric vehicles (Teslas and other EVs) — we do NOT do ENGINE or DRIVETRAIN work on
   electric cars: no remaps, no mechanical/engine repairs, those are diesel and petrol only.
   BUT: headlight and LED light repairs, and other body/light jobs, are FINE on any car
