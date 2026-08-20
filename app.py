@@ -4306,7 +4306,7 @@ def _voice_availability() -> str:
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     out = []
-    for i in range(14):
+    for i in range(30):
         d = start + timedelta(days=i)
         cap = day_capacity(d)
         if cap == 0:
@@ -4340,8 +4340,12 @@ async def retell_function(request: Request):
     log.info("Retell fn=%s args=%s caller=%s", fn, str(args)[:300], caller)
 
     if fn == "check_availability":
-        return {"open_days": _voice_availability(),
-                "note": "Drop-off is mornings 9 to 11am. Closed Sunday."}
+        today = now_local().date()
+        return {"today": f"{today.strftime('%A %d %B %Y')}",
+                "open_days": _voice_availability(),
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. ONLY offer "
+                         "days from open_days - if the caller wants a later date, "
+                         "say we book about a month ahead and take a message.")}
 
     if fn == "book_appointment":
         fields = {"name": (args.get("name") or "").strip(),
