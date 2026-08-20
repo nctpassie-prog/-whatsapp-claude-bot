@@ -1353,7 +1353,13 @@ def availability_block() -> str:
             "and offer the first available day from the list above. You can still answer their "
             "questions and give prices as normal — only the booking date is restricted."
         )
-    return (opening_note +
+    # Anchor the calendar explicitly — "tomorrow, Friday 22nd" (a Saturday) happened
+    # because the model was left to infer today's date. Never make it guess.
+    today_line = (f"\n\nTODAY is {today.strftime('%A %d %B %Y')}. "
+                  f"TOMORROW is {(today + timedelta(days=1)).strftime('%A %d %B %Y')}. "
+                  "When you say a day name with a date, it MUST match this calendar and "
+                  "the availability list — never compute weekdays yourself.")
+    return (today_line + opening_note +
         "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES while the day is more than 3 days away: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day that shows repair space (services can always be booked on any open day). Within 3 days of a date the reservation is released automatically and the list simply shows the real space — always trust the numbers in the list. Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
