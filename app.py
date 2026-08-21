@@ -4420,6 +4420,9 @@ async def retell_call_report(request: Request):
         lines.append(f"Mood: {sentiment}")
     if summary:
         lines.append(summary[:800])
+    rec = (call.get("recording_url") or "").strip()
+    if rec:
+        lines.append(f"🎧 Listen: {rec}")
     send_telegram("\n".join(lines))
     return {"ok": True}
 
