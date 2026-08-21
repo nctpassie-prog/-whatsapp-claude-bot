@@ -4394,6 +4394,35 @@ async def retell_function(request: Request):
 
     return JSONResponse({"error": f"unknown function {fn!r}"}, status_code=400)
 
+@app.post("/retell/webhook")
+async def retell_call_report(request: Request):
+    """Retell call-lifecycle webhook: after each phone call is analyzed, report it
+    to Telegram so Tadas can inspect the voice agent's work (🟢 success / 🔴 not)."""
+    if not _retell_ok(request):
+        return JSONResponse({"error": "bad token"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+    if (payload.get("event") or "").strip() != "call_analyzed":
+        return {"ok": True}
+    call = payload.get("call") or {}
+    analysis = call.get("call_analysis") or {}
+    mark = "🟢" if analysis.get("call_successful") else "🔴"
+    frm = str(call.get("from_number") or "unknown caller")
+    secs = int((call.get("duration_ms") or 0) / 1000)
+    dur = f"{secs // 60}:{secs % 60:02d}"
+    summary = (analysis.get("call_summary") or "").strip()
+    sentiment = (analysis.get("user_sentiment") or "").strip()
+    reason = (call.get("disconnection_reason") or "").replace("_", " ")
+    lines = [f"{mark} PHONE CALL — {frm}", f"⏱ {dur} min · ended: {reason}"]
+    if sentiment:
+        lines.append(f"Mood: {sentiment}")
+    if summary:
+        lines.append(summary[:800])
+    send_telegram("\n".join(lines))
+    return {"ok": True}
+
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
