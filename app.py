@@ -2907,6 +2907,20 @@ def health() -> dict:
             "voice_notes": ("deepgram" if DEEPGRAM_API_KEY
                             else "openai" if OPENAI_API_KEY else "not set up")}
 
+VOICE_SIP_TWIML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<Response><Dial answerOnBridge="true">'
+    '<Sip>sip:+35312659310@sip.retellai.com</Sip>'
+    '</Dial></Response>'
+)
+
+@app.get("/twiml/retell")
+@app.post("/twiml/retell")
+def twiml_retell():
+    # Twilio fetches this when a call hits the garage's 01 265 9310 number;
+    # the TwiML hands the call to Retell's SIP endpoint (Willa answers).
+    return Response(content=VOICE_SIP_TWIML, media_type="text/xml")
+
 CHAT_CSS = """
 body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f4f6;color:#111}
 header{background:#075e54;color:#fff;padding:14px 16px;position:sticky;top:0}
