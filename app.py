@@ -2567,6 +2567,72 @@ def handle_review_reply(sender: str, text: str) -> bool:
         return True
     return False  # unclear — let the normal assistant handle it
 
+MECHANIC_REPORT_HOUR = int(os.environ.get("MECHANIC_REPORT_HOUR", "19"))
+# Dima's shorthand codes vary a little — fold the obvious variants together.
+_MECH_CANON = {"yu": "yur", "yura": "yur", "se": "ser", "io": "ion", "nic": "nik"}
+_LABOUR_AMT_RE = re.compile(r"labou?r\D{0,12}(\d{2,4})", re.IGNORECASE)
+_JOB_REG_RE = re.compile(r"\b(\d{2,3}[A-Za-z]{1,2}\d{1,6})\b")
+
+def send_weekly_mechanic_report(force: bool = False) -> None:
+    """Saturday evening: labour earned per mechanic this week (Mon-Sat), parsed
+    from the ready-messages staff send customers (signed with mechanic codes)."""
+    now = now_local()
+    if not force and (now.weekday() != 5 or now.hour != MECHANIC_REPORT_HOUR):
+        return
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT content FROM messages WHERE role = 'staff'"
+                            " AND ts >= ? ORDER BY ts",
+                            (week_start.timestamp(),)).fetchall()
+    seen, stat = set(), {}
+    unassigned = 0.0
+    unassigned_jobs = no_labour = 0
+    for (content,) in rows:
+        text = content or ""
+        if "is ready" not in text.lower():
+            continue
+        reg_m = _JOB_REG_RE.search(text)
+        tot_m = re.search(r"Total\s*(\d+)", text, re.IGNORECASE)
+        labour = sum(float(a) for a in _LABOUR_AMT_RE.findall(text))
+        key = (reg_m.group(1) if reg_m else "", tot_m.group(1) if tot_m else "", labour)
+        if key in seen:
+            continue  # Dima double-sent the same notice
+        seen.add(key)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        idx = max((i for i, ln in enumerate(lines) if "nctpass.ie" in ln.lower()),
+                  default=-1)
+        tags = []
+        if 0 <= idx < len(lines) - 1:
+            cand = lines[idx + 1].lower()
+            if re.fullmatch(r"[a-z ]{1,20}", cand) and not cand.startswith("note"):
+                tags = [_MECH_CANON.get(t, t) for t in cand.split()]
+        if labour == 0:
+            no_labour += 1
+        if not tags:
+            unassigned += labour
+            if labour:
+                unassigned_jobs += 1
+            continue
+        share = labour / len(tags)
+        for t in tags:
+            jobs, total = stat.get(t, (0, 0.0))
+            stat[t] = (jobs + 1, total + share)
+    body_lines = [f"🔧 Mechanics' week {week_start.strftime('%d %b')} – "
+                  f"{now.strftime('%d %b')}"]
+    if stat:
+        for t, (jobs, total) in sorted(stat.items(), key=lambda kv: -kv[1][1]):
+            body_lines.append(f"{t:<6} {jobs:>3} jobs   €{total:,.0f} labour")
+    else:
+        body_lines.append("No signed ready-messages found this week.")
+    if unassigned:
+        body_lines.append(f"❓ No mechanic tag: €{unassigned:,.0f} "
+                          f"across {unassigned_jobs} jobs — remind Dima to sign them")
+    if no_labour:
+        body_lines.append(f"ℹ️ {no_labour} ready-jobs had no labour line "
+                          "(plain services etc. — not counted above)")
+    send_telegram("\n".join(body_lines))
+
 def send_weekly_gap_report(force: bool = False) -> None:
     """Once a week, tell the owner what customers asked that the bot couldn't answer.
 
@@ -2990,6 +3056,10 @@ def reminder_loop() -> None:
             send_weekly_gap_report()
         except Exception:
             log.exception("Gap report error")
+        try:
+            send_weekly_mechanic_report()
+        except Exception:
+            log.exception("Mechanic report error")
         time.sleep(3600)  # check hourly
 
 # ---------------------------------------------------------------- webhook
@@ -3057,7 +3127,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3400,6 +3470,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "mechanicreport":
+        # Send this week's per-mechanic labour table to Telegram right now.
+        send_weekly_mechanic_report(force=True)
+        return {"sent": True}
     if action == "staffreport":
         # Everything colleagues sent from the WhatsApp app in the last N days
         # (?date=N, default 31) — the raw material for a management report.
