@@ -3057,7 +3057,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3400,6 +3400,28 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "revenue":
+        # Charges logged in the last N days (?date=N, default 31): raw + totals.
+        try:
+            days = max(1, min(365, int(date or "31")))
+        except ValueError:
+            days = 31
+        cutoff = time.time() - days * 86400
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT reg, amount, note, ts FROM charges"
+                                " WHERE ts >= ? ORDER BY ts", (cutoff,)).fetchall()
+        def money(a):
+            m = re.search(r"\d+(?:[.,]\d+)?", str(a or "").replace(",", ""))
+            return float(m.group()) if m else 0.0
+        entries = [{"date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                    "reg": reg, "amount": money(amount), "note": (note or "")[:120]}
+                   for reg, amount, note, ts in rows]
+        total = sum(e["amount"] for e in entries)
+        by_day = {}
+        for e in entries:
+            by_day[e["date"]] = round(by_day.get(e["date"], 0) + e["amount"], 2)
+        return {"days": days, "jobs": len(entries), "total_ex_vat": round(total, 2),
+                "by_day": by_day, "entries": entries}
     if action == "reviewtest":
         # Send a test review request: ?phone=3538...&name=...&car=...
         digits = "".join(ch for ch in (phone or "") if ch.isdigit())
