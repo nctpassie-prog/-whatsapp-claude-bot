@@ -3164,7 +3164,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport", "tgpending", "setprivatechat",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3507,6 +3507,39 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "tgcleanup":
+        # Delete the bot's recent messages from the SHARED alert chats (e.g. a
+        # wages report sent there by mistake). Bots may delete their own messages
+        # for 48h. ?date=N sweeps the last N message-ids (default 50). The
+        # owner's private chat is left untouched.
+        try:
+            span = max(1, min(200, int(date or "50")))
+        except ValueError:
+            span = 50
+        private = (get_setting("owner_private_chat") or "").strip()
+        results = []
+        for cid in telegram_chat_ids():
+            if cid == private:
+                continue
+            try:
+                probe = httpx.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": cid, "text": "🧹 tidying up…"}, timeout=20)
+                mid = ((probe.json() or {}).get("result") or {}).get("message_id")
+                if not mid:
+                    results.append({"chat": cid, "error": "no probe id"})
+                    continue
+                deleted = 0
+                for i in range(max(1, mid - span), mid + 1):
+                    r = httpx.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+                        json={"chat_id": cid, "message_id": i}, timeout=10)
+                    if r.status_code == 200 and (r.json() or {}).get("ok"):
+                        deleted += 1
+                results.append({"chat": cid, "deleted": deleted})
+            except Exception as exc:
+                results.append({"chat": cid, "error": str(exc)[:120]})
+        return {"swept_ids": span, "results": results}
     if action == "tgpending":
         # Who has messaged the Telegram bot (candidates for the private chat link).
         try:
