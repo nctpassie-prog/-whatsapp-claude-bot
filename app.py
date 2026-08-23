@@ -102,7 +102,7 @@ REMINDER_TEMPLATE = os.environ.get("REMINDER_TEMPLATE", "appointment_reminder")
 REMINDER_LANG = os.environ.get("REMINDER_LANG", "en")  # fallback language
 REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "1") == "1"
 # Post-visit review request (feedback funnel).
-REVIEW_TEMPLATE = os.environ.get("REVIEW_TEMPLATE", "review_request")
+REVIEW_TEMPLATE = os.environ.get("REVIEW_TEMPLATE", "visit_feedback")
 REVIEW_ENABLED = os.environ.get("REVIEW_ENABLED", "1") == "1"
 REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after appointment
 # Direct link to the garage's Google listing (4.8 stars) — only ever sent AFTER a
