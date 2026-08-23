@@ -105,6 +105,9 @@ REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "1") == "1"
 REVIEW_TEMPLATE = os.environ.get("REVIEW_TEMPLATE", "review_request")
 REVIEW_ENABLED = os.environ.get("REVIEW_ENABLED", "1") == "1"
 REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after appointment
+# Direct link to the garage's Google listing (4.8 stars) — only ever sent AFTER a
+# customer says they were happy, so unhappy feedback stays private.
+REVIEW_LINK = os.environ.get("REVIEW_LINK", "https://maps.google.com/?cid=1793275012653342365")
 # Template language versions that exist/are approved (Moldovan = Romanian = ro).
 REMINDER_LANGS = {"en", "ru", "lt", "ro"}
 
@@ -842,6 +845,10 @@ def db() -> sqlite3.Connection:
         " wa_number TEXT PRIMARY KEY, name TEXT DEFAULT '', reg TEXT DEFAULT '',"
         " first_ts REAL, last_ts REAL)"
     )
+    # Who we asked "how was everything?" and are awaiting a rating from — the
+    # Google-review link only goes out after a HAPPY reply (feedback funnel).
+    conn.execute("CREATE TABLE IF NOT EXISTS review_pending ("
+                 " wa_user TEXT PRIMARY KEY, ts REAL, lang TEXT DEFAULT '')")
     # Stores the Google Contacts resource id once a customer is pushed there, so we
     # update the same contact instead of creating duplicates.
     try:
@@ -2466,9 +2473,86 @@ def send_due_reviews() -> None:
         ).fetchall()
     for bid, name, phone, car, lang in rows:
         if phone and send_review_template(phone, name, car, lang):
+            digits = "".join(ch for ch in str(phone) if ch.isdigit())
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET review_sent = 1 WHERE id = ?", (bid,))
+                conn.execute("INSERT OR REPLACE INTO review_pending (wa_user, ts, lang)"
+                             " VALUES (?, ?, ?)", (digits, time.time(), lang or ""))
             log.info("Sent review request for booking %s to %s", bid, phone)
+
+# Rating replies: the link goes out ONLY on a clearly happy answer; a clearly
+# unhappy one gets an apology and lands on the owner's Telegram instead.
+_REVIEW_POSITIVE_RE = re.compile(
+    r"\b(?:[45]|5\s*/\s*5|good|great|perfect|excellent|brilliant|grand|happy|"
+    r"lovely|delighted|thanks|thank you|отлично|хорошо|супер|спасибо|доволен|"
+    r"довольна|класс|bine|foarte|multumesc|mulțumesc|perfect|super|gerai|"
+    r"puikiai|ačiū|aciu|tobula)\b", re.IGNORECASE)
+_REVIEW_NEGATIVE_RE = re.compile(
+    r"\b(?:[123]|bad|poor|terrible|awful|not (?:good|great|happy)|unhappy|problem|"
+    r"issue|complaint|disappoint\w*|плохо|ужас\w*|проблем\w*|недоволен|недовольна|"
+    r"rau|prost|problema|nemultumit|nemulțumit|blogai|problemos?)\b", re.IGNORECASE)
+
+_REVIEW_HAPPY_REPLY = {
+    "en": ("Brilliant, delighted to hear it! 🎉 If you have 30 seconds, a quick "
+           f"Google review would mean the world to us: {REVIEW_LINK}\n"
+           "Thanks a million! 🙏"),
+    "ru": ("Отлично, очень рады это слышать! 🎉 Если найдётся 30 секунд, короткий "
+           f"отзыв в Google нам очень поможет: {REVIEW_LINK}\nОгромное спасибо! 🙏"),
+    "ro": ("Minunat, ne bucurăm mult! 🎉 Dacă aveți 30 de secunde, o scurtă recenzie "
+           f"pe Google ne-ar ajuta enorm: {REVIEW_LINK}\nMulțumim mult! 🙏"),
+    "lt": ("Puiku, labai džiaugiamės! 🎉 Jei turite 30 sekundžių, trumpas Google "
+           f"atsiliepimas mums labai padėtų: {REVIEW_LINK}\nLabai ačiū! 🙏"),
+}
+_REVIEW_SORRY_REPLY = {
+    "en": ("I'm really sorry to hear that. Please tell me what went wrong — the boss "
+           "sees these messages personally and the team will put it right."),
+    "ru": ("Очень жаль это слышать. Расскажите, пожалуйста, что было не так — "
+           "владелец лично читает эти сообщения, и команда всё исправит."),
+    "ro": ("Îmi pare foarte rău să aud asta. Spuneți-ne ce nu a fost în regulă — "
+           "patronul citește personal aceste mesaje și echipa va rezolva."),
+    "lt": ("Labai apgailestaujame. Parašykite, kas buvo ne taip — savininkas "
+           "asmeniškai skaito šias žinutes ir komanda viską sutvarkys."),
+}
+
+def handle_review_reply(sender: str, text: str) -> bool:
+    """If this customer was just asked to rate their visit, act on the answer.
+    Returns True when the message was fully handled here."""
+    digits = "".join(ch for ch in str(sender) if ch.isdigit())
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts, COALESCE(lang,'') FROM review_pending"
+                               " WHERE wa_user = ?", (digits,)).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    ts, lang = row
+    # However it goes, one reply settles it — never nag the same customer again.
+    with closing(db()) as conn, conn:
+        conn.execute("DELETE FROM review_pending WHERE wa_user = ?", (digits,))
+    if time.time() - (ts or 0) > 7 * 86400:
+        return False  # stale ask — treat as a normal message
+    code = reminder_lang_code(lang)
+    negative = bool(_REVIEW_NEGATIVE_RE.search(text))
+    positive = bool(_REVIEW_POSITIVE_RE.search(text)) and not negative
+    if positive:
+        save_message(sender, "user", text)
+        reply = _REVIEW_HAPPY_REPLY.get(code, _REVIEW_HAPPY_REPLY["en"])
+        send_whatsapp(sender, reply)
+        save_message(sender, "assistant", reply)
+        return True
+    if negative:
+        save_message(sender, "user", text)
+        reply = _REVIEW_SORRY_REPLY.get(code, _REVIEW_SORRY_REPLY["en"])
+        send_whatsapp(sender, reply)
+        save_message(sender, "assistant", reply)
+        try:
+            alert_owner(sender, "⭐ Unhappy after visit (review ask)",
+                        reason=text.strip()[:300])
+        except Exception:
+            log.exception("Could not alert owner about unhappy review reply")
+        return True
+    return False  # unclear — let the normal assistant handle it
 
 def send_weekly_gap_report(force: bool = False) -> None:
     """Once a week, tell the owner what customers asked that the bot couldn't answer.
@@ -3310,35 +3394,46 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             return {"sent": False, "reason": "no phone given"}
         ok = send_review_template(digits, name or "Tadas", need or "Test Car",
                                   date or "")
+        if ok:
+            with closing(db()) as conn, conn:
+                conn.execute("INSERT OR REPLACE INTO review_pending (wa_user, ts, lang)"
+                             " VALUES (?, ?, ?)", (digits, time.time(), date or ""))
         return {"sent": bool(ok), "to": digits}
     if action == "mkreviewtemplate":
         # Submit the review_request template (all languages, both WABAs) so the
         # 2-days-after-visit review ask can go out beyond the 24h window.
-        link = "https://maps.google.com/?cid=1793275012653342365"
+        # RATE-FIRST funnel: this first message carries NO link — it just asks how
+        # the visit went. The Google link only follows a happy reply.
         bodies = {
-            "en": (f"Hi {{{{1}}}}, thanks for trusting NCTPass with your {{{{2}}}}! "
-                   f"If you were happy with the work, a quick Google review would "
-                   f"mean the world to us: {link} - thanks a million! If anything "
-                   f"wasn't right, just reply here and we'll sort it.",
+            "en": ("Hi {{1}}, thanks for trusting NCTPass with your {{2}}! "
+                   "Quick question - how was everything? Just reply with a rating "
+                   "from 1 to 5 (5 = brilliant). Your feedback really helps us.",
                    ["John", "VW Golf"]),
-            "ro": (f"Bună {{{{1}}}}, mulțumim că ați ales NCTPass pentru {{{{2}}}}! "
-                   f"Dacă ați fost mulțumit, o scurtă recenzie pe Google ne-ar ajuta "
-                   f"enorm: {link} - mulțumim mult! Dacă ceva nu a fost în regulă, "
-                   f"răspundeți aici și rezolvăm.",
+            "ro": ("Bună {{1}}, mulțumim că ați ales NCTPass pentru {{2}}! "
+                   "O întrebare scurtă - cum a fost totul? Răspundeți cu o notă de "
+                   "la 1 la 5 (5 = excelent). Părerea dvs. ne ajută mult.",
                    ["Ion", "VW Golf"]),
-            "ru": (f"Здравствуйте, {{{{1}}}}! Спасибо, что доверили NCTPass ваш "
-                   f"{{{{2}}}}! Если вам всё понравилось, короткий отзыв в Google "
-                   f"очень нам поможет: {link} - огромное спасибо! Если что-то было "
-                   f"не так, просто ответьте здесь, и мы всё исправим.",
+            "ru": ("Здравствуйте, {{1}}! Спасибо, что доверили NCTPass ваш {{2}}! "
+                   "Короткий вопрос - как всё прошло? Просто ответьте оценкой от 1 "
+                   "до 5 (5 = отлично). Ваше мнение очень помогает нам.",
                    ["Иван", "VW Golf"]),
-            "lt": (f"Sveiki, {{{{1}}}}! Ačiū, kad patikėjote NCTPass savo {{{{2}}}}! "
-                   f"Jei likote patenkinti, trumpas Google atsiliepimas mums labai "
-                   f"padėtų: {link} - labai ačiū! Jei kažkas buvo ne taip, tiesiog "
-                   f"atsakykite čia ir viską sutvarkysime.",
+            "lt": ("Sveiki, {{1}}! Ačiū, kad patikėjote NCTPass savo {{2}}! "
+                   "Trumpas klausimas - kaip viskas praėjo? Tiesiog atsakykite "
+                   "įvertinimu nuo 1 iki 5 (5 = puikiai). Jūsų nuomonė mums labai "
+                   "padeda.",
                    ["Jonas", "VW Golf"]),
         }
         out = []
         for waba in ("1713722639843344", "236685551234423"):
+            # Replace any previous submission of this template (all languages).
+            try:
+                d = httpx.delete(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                                 "message_templates",
+                                 headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                                 params={"name": REVIEW_TEMPLATE}, timeout=30)
+                out.append({"waba": waba[-6:], "delete": d.status_code})
+            except Exception as exc:
+                out.append({"waba": waba[-6:], "delete_error": str(exc)[:120]})
             for code, (text, example) in bodies.items():
                 payload = {
                     "name": REVIEW_TEMPLATE, "language": code, "category": "MARKETING",
@@ -4170,6 +4265,12 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
+    if not is_owner:
+        try:
+            if handle_review_reply(sender, text):
+                return
+        except Exception:
+            log.exception("Review reply handling failed for %s", sender)
     answer = ask_claude(sender, text, transcript_note)
     send_whatsapp(sender, answer)
 
