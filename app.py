@@ -108,6 +108,8 @@ REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after 
 # Direct link to the garage's Google listing (4.8 stars) — only ever sent AFTER a
 # customer says they were happy, so unhappy feedback stays private.
 REVIEW_LINK = os.environ.get("REVIEW_LINK", "https://maps.google.com/?cid=1793275012653342365")
+# Start cautious: only customers whose job was a service get the review ask.
+REVIEW_SERVICE_ONLY = os.environ.get("REVIEW_SERVICE_ONLY", "1") == "1"
 # Template language versions that exist/are approved (Moldovan = Romanian = ro).
 REMINDER_LANGS = {"en", "ru", "lt", "ro"}
 
@@ -2467,11 +2469,17 @@ def send_due_reviews() -> None:
     target = (now.date() - timedelta(days=REVIEW_DELAY_DAYS)).isoformat()
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT id, name, phone, car, COALESCE(lang, '') FROM bookings"
-            " WHERE date = ? AND COALESCE(review_sent, 0) = 0",
+            "SELECT id, name, phone, car, COALESCE(lang, ''), COALESCE(need, '')"
+            " FROM bookings WHERE date = ? AND COALESCE(review_sent, 0) = 0",
             (target,),
         ).fetchall()
-    for bid, name, phone, car, lang in rows:
+    for bid, name, phone, car, lang, need in rows:
+        # For now only service customers get the review ask — they left happiest.
+        # (Repair/NCT customers often just paid for bad news; widen later if wanted.)
+        nl = (need or "").lower()
+        if REVIEW_SERVICE_ONLY and not any(w in nl for w in (
+                "service", "servicing", "oil change", "oil and filter", "oil & filter")):
+            continue
         if phone and send_review_template(phone, name, car, lang):
             digits = "".join(ch for ch in str(phone) if ch.isdigit())
             with closing(db()) as conn, conn:
