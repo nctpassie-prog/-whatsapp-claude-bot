@@ -1087,16 +1087,27 @@ def customer_label(number: str) -> str:
     always tell at a glance whether it's a regular or a stranger.
     """
     digits = "".join(ch for ch in str(number) if ch.isdigit())
-    name = reg = ""
+    name = reg = car = ""
     try:
         with closing(db()) as conn:
             row = conn.execute(
                 "SELECT name, reg FROM customers WHERE wa_number = ?", (digits,)).fetchone()
-        if row:
-            name, reg = (row[0] or "").strip(), (row[1] or "").strip()
+            if row:
+                name, reg = (row[0] or "").strip(), (row[1] or "").strip()
+            # Bookings often know more (the car, a name given on the phone) and
+            # store numbers in varying formats — match on the last 9 digits.
+            if len(digits) >= 7:
+                b = conn.execute(
+                    "SELECT name, car, reg FROM bookings "
+                    "WHERE replace(replace(phone,'+',''),' ','') LIKE ? "
+                    "ORDER BY id DESC LIMIT 1", (f"%{digits[-9:]}",)).fetchone()
+                if b:
+                    name = name or (b[0] or "").strip()
+                    car = (b[1] or "").strip()
+                    reg = reg or (b[2] or "").strip()
     except Exception:
         log.exception("Could not look up customer name for %s", number)
-    bits = [b for b in [name, f"({reg})" if reg else ""] if b]
+    bits = [b for b in [name, car, f"({reg})" if reg else ""] if b]
     return (" ".join(bits) + f" +{digits}") if bits else f"+{digits}"
 
 def customers_list(limit: int = 20) -> str:
@@ -4387,8 +4398,9 @@ async def retell_function(request: Request):
                 "reason": "duplicate - this car already has a booking that day"}
 
     if fn == "take_message":
+        label = customer_label(caller) if caller else f"+{args.get('phone', '?')}"
         send_telegram("📞 PHONE MESSAGE (voice agent)\n"
-                      f"From: {args.get('name', '?')} +{caller or args.get('phone', '?')}\n"
+                      f"From: {args.get('name', '?')} — {label}\n"
                       f"{args.get('message', '')}")
         return {"ok": True, "confirm": "Message passed to the team."}
 
@@ -4410,36 +4422,15 @@ async def retell_call_report(request: Request):
     analysis = call.get("call_analysis") or {}
     mark = "🟢" if analysis.get("call_successful") else "🔴"
     frm = str(call.get("from_number") or "unknown caller")
-    # If we know this caller (past booking or WhatsApp customer), show who it is.
-    who = ""
-    digits = "".join(ch for ch in frm if ch.isdigit())
-    if len(digits) >= 7:
-        tail = f"%{digits[-9:]}"
-        try:
-            with closing(db()) as conn:
-                row = conn.execute(
-                    "SELECT name, car, reg FROM bookings "
-                    "WHERE replace(replace(phone,'+',''),' ','') LIKE ? "
-                    "ORDER BY id DESC LIMIT 1", (tail,)).fetchone()
-                if not row:
-                    c = conn.execute(
-                        "SELECT name, reg FROM customers WHERE wa_number LIKE ? "
-                        "ORDER BY last_ts DESC LIMIT 1", (tail,)).fetchone()
-                    row = (c[0], "", c[1]) if c else None
-            if row:
-                bits = [str(b).strip() for b in row if b and str(b).strip()]
-                who = " · ".join(bits)
-        except Exception:
-            log.exception("Caller lookup failed for call report")
+    # customer_label knows regulars: "Caroline Nissan Qashqai (201CW757) +353864..."
+    label = customer_label(frm) if any(ch.isdigit() for ch in frm) else frm
     secs = int((call.get("duration_ms") or 0) / 1000)
     dur = f"{secs // 60}:{secs % 60:02d}"
     summary = (analysis.get("call_summary") or "").strip()
     sentiment = (analysis.get("user_sentiment") or "").strip()
     reason = (call.get("disconnection_reason") or "").replace("_", " ")
-    lines = [f"{mark} PHONE CALL — {frm}"]
-    if who:
-        lines.append(f"👤 {who}")
-    lines.append(f"⏱ {dur} min · ended: {reason}")
+    lines = [f"{mark} PHONE CALL — {label}",
+             f"⏱ {dur} min · ended: {reason}"]
     if sentiment:
         lines.append(f"Mood: {sentiment}")
     if summary:
