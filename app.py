@@ -2644,7 +2644,9 @@ def send_weekly_mechanic_report(force: bool = False) -> None:
                           "(not counted above)")
     # Wages are private: this report goes ONLY to the owner's personal Telegram,
     # never the shared alert chats the team may be in.
-    send_telegram_private("\n".join(body_lines))
+    body = "\n".join(body_lines)
+    send_telegram_private(body)
+    return body
 
 def send_telegram_private(text: str) -> None:
     """Send to the owner's PERSONAL Telegram chat only (setting owner_private_chat).
@@ -3523,9 +3525,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                               "will arrive here (Saturdays 7pm).")
         return {"ok": True, "owner_private_chat": cid}
     if action == "mechanicreport":
-        # Send this week's per-mechanic labour table to Telegram right now.
-        send_weekly_mechanic_report(force=True)
-        return {"sent": True}
+        # Send this week's per-mechanic labour table to the private chat right
+        # now; the body also comes back so it can be relayed elsewhere.
+        body = send_weekly_mechanic_report(force=True)
+        return {"sent": bool((get_setting("owner_private_chat") or "").strip()),
+                "body": body}
     if action == "staffreport":
         # Everything colleagues sent from the WhatsApp app in the last N days
         # (?date=N, default 31) — the raw material for a management report.
