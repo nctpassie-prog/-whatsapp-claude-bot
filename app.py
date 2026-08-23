@@ -2573,18 +2573,26 @@ _MECH_CANON = {"yu": "yur", "yura": "yur", "se": "ser", "io": "ion", "nic": "nik
 _LABOUR_AMT_RE = re.compile(r"labou?r\D{0,12}(\d{2,4})", re.IGNORECASE)
 _JOB_REG_RE = re.compile(r"\b(\d{2,3}[A-Za-z]{1,2}\d{1,6})\b")
 
-def send_weekly_mechanic_report(force: bool = False) -> None:
+def send_weekly_mechanic_report(force: bool = False, week_of: str = "") -> None:
     """Saturday evening: labour earned per mechanic this week (Mon-Sat), parsed
-    from the ready-messages staff send customers (signed with mechanic codes)."""
+    from the ready-messages staff send customers (signed with mechanic codes).
+    week_of (YYYY-MM-DD): report the week containing that date instead."""
     now = now_local()
     if not force and (now.weekday() != 5 or now.hour != MECHANIC_REPORT_HOUR):
         return
-    week_start = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0)
+    if week_of:
+        d = datetime.strptime(week_of, "%Y-%m-%d")
+        week_start = now.replace(year=d.year, month=d.month, day=d.day,
+                                 hour=0, minute=0, second=0, microsecond=0)
+        week_start -= timedelta(days=week_start.weekday())
+    else:
+        week_start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
     with closing(db()) as conn:
         rows = conn.execute("SELECT content FROM messages WHERE role = 'staff'"
-                            " AND ts >= ? ORDER BY ts",
-                            (week_start.timestamp(),)).fetchall()
+                            " AND ts >= ? AND ts < ? ORDER BY ts",
+                            (week_start.timestamp(), week_end.timestamp())).fetchall()
     seen, stat = set(), {}
     unassigned = 0.0
     unassigned_jobs = no_labour = 0
@@ -2630,7 +2638,7 @@ def send_weekly_mechanic_report(force: bool = False) -> None:
             jobs, total = stat.get(t, (0, 0.0))
             stat[t] = (jobs + 1, total + share)
     body_lines = [f"🔧 Mechanics' week {week_start.strftime('%d %b')} – "
-                  f"{now.strftime('%d %b')}"]
+                  f"{(week_start + timedelta(days=5)).strftime('%d %b')}"]
     if stat:
         for t, (jobs, total) in sorted(stat.items(), key=lambda kv: -kv[1][1]):
             body_lines.append(f"{t:<6} {jobs:>3} jobs   €{total:,.0f} labour")
@@ -3527,7 +3535,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "mechanicreport":
         # Send this week's per-mechanic labour table to the private chat right
         # now; the body also comes back so it can be relayed elsewhere.
-        body = send_weekly_mechanic_report(force=True)
+        body = send_weekly_mechanic_report(force=True, week_of=(date or "").strip())
         return {"sent": bool((get_setting("owner_private_chat") or "").strip()),
                 "body": body}
     if action == "staffreport":
