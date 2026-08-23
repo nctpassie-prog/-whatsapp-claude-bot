@@ -110,6 +110,9 @@ REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after 
 REVIEW_LINK = os.environ.get("REVIEW_LINK", "https://maps.google.com/?cid=1793275012653342365")
 # Start cautious: only customers whose job was a service get the review ask.
 REVIEW_SERVICE_ONLY = os.environ.get("REVIEW_SERVICE_ONLY", "1") == "1"
+# Answering instantly feels robotic — replies wait until at least this many
+# seconds have passed since the customer's message (thinking/typing time).
+REPLY_DELAY_SECONDS = float(os.environ.get("REPLY_DELAY_SECONDS", "5"))
 # Template language versions that exist/are approved (Moldovan = Romanian = ro).
 REMINDER_LANGS = {"en", "ru", "lt", "ro"}
 
@@ -2543,6 +2546,8 @@ def handle_review_reply(sender: str, text: str) -> bool:
     code = reminder_lang_code(lang)
     negative = bool(_REVIEW_NEGATIVE_RE.search(text))
     positive = bool(_REVIEW_POSITIVE_RE.search(text)) and not negative
+    if positive or negative:
+        time.sleep(max(0.0, REPLY_DELAY_SECONDS))  # don't answer inhumanly fast
     if positive:
         save_message(sender, "user", text)
         reply = _REVIEW_HAPPY_REPLY.get(code, _REVIEW_HAPPY_REPLY["en"])
@@ -4090,6 +4095,7 @@ def valid_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature or "")
 
 def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note: str = "") -> None:
+    _t0 = time.time()
     if arrived_on:
         _ctx_phone_id.set(arrived_on)  # reply from the number it came in on
     if is_blocked(sender):
@@ -4281,6 +4287,10 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         except Exception:
             log.exception("Failed to record customer %s", sender)
     answer = ask_claude(sender, text, transcript_note)
+    if not is_owner:  # the owner's own commands should stay snappy
+        pause = REPLY_DELAY_SECONDS - (time.time() - _t0)
+        if pause > 0:
+            time.sleep(pause)
     send_whatsapp(sender, answer)
 
 # Things a customer sends that carry REAL content we can't read (a fail sheet PDF,
