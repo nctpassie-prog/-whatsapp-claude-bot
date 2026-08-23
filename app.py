@@ -3164,7 +3164,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3587,6 +3587,26 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "messages": [{"when": datetime.fromtimestamp(ts).strftime("%d %b %H:%M"),
                               "to": customer_label(u), "text": (c or "")[:400]}
                              for u, c, ts in rows]}
+    if action == "car":
+        # Everything we know about a reg: ?need=11CE4196
+        q = "".join(ch for ch in (need or "").upper() if ch.isalnum())
+        if not q:
+            return {"error": "give a reg in ?need="}
+        with closing(db()) as conn:
+            bk = conn.execute(
+                "SELECT date, name, phone, car, need FROM bookings"
+                " WHERE UPPER(REPLACE(reg,' ','')) LIKE ? ORDER BY date DESC LIMIT 10",
+                (f"%{q}%",)).fetchall()
+            ch = conn.execute(
+                "SELECT ts, amount, note FROM charges"
+                " WHERE UPPER(REPLACE(reg,' ','')) LIKE ? ORDER BY id DESC LIMIT 10",
+                (f"%{q}%",)).fetchall()
+        return {"reg": q,
+                "bookings": [{"date": d, "name": n, "phone": p, "car": c, "job": j}
+                             for d, n, p, c, j in bk],
+                "charges": [{"date": datetime.fromtimestamp(t).strftime("%Y-%m-%d"),
+                             "amount": a, "note": (no or "")[:200]}
+                            for t, a, no in ch]}
     if action == "revenue":
         # Charges logged in the last N days (?date=N, default 31): raw + totals.
         try:
