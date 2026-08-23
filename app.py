@@ -3057,7 +3057,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3400,6 +3400,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "staffreport":
+        # Everything colleagues sent from the WhatsApp app in the last N days
+        # (?date=N, default 31) — the raw material for a management report.
+        try:
+            days = max(1, min(365, int(date or "31")))
+        except ValueError:
+            days = 31
+        cutoff = time.time() - days * 86400
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_user, content, ts FROM messages WHERE role = 'staff'"
+                " AND ts >= ? ORDER BY ts", (cutoff,)).fetchall()
+        return {"days": days, "count": len(rows),
+                "messages": [{"when": datetime.fromtimestamp(ts).strftime("%d %b %H:%M"),
+                              "to": customer_label(u), "text": (c or "")[:400]}
+                             for u, c, ts in rows]}
     if action == "revenue":
         # Charges logged in the last N days (?date=N, default 31): raw + totals.
         try:
