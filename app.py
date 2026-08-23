@@ -2960,7 +2960,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3303,6 +3303,58 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "reviewtest":
+        # Send a test review request: ?phone=3538...&name=...&car=...
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if not digits:
+            return {"sent": False, "reason": "no phone given"}
+        ok = send_review_template(digits, name or "Tadas", need or "Test Car",
+                                  date or "")
+        return {"sent": bool(ok), "to": digits}
+    if action == "mkreviewtemplate":
+        # Submit the review_request template (all languages, both WABAs) so the
+        # 2-days-after-visit review ask can go out beyond the 24h window.
+        link = "https://maps.google.com/?cid=1793275012653342365"
+        bodies = {
+            "en": (f"Hi {{{{1}}}}, thanks for trusting NCTPass with your {{{{2}}}}! "
+                   f"If you were happy with the work, a quick Google review would "
+                   f"mean the world to us: {link} - thanks a million! If anything "
+                   f"wasn't right, just reply here and we'll sort it.",
+                   ["John", "VW Golf"]),
+            "ro": (f"Bună {{{{1}}}}, mulțumim că ați ales NCTPass pentru {{{{2}}}}! "
+                   f"Dacă ați fost mulțumit, o scurtă recenzie pe Google ne-ar ajuta "
+                   f"enorm: {link} - mulțumim mult! Dacă ceva nu a fost în regulă, "
+                   f"răspundeți aici și rezolvăm.",
+                   ["Ion", "VW Golf"]),
+            "ru": (f"Здравствуйте, {{{{1}}}}! Спасибо, что доверили NCTPass ваш "
+                   f"{{{{2}}}}! Если вам всё понравилось, короткий отзыв в Google "
+                   f"очень нам поможет: {link} - огромное спасибо! Если что-то было "
+                   f"не так, просто ответьте здесь, и мы всё исправим.",
+                   ["Иван", "VW Golf"]),
+            "lt": (f"Sveiki, {{{{1}}}}! Ačiū, kad patikėjote NCTPass savo {{{{2}}}}! "
+                   f"Jei likote patenkinti, trumpas Google atsiliepimas mums labai "
+                   f"padėtų: {link} - labai ačiū! Jei kažkas buvo ne taip, tiesiog "
+                   f"atsakykite čia ir viską sutvarkysime.",
+                   ["Jonas", "VW Golf"]),
+        }
+        out = []
+        for waba in ("1713722639843344", "236685551234423"):
+            for code, (text, example) in bodies.items():
+                payload = {
+                    "name": REVIEW_TEMPLATE, "language": code, "category": "MARKETING",
+                    "components": [{"type": "BODY", "text": text,
+                                    "example": {"body_text": [example]}}],
+                }
+                try:
+                    r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                                   "message_templates",
+                                   headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                                   json=payload, timeout=30)
+                    out.append({"waba": waba[-6:], "lang": code, "http": r.status_code,
+                                "body": (r.text or "")[:150]})
+                except Exception as exc:
+                    out.append({"waba": waba[-6:], "lang": code, "error": str(exc)[:150]})
+        return {"template": REVIEW_TEMPLATE, "results": out}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from, in each language our customers speak. Templates live per-account AND
