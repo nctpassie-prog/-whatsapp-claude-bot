@@ -4097,6 +4097,13 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         return
     lowered = text.strip().lower()
     is_owner = bool(OWNER_WHATSAPP) and sender == OWNER_WHATSAPP
+    # A pending "rate us 1-5" answer outranks everything else (even the owner's
+    # command shortcuts — the pending flag only exists if we just asked them).
+    try:
+        if handle_review_reply(sender, text):
+            return
+    except Exception:
+        log.exception("Review reply handling failed for %s", sender)
     # Owner-only commands.
     if is_owner and lowered.lstrip("#/ ") in ("today", "tomorrow"):
         send_whatsapp(sender, bookings_for(lowered.lstrip("#/ ")))
@@ -4273,12 +4280,6 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
                 send_whatsapp(OWNER_WHATSAPP, f"\U0001F4C7 New customer messaged: +{sender}")
         except Exception:
             log.exception("Failed to record customer %s", sender)
-    if not is_owner:
-        try:
-            if handle_review_reply(sender, text):
-                return
-        except Exception:
-            log.exception("Review reply handling failed for %s", sender)
     answer = ask_claude(sender, text, transcript_note)
     send_whatsapp(sender, answer)
 
