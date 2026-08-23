@@ -2595,6 +2595,10 @@ def send_weekly_mechanic_report(force: bool = False) -> None:
         reg_m = _JOB_REG_RE.search(text)
         tot_m = re.search(r"Total\s*(\d+)", text, re.IGNORECASE)
         labour = sum(float(a) for a in _LABOUR_AMT_RE.findall(text))
+        # House rule: a service counts as €60 labour for the mechanic, on top of
+        # any separately-listed labour lines.
+        if re.search(r"servic", text, re.IGNORECASE):
+            labour += 60.0
         key = (reg_m.group(1) if reg_m else "", tot_m.group(1) if tot_m else "", labour)
         if key in seen:
             continue  # Dima double-sent the same notice
@@ -2629,9 +2633,25 @@ def send_weekly_mechanic_report(force: bool = False) -> None:
         body_lines.append(f"❓ No mechanic tag: €{unassigned:,.0f} "
                           f"across {unassigned_jobs} jobs — remind Dima to sign them")
     if no_labour:
-        body_lines.append(f"ℹ️ {no_labour} ready-jobs had no labour line "
-                          "(plain services etc. — not counted above)")
-    send_telegram("\n".join(body_lines))
+        body_lines.append(f"ℹ️ {no_labour} ready-jobs had no labour or service line "
+                          "(not counted above)")
+    # Wages are private: this report goes ONLY to the owner's personal Telegram,
+    # never the shared alert chats the team may be in.
+    send_telegram_private("\n".join(body_lines))
+
+def send_telegram_private(text: str) -> None:
+    """Send to the owner's PERSONAL Telegram chat only (setting owner_private_chat).
+    Silently logs if that chat hasn't been linked yet — sensitive reports must
+    never fall back to the shared alert channel."""
+    chat_id = (get_setting("owner_private_chat") or "").strip()
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        log.warning("Private Telegram chat not set — private report NOT sent")
+        return
+    try:
+        httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                   json={"chat_id": chat_id, "text": text[:4000]}, timeout=20)
+    except Exception:
+        log.exception("Private Telegram send failed")
 
 def send_weekly_gap_report(force: bool = False) -> None:
     """Once a week, tell the owner what customers asked that the bot couldn't answer.
@@ -3127,7 +3147,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "staffreport", "mechanicreport", "tgpending", "setprivatechat",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3470,6 +3490,31 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out.append({"waba": waba[-6:], "error": str(exc)[:200]})
         return {"template": INVOICE_TEMPLATE, "results": out}
+    if action == "tgpending":
+        # Who has messaged the Telegram bot (candidates for the private chat link).
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          timeout=20)
+            found = {}
+            for upd in r.json().get("result", []):
+                chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
+                cid = str(chat.get("id", ""))
+                if cid:
+                    found[cid] = ((chat.get("first_name") or chat.get("title") or "") +
+                                  (f" @{chat['username']}" if chat.get("username") else ""))
+            return {"chats": found,
+                    "private_set_to": get_setting("owner_private_chat") or ""}
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+    if action == "setprivatechat":
+        # ?phone=<telegram chat id> — where private (wages) reports go.
+        cid = "".join(c for c in (phone or "") if c.isdigit() or c == "-")
+        if not cid:
+            return {"ok": False, "reason": "no chat id"}
+        set_setting("owner_private_chat", cid)
+        send_telegram_private("🔒 Private reports linked. Weekly mechanic wages "
+                              "will arrive here (Saturdays 7pm).")
+        return {"ok": True, "owner_private_chat": cid}
     if action == "mechanicreport":
         # Send this week's per-mechanic labour table to Telegram right now.
         send_weekly_mechanic_report(force=True)
