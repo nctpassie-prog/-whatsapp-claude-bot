@@ -3601,12 +3601,21 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "SELECT ts, amount, note FROM charges"
                 " WHERE UPPER(REPLACE(reg,' ','')) LIKE ? ORDER BY id DESC LIMIT 10",
                 (f"%{q}%",)).fetchall()
+        with closing(db()) as conn:
+            msgs = conn.execute(
+                "SELECT wa_user, role, content, ts FROM messages"
+                " WHERE UPPER(REPLACE(content,' ','')) LIKE ? ORDER BY ts DESC LIMIT 20",
+                (f"%{q}%",)).fetchall()
         return {"reg": q,
                 "bookings": [{"date": d, "name": n, "phone": p, "car": c, "job": j}
                              for d, n, p, c, j in bk],
                 "charges": [{"date": datetime.fromtimestamp(t).strftime("%Y-%m-%d"),
                              "amount": a, "note": (no or "")[:200]}
-                            for t, a, no in ch]}
+                            for t, a, no in ch],
+                "mentions": [{"when": datetime.fromtimestamp(t).strftime("%d %b %H:%M"),
+                              "who": customer_label(u), "role": r,
+                              "text": (c or "")[:300]}
+                             for u, r, c, t in msgs]}
     if action == "revenue":
         # Charges logged in the last N days (?date=N, default 31): raw + totals.
         try:
