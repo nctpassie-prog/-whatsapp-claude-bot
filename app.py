@@ -2599,10 +2599,17 @@ def send_weekly_mechanic_report(force: bool = False) -> None:
         # any separately-listed labour lines.
         if re.search(r"servic", text, re.IGNORECASE):
             labour += 60.0
+        # House rule: ECU remaps are Nik's work — credit the remap money to nik
+        # no matter whose code signs the message.
+        remap = sum(float(a) for a in
+                    re.findall(r"remap\D{0,12}(\d{2,4})", text, re.IGNORECASE))
         key = (reg_m.group(1) if reg_m else "", tot_m.group(1) if tot_m else "", labour)
         if key in seen:
             continue  # Dima double-sent the same notice
         seen.add(key)
+        if remap:
+            jobs, total = stat.get("nik", (0, 0.0))
+            stat["nik"] = (jobs + 1, total + remap)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         idx = max((i for i, ln in enumerate(lines) if "nctpass.ie" in ln.lower()),
                   default=-1)
