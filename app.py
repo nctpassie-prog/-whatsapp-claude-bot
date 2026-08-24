@@ -142,7 +142,11 @@ ALERT_NUMBERS = [d for d in ("".join(c for c in n if c.isdigit())
 # Follow up a customer who went quiet after our last reply (one gentle check-in,
 # only inside WhatsApp's 24h window, daytime only).
 FOLLOWUP_ENABLED = os.environ.get("FOLLOWUP_ENABLED", "1") == "1"
-FOLLOWUP_AFTER_HOURS = float(os.environ.get("FOLLOWUP_AFTER_HOURS", "3"))
+FOLLOWUP_AFTER_HOURS = float(os.environ.get("FOLLOWUP_AFTER_HOURS", "2"))
+# The next-day second touch: an approved template (works beyond the 24h window)
+# for customers who got an answer/quote and never came back.
+NEXTDAY_TEMPLATE = os.environ.get("NEXTDAY_TEMPLATE", "come_back_nudge")
+NEXTDAY_ENABLED = os.environ.get("NEXTDAY_ENABLED", "1") == "1"
 FOLLOWUP_WINDOW_HOURS = float(os.environ.get("FOLLOWUP_WINDOW_HOURS", "23"))
 # Google account whose calendar booking links open in. Defaults to the booking inbox
 # so events always land on the same calendar, whoever is signed in.
@@ -854,6 +858,11 @@ def db() -> sqlite3.Connection:
     # Google-review link only goes out after a HAPPY reply (feedback funnel).
     conn.execute("CREATE TABLE IF NOT EXISTS review_pending ("
                  " wa_user TEXT PRIMARY KEY, ts REAL, lang TEXT DEFAULT '')")
+    # Every nudge we send chasing a quiet customer, so the weekly report can say
+    # how many went out and how many turned into bookings.
+    conn.execute("CREATE TABLE IF NOT EXISTS followup_log ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 " wa_user TEXT, kind TEXT, ts REAL)")
     # Stores the Google Contacts resource id once a customer is pushed there, so we
     # update the same contact instead of creating duplicates.
     try:
@@ -2706,6 +2715,10 @@ def send_weekly_gap_report(force: bool = False) -> None:
              f"🆕 New customers: {new_custs}",
              f"📅 Bookings taken: {booked}",
              f"🙋 Times a human was needed: {handovers}"]
+    try:
+        parts.append("🔁 " + followup_week_stats())
+    except Exception:
+        log.exception("Follow-up stats failed")
     if lines:
         parts += ["", f"❓ Questions the bot couldn't answer ({len(seen)}):"] + lines[:15]
         if len(lines) > 15:
@@ -2937,6 +2950,8 @@ def _maybe_followup(user: str, nowts: float) -> None:
         conn.execute("INSERT INTO followups (wa_user, inbound_ts) VALUES (?, ?) "
                      "ON CONFLICT(wa_user) DO UPDATE SET inbound_ts = excluded.inbound_ts",
                      (user, last_in[0]))
+        conn.execute("INSERT INTO followup_log (wa_user, kind, ts) VALUES (?, 'same_day', ?)",
+                     (user, nowts))
     log.info("Sent follow-up to %s", user)
 
 def send_due_followups() -> None:
@@ -2955,6 +2970,167 @@ def send_due_followups() -> None:
             _maybe_followup(user, nowts)
         except Exception:
             log.exception("Follow-up failed for %s", user)
+
+# ---- Next-day second touch ---------------------------------------------------
+# Once WhatsApp's 24h window closes, only an approved template can reach the
+# customer. This chases enquiries that got an answer/quote and then went cold.
+
+NEXTDAY_SYSTEM = (
+    "You are helping the NCTPass car garage decide whether to send a next-day "
+    "'still interested?' WhatsApp template to a customer who enquired yesterday "
+    "and went quiet. Read the conversation. Reply with EXACTLY one line in the "
+    "form LANG|TOPIC where LANG is one of en, ru, ro, lt (the customer's "
+    "language) and TOPIC is a short phrase (max 6 words, in that language, "
+    "lowercase) naming what they asked about, e.g. 'a service for your Golf' "
+    "or 'the DPF clean quote'. Reply exactly SKIP instead if ANY of these: "
+    "they already booked, they said no / not interested / found elsewhere, it "
+    "was a complaint or dispute, they only asked opening hours or directions, "
+    "the conversation was small talk, or a nudge could feel pushy or unwelcome. "
+    "When in doubt, SKIP.")
+
+def _make_nextday(user: str):
+    history = get_history(user)
+    if not history:
+        return None
+    messages = history + [{"role": "user", "content":
+                           "(Internal: decide per your rules — LANG|TOPIC or SKIP.)"}]
+    raw = (_call_claude(messages, NEXTDAY_SYSTEM) or "").strip()
+    if not raw or raw.upper().startswith("SKIP") or "|" not in raw:
+        return None
+    lang, topic = raw.split("|", 1)
+    lang = lang.strip().lower()[:2]
+    topic = topic.strip().strip('."')[:60]
+    if lang not in ("en", "ru", "ro", "lt") or not topic:
+        return None
+    return lang, topic
+
+def _send_nextday_in(to: str, params: list, lang_code: str) -> bool:
+    try:
+        r = httpx.post(
+            send_endpoint()[0],
+            headers={"Authorization": f"Bearer {send_endpoint()[1]}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "template",
+                "template": {
+                    "name": NEXTDAY_TEMPLATE,
+                    "language": {"code": lang_code},
+                    "components": [
+                        {"type": "body",
+                         "parameters": [{"type": "text", "text": p} for p in params]},
+                    ],
+                },
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.warning("Next-day nudge (%s) to %s failed: %s %s",
+                        lang_code, to, r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("Failed to send next-day nudge to %s", to)
+        return False
+
+def send_nextday_template(to: str, name: str, topic: str, lang: str = "") -> bool:
+    params = [name or "there", topic or "your enquiry"]
+    code = reminder_lang_code(lang)
+    if _send_nextday_in(to, params, code):
+        return True
+    if code != REMINDER_LANG:
+        return _send_nextday_in(to, params, REMINDER_LANG)
+    return False
+
+def send_due_nextday_followups() -> None:
+    if not (FOLLOWUP_ENABLED and NEXTDAY_ENABLED):
+        return
+    now = now_local()
+    if not (10 <= now.hour < 19):
+        return  # polite daytime hours only
+    nowts = time.time()
+    with closing(db()) as conn:
+        users = [r[0] for r in conn.execute(
+            "SELECT DISTINCT wa_user FROM messages WHERE ts > ?",
+            (nowts - 2 * 86400,)).fetchall()]
+    for user in users:
+        try:
+            _maybe_nextday(user, nowts)
+        except Exception:
+            log.exception("Next-day follow-up failed for %s", user)
+
+def _maybe_nextday(user: str, nowts: float) -> None:
+    if is_blocked(user) or (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
+        return
+    if not bot_enabled() or is_paused(user) or human_handling(user):
+        return
+    with closing(db()) as conn:
+        last = conn.execute("SELECT role, ts FROM messages WHERE wa_user = ? "
+                            "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        last_in = conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                               "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        already = conn.execute(
+            "SELECT 1 FROM followup_log WHERE wa_user = ? AND kind = 'next_day' AND ts > ?",
+            (user, (last_in[0] if last_in else 0))).fetchone()
+        tail = user[-9:]
+        booked = conn.execute(
+            "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
+            "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+            ((last_in[0] if last_in else nowts), "%" + tail)).fetchone()
+        name_row = conn.execute("SELECT name FROM customers WHERE wa_user = ?",
+                                (user,)).fetchone()
+    if not last or last[0] != "assistant":
+        return  # customer came back — nothing to chase
+    if not last_in:
+        return
+    quiet = nowts - last_in[0]
+    # Only in the 24h..48h band: window just closed, enquiry still warm.
+    if quiet < FOLLOWUP_WINDOW_HOURS * 3600 + 3600 or quiet > 48 * 3600:
+        return
+    if already or booked:
+        return
+    if alerted and nowts - (alerted[0] or 0) < 48 * 3600:
+        return  # a person is (or was just) on it — don't template over them
+    decision = _make_nextday(user)
+    if not decision:
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO followup_log (wa_user, kind, ts) "
+                         "VALUES (?, 'next_day', ?)", (user, nowts))
+        return  # record the SKIP so we never re-judge this enquiry
+    lang, topic = decision
+    name = (name_row[0].split()[0] if name_row and name_row[0] else "")
+    if send_nextday_template(user, name, topic, lang):
+        # Save what the customer actually saw, so the bot understands their reply.
+        save_message(user, "assistant",
+                     f"Hi {name or 'there'}, you were asking us yesterday about "
+                     f"{topic}. Would you like me to get you booked in? Just reply "
+                     "here and I'll sort it out for you.")
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO followup_log (wa_user, kind, ts) "
+                         "VALUES (?, 'next_day', ?)", (user, nowts))
+        log.info("Sent next-day nudge to %s (%s)", user, topic)
+
+def followup_week_stats(days: int = 7) -> str:
+    """One line for the owner's report: nudges sent and bookings they preceded."""
+    nowts = time.time()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_user, kind, ts FROM followup_log WHERE ts > ?",
+            (nowts - days * 86400,)).fetchall()
+        sent = len(rows)
+        won = 0
+        for u, kind, ts in rows:
+            tail = u[-9:]
+            hit = conn.execute(
+                "SELECT 1 FROM bookings WHERE created_ts BETWEEN ? AND ? AND "
+                "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+                (ts, ts + 48 * 3600, "%" + tail)).fetchone()
+            if hit:
+                won += 1
+    if not sent:
+        return "Follow-ups: none sent this week"
+    return f"Follow-ups: {sent} sent → {won} became bookings"
 
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
@@ -3070,6 +3246,10 @@ def reminder_loop() -> None:
         except Exception:
             log.exception("Follow-up loop error")
         try:
+            send_due_nextday_followups()
+        except Exception:
+            log.exception("Next-day follow-up loop error")
+        try:
             send_due_reminders()
         except Exception:
             log.exception("Reminder loop error")
@@ -3164,7 +3344,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove"}
@@ -3701,6 +3881,62 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 except Exception as exc:
                     out.append({"waba": waba[-6:], "lang": code, "error": str(exc)[:150]})
         return {"template": REVIEW_TEMPLATE, "results": out}
+    if action == "mknextdaytemplate":
+        # Submit the next-day "still interested?" template (all languages, both
+        # WABAs). Sent once, 24-48h after an enquiry went quiet, chasing quotes
+        # that escaped the free-form window.
+        bodies = {
+            "en": ("Hi {{1}}, you were asking us yesterday about {{2}}. Would you "
+                   "like me to get you booked in? Just reply here and I'll sort it "
+                   "out for you.",
+                   ["John", "a service for your Golf"]),
+            "ro": ("Bună {{1}}, ne-ați întrebat ieri despre {{2}}. Doriți să vă "
+                   "fac o programare? Răspundeți aici și rezolv imediat.",
+                   ["Ion", "o revizie pentru Golf"]),
+            "ru": ("Здравствуйте, {{1}}! Вчера вы спрашивали нас про {{2}}. Хотите, "
+                   "запишу вас? Просто ответьте здесь, и я всё устрою.",
+                   ["Иван", "обслуживание вашего Golf"]),
+            "lt": ("Sveiki, {{1}}! Vakar klausėte mūsų apie {{2}}. Ar norėtumėte, "
+                   "kad jus užregistruočiau? Tiesiog atsakykite čia ir viską "
+                   "sutvarkysiu.",
+                   ["Jonas", "jūsų Golf aptarnavimą"]),
+        }
+        out = []
+        for waba in ("1713722639843344", "236685551234423"):
+            for code, (text_, example) in bodies.items():
+                payload = {
+                    "name": NEXTDAY_TEMPLATE, "language": code, "category": "MARKETING",
+                    "components": [{"type": "BODY", "text": text_,
+                                    "example": {"body_text": [example]}}],
+                }
+                try:
+                    r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                                   "message_templates",
+                                   headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                                   json=payload, timeout=30)
+                    out.append({"waba": waba[-6:], "lang": code, "http": r.status_code,
+                                "body": (r.text or "")[:150]})
+                except Exception as exc:
+                    out.append({"waba": waba[-6:], "lang": code, "error": str(exc)[:150]})
+        return {"template": NEXTDAY_TEMPLATE, "results": out}
+    if action == "nextdaytest":
+        # ?need=353858182839 — send the owner a sample next-day nudge.
+        to = re.sub(r"\D", "", need or "")
+        if not to:
+            return {"error": "need=phone required"}
+        ok = send_nextday_template(to, "Tadas", "a full service for your car", "en")
+        return {"sent": ok, "to": to, "template": NEXTDAY_TEMPLATE}
+    if action == "followupstats":
+        # ?date=30 — how many nudges went out over the last N days and how many
+        # customers booked within 48h of getting one.
+        days = int(date) if (date or "").isdigit() else 7
+        with closing(db()) as conn:
+            recent = conn.execute(
+                "SELECT wa_user, kind, datetime(ts, 'unixepoch') FROM followup_log "
+                "WHERE ts > ? ORDER BY ts DESC LIMIT 100",
+                (time.time() - days * 86400,)).fetchall()
+        return {"summary": followup_week_stats(days),
+                "log": [{"user": u, "kind": k, "at": t} for u, k, t in recent]}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from, in each language our customers speak. Templates live per-account AND
