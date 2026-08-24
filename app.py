@@ -2727,8 +2727,10 @@ def send_weekly_gap_report(force: bool = False) -> None:
     else:
         parts += ["", "✅ No unanswered questions this week."]
     body = "\n".join(parts)
+    # Owner's rule: weekly reports are for him alone — the shared alert chats
+    # include staff phones, so this goes to his personal Telegram only.
     try:
-        send_telegram(body)
+        send_telegram_private(body)
     except Exception:
         log.exception("Failed to send weekly report to Telegram")
     try:
