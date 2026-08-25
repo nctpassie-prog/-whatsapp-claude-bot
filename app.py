@@ -4913,6 +4913,16 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
             log.info("Ignoring repeat sticker/reaction from %s", sender)
             return
         _sticker_seen[sender] = time.time()
+        # Owner's rule (less follow-ups): a sticker or 👍 from an EXISTING
+        # conversation is an acknowledgement, not a question — record it and stay
+        # quiet instead of firing "what can I help you with?" at a happy customer.
+        with closing(db()) as conn:
+            prior = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ?",
+                                 (sender,)).fetchone()[0]
+        if prior > 0:
+            save_message(sender, "user", "[Customer sent a sticker or reaction]")
+            log.info("Sticker from known customer %s — acknowledged silently", sender)
+            return
     if real:
         prompt = (f"[Customer sent a {what}. Thank them warmly for sending it and say "
                   "one of the team will look at it and come straight back to them. "
