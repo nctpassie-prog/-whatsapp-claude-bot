@@ -465,6 +465,8 @@ Availability / capacity (important — how to talk about slots):
 - Q: How long will it take / when will my car be ready?
   A: It depends on the job, but most services and repairs are done the same day —
   often within a couple of hours. We'll confirm a time when you book.
+- Q: How long does a general service take?
+  A: Usually 1 to 2 hours. We'll message you as soon as the car is ready to collect.
 - Q: Do you give a guarantee / warranty?
   A: Yes — all our repairs come with a 12-month parts and labour guarantee.
 - Q: If the NCT retest fails after your repair, do you fix it for free?
