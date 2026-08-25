@@ -2551,6 +2551,10 @@ PARTS_FROM_PHONE_ID = os.environ.get("PARTS_FROM_PHONE_ID", "335852741443330")  
 # Whapi.cloud gateway (unofficial, linked to the 085 number — owner accepted the
 # ban risk 2026-08-25): lets the bot post into the existing supplier group.
 WHAPI_TOKEN = os.environ.get("WHAPI_TOKEN", "")
+# Green API free Developer plan (also unofficial, linked to 085; free tier is
+# capped at 3 chats — we only ever use the one supplier group).
+GREEN_API_ID = os.environ.get("GREEN_API_ID", "")
+GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 PARTS_GROUP_NAME = os.environ.get("PARTS_GROUP_NAME", "ECP to NW Autos parts")
 _SERVICE_PARTS_RE = re.compile(r"servic|oil change|oil and filter|oil & filter",
                                re.IGNORECASE)
@@ -2577,8 +2581,42 @@ def _whapi_group_id() -> str:
         log.exception("Whapi group lookup failed")
     return ""
 
+def _green_group_id() -> str:
+    """Chat id of the parts group via Green API's getChats, cached."""
+    cached = get_setting("parts_group_id_green")
+    if cached:
+        return cached
+    try:
+        r = requests.get(f"https://api.green-api.com/waInstance{GREEN_API_ID}"
+                         f"/getChats/{GREEN_API_TOKEN}", timeout=30)
+        for chat in (r.json() or []):
+            cid = chat.get("id") or ""
+            if cid.endswith("@g.us") and (chat.get("name") or "").strip().lower() \
+                    == PARTS_GROUP_NAME.strip().lower():
+                set_setting("parts_group_id_green", cid)
+                return cid
+        log.warning("Green API: group '%s' not found among this number's chats",
+                    PARTS_GROUP_NAME)
+    except Exception:
+        log.exception("Green API chat lookup failed")
+    return ""
+
 def send_parts_to_group(msg: str) -> bool:
-    """Post into the supplier WhatsApp group via Whapi. False = not sent."""
+    """Post into the supplier WhatsApp group. Tries the free Green API gateway
+    first, then Whapi if configured. False = not posted anywhere."""
+    if GREEN_API_ID and GREEN_API_TOKEN:
+        gid = _green_group_id()
+        if gid:
+            try:
+                r = requests.post(f"https://api.green-api.com/waInstance{GREEN_API_ID}"
+                                  f"/sendMessage/{GREEN_API_TOKEN}",
+                                  json={"chatId": gid, "message": msg}, timeout=30)
+                if r.status_code < 300:
+                    log.info("Parts order posted to group %s via Green API", gid)
+                    return True
+                log.error("Green API send failed %s: %s", r.status_code, r.text[:300])
+            except Exception:
+                log.exception("Green API send failed")
     if not WHAPI_TOKEN:
         return False
     gid = _whapi_group_id()
@@ -4379,14 +4417,15 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "partstest":
         # Verify the Whapi group link: ?need=<text> posts that text to the parts
         # group (default a harmless test line). No text goes to customers.
-        if not WHAPI_TOKEN:
-            return {"error": "WHAPI_TOKEN not set on Railway yet"}
-        gid = _whapi_group_id()
-        if not gid:
-            return {"error": f"group '{PARTS_GROUP_NAME}' not found — is the 085 "
-                             "number linked on Whapi and a member of the group?"}
+        if not (WHAPI_TOKEN or (GREEN_API_ID and GREEN_API_TOKEN)):
+            return {"error": "Set GREEN_API_ID + GREEN_API_TOKEN (or WHAPI_TOKEN) "
+                             "on Railway first"}
         ok = send_parts_to_group((need or "").strip() or "Test from NCTPass bot 👍")
-        return {"sent": bool(ok), "group": gid}
+        if not ok:
+            return {"sent": False,
+                    "error": f"group '{PARTS_GROUP_NAME}' not reachable — is the 085 "
+                             "number linked on the gateway and a member of the group?"}
+        return {"sent": True}
     if action == "addbooking":
         # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
         # diary, calendar, job sheet and day-before reminder all know about it.
