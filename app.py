@@ -1316,7 +1316,8 @@ AHEAD_ONLY_DAYS = 2
 _GOOD_RE = re.compile(
     r"servic|oil change|oil and filter|oil & filter|\bnct\b|retest|fail|brake|pads|discs"
     r"|\bdpf\b|particulate"   # owner 2026-08-25: DPF diagnosis/cleaning is good money
-    r"|timing belt|timing chain|cam ?belt|clutch|flywheel",  # owner: big planned repairs too
+    r"|timing belt|timing chain|cam ?belt|clutch|flywheel"   # owner: big planned repairs too
+    r"|head ?la?mp|headlight",  # specialist headlight repairs from €400 — good money
     re.IGNORECASE)
 
 def is_good_job(need: str) -> bool:

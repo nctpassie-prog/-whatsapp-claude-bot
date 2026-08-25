@@ -222,6 +222,8 @@ Headlight repair (specialist)
 - DRL tubes: from €100
 - Headlight removal: from €75
 - Full headlight jobs: from €400
+- EV LED headlight repairs (e.g. VW ID.4 — indicator/LED module inside the
+  headlamp unit): from €400
 
 ## What we do NOT do
 If a customer asks for any of these, say politely and clearly that it is not something we
