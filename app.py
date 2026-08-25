@@ -2548,8 +2548,53 @@ def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, la
 PARTS_ORDER_HOUR = int(os.environ.get("PARTS_ORDER_HOUR", "14"))
 PARTS_ORDER_TO = os.environ.get("PARTS_ORDER_TO", "")
 PARTS_FROM_PHONE_ID = os.environ.get("PARTS_FROM_PHONE_ID", "335852741443330")  # 086
+# Whapi.cloud gateway (unofficial, linked to the 085 number — owner accepted the
+# ban risk 2026-08-25): lets the bot post into the existing supplier group.
+WHAPI_TOKEN = os.environ.get("WHAPI_TOKEN", "")
+PARTS_GROUP_NAME = os.environ.get("PARTS_GROUP_NAME", "ECP to NW Autos parts")
 _SERVICE_PARTS_RE = re.compile(r"servic|oil change|oil and filter|oil & filter",
                                re.IGNORECASE)
+
+def _whapi_group_id() -> str:
+    """Chat id of the parts group, found once by name via Whapi and cached."""
+    cached = get_setting("parts_group_id")
+    if cached:
+        return cached
+    try:
+        r = requests.get("https://gate.whapi.cloud/groups?count=200",
+                         headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}, timeout=20)
+        for g in (r.json() or {}).get("groups", []) or []:
+            if (g.get("name") or "").strip().lower() == PARTS_GROUP_NAME.strip().lower():
+                gid = g.get("id") or ""
+                if gid:
+                    if "@" not in gid:
+                        gid += "@g.us"
+                    set_setting("parts_group_id", gid)
+                    return gid
+        log.warning("Whapi: group '%s' not found among this number's groups",
+                    PARTS_GROUP_NAME)
+    except Exception:
+        log.exception("Whapi group lookup failed")
+    return ""
+
+def send_parts_to_group(msg: str) -> bool:
+    """Post into the supplier WhatsApp group via Whapi. False = not sent."""
+    if not WHAPI_TOKEN:
+        return False
+    gid = _whapi_group_id()
+    if not gid:
+        return False
+    try:
+        r = requests.post("https://gate.whapi.cloud/messages/text",
+                          json={"to": gid, "body": msg},
+                          headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}, timeout=20)
+        if r.status_code < 300:
+            log.info("Parts order posted to group %s", gid)
+            return True
+        log.error("Whapi send failed %s: %s", r.status_code, r.text[:300])
+    except Exception:
+        log.exception("Whapi send failed")
+    return False
 
 def send_parts_orders() -> None:
     now = now_local()
@@ -2575,6 +2620,7 @@ def send_parts_orders() -> None:
             label = f"{reg} ({car})"
         lines.append(f"- {label} — air, oil, fuel filter")
     msg = "\n".join(lines) + "\nThanks!"
+    in_group = send_parts_to_group(msg)
     if PARTS_ORDER_TO:
         try:
             send_whatsapp("".join(ch for ch in PARTS_ORDER_TO if ch.isdigit()), msg,
@@ -2583,10 +2629,13 @@ def send_parts_orders() -> None:
         except Exception:
             log.exception("Parts order WhatsApp send failed")
     try:
-        note = ("🧰 Parts order for tomorrow (also sent to the supplier on WhatsApp):"
-                if PARTS_ORDER_TO else
-                "🧰 Parts order for tomorrow — forward this into the "
-                "'ECP to NW Autos parts' group:")
+        if in_group:
+            note = f"🧰 Parts order posted in the '{PARTS_GROUP_NAME}' group:"
+        elif PARTS_ORDER_TO:
+            note = "🧰 Parts order for tomorrow (sent to the supplier on WhatsApp):"
+        else:
+            note = ("🧰 Parts order for tomorrow — forward this into the "
+                    f"'{PARTS_GROUP_NAME}' group:")
         send_telegram_private(note + "\n\n" + msg)
     except Exception:
         log.exception("Parts order Telegram send failed")
@@ -3590,7 +3639,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
-                     "tgadd", "tgremove",
+                     "tgadd", "tgremove", "partstest",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4315,6 +4364,17 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "gemini_model": GEMINI_MODEL,
                 "note": "test = owner chats only; all = every customer; "
                         "any Gemini error falls back to Claude automatically"}
+    if action == "partstest":
+        # Verify the Whapi group link: ?need=<text> posts that text to the parts
+        # group (default a harmless test line). No text goes to customers.
+        if not WHAPI_TOKEN:
+            return {"error": "WHAPI_TOKEN not set on Railway yet"}
+        gid = _whapi_group_id()
+        if not gid:
+            return {"error": f"group '{PARTS_GROUP_NAME}' not found — is the 085 "
+                             "number linked on Whapi and a member of the group?"}
+        ok = send_parts_to_group((need or "").strip() or "Test from NCTPass bot 👍")
+        return {"sent": bool(ok), "group": gid}
     if action == "addbooking":
         # Log a booking agreed outside the bot (e.g. staff arranged it in chat), so the
         # diary, calendar, job sheet and day-before reminder all know about it.
