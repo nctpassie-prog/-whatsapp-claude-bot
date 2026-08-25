@@ -2538,6 +2538,59 @@ def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, la
         return _send_reminder_in(to, params, REMINDER_LANG)
     return False
 
+# ------------------------------------------------------------------ parts orders
+# Owner (2026-08-25): every day after lunch, order the filters for tomorrow's
+# general services — reg number + air, oil, fuel filter for each car. Goes out
+# on WhatsApp from the 086 number to the supplier's direct number when
+# PARTS_ORDER_TO is set; a copy always goes to the owner's private Telegram
+# (the Cloud API cannot post into app-made groups like "ECP to NW Autos parts",
+# so until a direct number is set the owner forwards the Telegram copy).
+PARTS_ORDER_HOUR = int(os.environ.get("PARTS_ORDER_HOUR", "14"))
+PARTS_ORDER_TO = os.environ.get("PARTS_ORDER_TO", "")
+PARTS_FROM_PHONE_ID = os.environ.get("PARTS_FROM_PHONE_ID", "335852741443330")  # 086
+_SERVICE_PARTS_RE = re.compile(r"servic|oil change|oil and filter|oil & filter",
+                               re.IGNORECASE)
+
+def send_parts_orders() -> None:
+    now = now_local()
+    if now.hour < PARTS_ORDER_HOUR:
+        return
+    today = now.date().isoformat()
+    if get_setting("parts_order_sent") == today:
+        return
+    tomorrow = (now.date() + timedelta(days=1)).isoformat()
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT reg, car, need FROM bookings WHERE date = ?",
+                            (tomorrow,)).fetchall()
+    cars = [(clean_reg(r or ""), (c or "").strip()) for r, c, n in rows
+            if _SERVICE_PARTS_RE.search(n or "") and "TEST" not in (r or "").upper()]
+    set_setting("parts_order_sent", today)  # once per day, even when nothing to order
+    if not cars:
+        return
+    day_label = datetime.strptime(tomorrow, "%Y-%m-%d").strftime("%A %d %B")
+    lines = [f"Parts for tomorrow ({day_label}) please:"]
+    for reg, car in cars:
+        label = reg or car or "?"
+        if reg and car:
+            label = f"{reg} ({car})"
+        lines.append(f"- {label} — air, oil, fuel filter")
+    msg = "\n".join(lines) + "\nThanks!"
+    if PARTS_ORDER_TO:
+        try:
+            send_whatsapp("".join(ch for ch in PARTS_ORDER_TO if ch.isdigit()), msg,
+                          from_phone_id=PARTS_FROM_PHONE_ID)
+            log.info("Parts order sent to supplier for %s (%d cars)", tomorrow, len(cars))
+        except Exception:
+            log.exception("Parts order WhatsApp send failed")
+    try:
+        note = ("🧰 Parts order for tomorrow (also sent to the supplier on WhatsApp):"
+                if PARTS_ORDER_TO else
+                "🧰 Parts order for tomorrow — forward this into the "
+                "'ECP to NW Autos parts' group:")
+        send_telegram_private(note + "\n\n" + msg)
+    except Exception:
+        log.exception("Parts order Telegram send failed")
+
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
     if not REMINDER_ENABLED:
@@ -3435,6 +3488,10 @@ def reminder_loop() -> None:
             send_due_reminders()
         except Exception:
             log.exception("Reminder loop error")
+        try:
+            send_parts_orders()
+        except Exception:
+            log.exception("Parts order error")
         try:
             send_due_reviews()
         except Exception:
