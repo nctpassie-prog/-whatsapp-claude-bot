@@ -39,3 +39,5 @@
 # NOTE: this disables his owner WhatsApp commands (today / bot off / charge
 # logging) — remove this line to get them back.
 0858182839  # Tadas (owner)
+
+0874405814  # owner asked to ignore (2026-08-25)
