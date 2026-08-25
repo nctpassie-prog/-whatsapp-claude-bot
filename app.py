@@ -1293,7 +1293,8 @@ def is_diagnostic_job(need: str) -> bool:
 # AHEAD_ONLY_DAYS of the date, so far-future days stay clear for good work.
 AHEAD_ONLY_DAYS = 2
 _GOOD_RE = re.compile(
-    r"servic|oil change|oil and filter|oil & filter|\bnct\b|retest|fail|brake|pads|discs",
+    r"servic|oil change|oil and filter|oil & filter|\bnct\b|retest|fail|brake|pads|discs"
+    r"|\bdpf\b|particulate",  # owner 2026-08-25: DPF diagnosis/cleaning is good money
     re.IGNORECASE)
 
 def is_good_job(need: str) -> bool:
@@ -1305,9 +1306,13 @@ def is_good_job(need: str) -> bool:
     return bool(_GOOD_RE.search(need or ""))
 
 def _diag_count(date_str: str) -> int:
+    # Good jobs (service/NCT/brakes/DPF) never count against the diagnostics
+    # quota, even when they include a diagnosis — the cap is for the pure
+    # time-eaters (warning lights, noises, "won't start").
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?", (date_str,)).fetchall()
-    return sum(1 for (n,) in rows if is_diagnostic_job(n or ""))
+    return sum(1 for (n,) in rows
+               if is_diagnostic_job(n or "") and not is_good_job(n or ""))
 
 def day_is_full(date_str: str, need: str = "") -> bool:
     """True if the date has no free slot for THIS kind of job."""
@@ -1319,7 +1324,8 @@ def day_is_full(date_str: str, need: str = "") -> bool:
         n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?", (date_str,)).fetchone()[0]
     if n >= day_capacity(d):
         return True
-    if is_diagnostic_job(need) and _diag_count(date_str) >= DIAG_SLOTS_PER_DAY:
+    if (is_diagnostic_job(need) and not is_good_job(need)
+            and _diag_count(date_str) >= DIAG_SLOTS_PER_DAY):
         return True  # diagnostics quota used up — offer another day
     if need and not is_good_job(need) and (d - now_local().date()).days > AHEAD_ONLY_DAYS:
         return True  # non-money jobs may only book within the last 2 days
