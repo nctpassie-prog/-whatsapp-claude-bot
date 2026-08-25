@@ -1348,9 +1348,32 @@ def day_is_full(date_str: str, need: str = "") -> bool:
     if (is_diagnostic_job(need) and not is_good_job(need)
             and _diag_count(date_str) >= DIAG_SLOTS_PER_DAY):
         return True  # diagnostics quota used up — offer another day
-    if need and not is_good_job(need) and (d - now_local().date()).days > AHEAD_ONLY_DAYS:
+    if ahead_only_rejected(date_str, need):
         return True  # non-money jobs may only book within the last 2 days
     return False
+
+def ahead_only_rejected(date_str: str, need: str) -> bool:
+    """The date is fine but THIS job may only book short-notice (owner's rule:
+    far-out days stay clear for services/NCT/brakes/DPF). Deserves its own
+    honest message — 'fully booked' here is a lie that loses customers."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    return bool(need) and not is_good_job(need) and (d - now_local().date()).days > AHEAD_ONLY_DAYS
+
+# Honest short-notice message for jobs that must book close to the date.
+AHEAD_ONLY_MSG = {
+    "en": "For this kind of job we keep the diary flexible and book it in closer to the "
+          "day. \U0001F64f Just message me 1–2 days before you'd like to come in and "
+          "I'll fit you in straight away.",
+    "ru": "Такие работы мы записываем ближе к дате. \U0001F64f Напишите мне за 1–2 дня "
+          "до желаемого визита, и я сразу вас запишу.",
+    "lt": "Tokius darbus registruojame arčiau datos. \U0001F64f Parašykite man likus "
+          "1–2 dienoms iki norimo atvykimo, ir iš karto jus užrašysiu.",
+    "ro": "Pentru astfel de lucrări facem programarea aproape de zi. \U0001F64f "
+          "Scrieți-mi cu 1–2 zile înainte de ziua dorită și vă programez imediat.",
+}
 
 # Templated "that day is full" message, per language (used when a booking hits a full day).
 FULL_DAY_MSG = {
@@ -2139,6 +2162,12 @@ def _finish_reply(user: str, answer: str) -> str:
                             f"{booking.get('need', '')}). Squeeze them in?")
             except Exception:
                 log.exception("Failed to alert owner about an early-date request")
+            save_message(user, "assistant", answer)
+            return answer
+        if (not is_owner and not already_booked
+                and ahead_only_rejected(booking.get("date", ""), booking.get("need", ""))):
+            log.info("Booking for %s rejected: short-notice-only job", booking.get("date"))
+            answer = AHEAD_ONLY_MSG.get(reminder_lang_code(booking.get("lang", "")), AHEAD_ONLY_MSG["en"])
             save_message(user, "assistant", answer)
             return answer
         if not is_owner and not already_booked and day_is_full(booking.get("date", ""), booking.get("need", "")):
