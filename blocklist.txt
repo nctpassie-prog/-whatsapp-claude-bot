@@ -33,3 +33,9 @@
 0857777888  # bot number 1
 0866677666  # bot number 2 (main line)
 0873300247  # Headlights Repair bot (sister business — also a bot)
+
+# Owner's own phone — he asked the bots to ignore his messages (2026-08-25).
+# Alerts and reports still go TO him; the bot just never replies to him.
+# NOTE: this disables his owner WhatsApp commands (today / bot off / charge
+# logging) — remove this line to get them back.
+0858182839  # Tadas (owner)
