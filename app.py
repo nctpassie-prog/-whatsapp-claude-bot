@@ -3689,7 +3689,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
-                     "tgadd", "tgremove", "partstest", "partsgroup",
+                     "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4414,6 +4414,14 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "gemini_model": GEMINI_MODEL,
                 "note": "test = owner chats only; all = every customer; "
                         "any Gemini error falls back to Claude automatically"}
+    if action == "tgprivate":
+        # Send a one-off note to the owner's PRIVATE Telegram chat (reminders,
+        # nudges). Goes nowhere else — same privacy as the weekly reports.
+        text = (need or "").strip()
+        if not text:
+            return {"error": "need=text required"}
+        send_telegram_private(text)
+        return {"sent": True}
     if action == "partstest":
         # Verify the Whapi group link: ?need=<text> posts that text to the parts
         # group (default a harmless test line). No text goes to customers.
