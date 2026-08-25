@@ -2948,6 +2948,32 @@ def chase_unresolved_alerts() -> None:
                               f"a holding message.\nOpen chat: https://wa.me/{user}")
             except Exception:
                 log.exception("Failed to notify owner about unanswered alert")
+            # WhatsApp's 24h wall: once the customer has been silent longer than
+            # the window, a normal chase is silently blocked by Meta — the
+            # approved template is the only thing that still gets through.
+            with closing(db()) as conn:
+                last_in = conn.execute(
+                    "SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                    "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+            if not last_in or nowts - last_in[0] > 23 * 3600:
+                made = _make_nextday(user)
+                if made:
+                    t_lang, t_topic = made
+                    with closing(db()) as conn:
+                        nm = conn.execute(
+                            "SELECT name FROM customers WHERE wa_number = ?",
+                            (user,)).fetchone()
+                    if send_nextday_template(user, (nm[0] if nm and nm[0] else ""),
+                                             t_topic, t_lang):
+                        save_message(user, "assistant",
+                                     "[Template nudge sent: offered to get them "
+                                     f"booked in — {t_topic}]")
+                        with closing(db()) as conn, conn:
+                            conn.execute(
+                                "INSERT INTO followup_log (wa_user, kind, ts) "
+                                "VALUES (?, 'chase_template', ?)", (user, nowts))
+                        log.info("Window closed for %s — template nudge sent", user)
+                continue
             text = _make_chase(user)
             # Belt and braces: never send the customer the same line twice in a row.
             with closing(db()) as conn:
@@ -3201,6 +3227,36 @@ def alert_resolved(conn, user: str, alert_ts: float) -> bool:
         (alert_ts, "%" + tail)).fetchone()
     return bool(booked)
 
+UNRESOLVED_DIGEST_HOUR = int(os.environ.get("UNRESOLVED_DIGEST_HOUR", "18"))
+
+def send_unresolved_digest() -> None:
+    """Owner's 18:00 private digest: every customer still waiting on a human today.
+
+    The bot alerts and chases, but only a person can close these — so the owner
+    sees the day's dropped customers before they go cold. Private chat only."""
+    now = now_local()
+    if now.hour != UNRESOLVED_DIGEST_HOUR:
+        return
+    today_iso = now.date().isoformat()
+    if get_setting("unresolved_digest_sent") == today_iso:
+        return
+    set_setting("unresolved_digest_sent", today_iso)
+    nowts = time.time()
+    with closing(db()) as conn:
+        alerts = conn.execute(
+            "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
+        waiting = [(u, ts) for u, ts in alerts if not alert_resolved(conn, u, ts)]
+    if not waiting:
+        return  # a quiet list needs no message
+    lines = [f"🚨 Still unanswered today — {len(waiting)} customer(s) waiting on a person:"]
+    for user, ts in waiting[:15]:
+        hrs = (nowts - ts) / 3600
+        waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)}d"
+        lines.append(f"• {customer_label(user)} — waiting {waited} — wa.me/{user}")
+    lines.append("The bot has alerted and chased each one; they need a human reply.")
+    send_telegram_private("\n".join(lines))
+    log.info("Sent unresolved digest: %d waiting", len(waiting))
+
 def send_waiting_conversations(limit: int = 10) -> int:
     """Send each still-waiting customer to Telegram as its OWN message.
 
@@ -3322,6 +3378,10 @@ def reminder_loop() -> None:
             chase_unresolved_alerts()
         except Exception:
             log.exception("Alert chase error")
+        try:
+            send_unresolved_digest()
+        except Exception:
+            log.exception("Unresolved digest error")
         try:
             send_weekly_gap_report()
         except Exception:
