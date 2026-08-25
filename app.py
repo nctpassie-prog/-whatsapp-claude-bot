@@ -1276,15 +1276,36 @@ def day_capacity(d) -> int:
         return 0
     return 10
 
-def day_is_full(date_str: str) -> bool:
-    """True if the given YYYY-MM-DD date already has no free slots."""
+# Owner's rule (2026-08-25): diagnostics are time-eaters — at most 2 per day.
+# The money jobs (services, NCT repairs, brakes, clear repairs) get the rest.
+DIAG_SLOTS_PER_DAY = 2
+_DIAG_RE = re.compile(
+    r"diagnos|warning light|engine light|dash(board)? (light|fault)|noise|rattl|knock"
+    r"|leak|misfire|\bp0\d|fault code|smoke|vibrat|cutting out|cuts out"
+    r"|loss of power|won'?t start|wont start|not starting|juddering|check (it|the car) over",
+    re.IGNORECASE)
+
+def is_diagnostic_job(need: str) -> bool:
+    return bool(_DIAG_RE.search(need or ""))
+
+def _diag_count(date_str: str) -> int:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT need FROM bookings WHERE date = ?", (date_str,)).fetchall()
+    return sum(1 for (n,) in rows if is_diagnostic_job(n or ""))
+
+def day_is_full(date_str: str, need: str = "") -> bool:
+    """True if the date has no free slot for THIS kind of job."""
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
     except Exception:
         return False  # unknown/vague date -> let the owner sort the exact day
     with closing(db()) as conn:
         n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?", (date_str,)).fetchone()[0]
-    return n >= day_capacity(d)
+    if n >= day_capacity(d):
+        return True
+    if is_diagnostic_job(need) and _diag_count(date_str) >= DIAG_SLOTS_PER_DAY:
+        return True  # diagnostics quota used up — offer another day
+    return False
 
 # Templated "that day is full" message, per language (used when a booking hits a full day).
 FULL_DAY_MSG = {
@@ -1344,7 +1365,7 @@ def availability_block() -> str:
             "SELECT date, need FROM bookings WHERE date >= ?",
             (today.isoformat(),),
         ).fetchall()
-    taken, nonservice = {}, {}
+    taken, nonservice, diag = {}, {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
         nl = (need or "").lower()
@@ -1352,6 +1373,8 @@ def availability_block() -> str:
                                            "oil and filter", "oil & filter"))
         if not is_service:
             nonservice[d] = nonservice.get(d, 0) + 1
+        if is_diagnostic_job(need or ""):
+            diag[d] = diag.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     lines = []
@@ -1372,6 +1395,10 @@ def availability_block() -> str:
         else:
             nonservice_left = 0  # Saturday is services-only anyway
         nonservice_left = min(nonservice_left, left)
+        # Owner's rule: diagnostics (noises, leaks, warning lights, fault-finding)
+        # get at most 2 slots a day — the rest stay for the money jobs.
+        diag_left = min(left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0))) \
+            if d.weekday() < 5 else 0
         if left == 0:
             lines.append(f"{d.strftime('%a %d %b')}: FULL")
         elif nonservice_left == 0 and d.weekday() < 5:
@@ -1380,7 +1407,8 @@ def availability_block() -> str:
                          "this day, offer the next day for those)")
         else:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left "
-                         f"({nonservice_left} usable for repairs/diagnostics/NCT)")
+                         f"({nonservice_left} usable for repairs/NCT, "
+                         f"{diag_left} for diagnostics)")
     opening_note = ""
     if opens and opens > today:
         opening_note = (
@@ -1400,6 +1428,11 @@ def availability_block() -> str:
         "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES while the day is more than 3 days away: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day that shows repair space (services can always be booked on any open day). Within 3 days of a date the reservation is released automatically and the list simply shows the real space — always trust the numbers in the list. Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
+        "\n\nDIAGNOSTIC JOBS (unknown noises, leaks, warning lights, misfires, 'can you check "
+        "it over') take AT MOST 2 slots per day — when a day shows 0 diagnostic slots, do NOT "
+        "book a diagnostic on it even if other slots remain: offer the nearest day that still "
+        "shows diagnostic space. Services, NCT repairs, brakes and clearly-named repairs are "
+        "NOT diagnostics and use the normal slots. "
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
         "slots left. If the customer asks for a day marked FULL, or a Sunday, DO NOT confirm — "
         "tell them it's fully booked and offer the nearest day with space. On SATURDAY only book "
@@ -2053,7 +2086,7 @@ def _finish_reply(user: str, answer: str) -> str:
                 log.exception("Failed to alert owner about an early-date request")
             save_message(user, "assistant", answer)
             return answer
-        if not is_owner and day_is_full(booking.get("date", "")):
+        if not is_owner and day_is_full(booking.get("date", ""), booking.get("need", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
             save_message(user, "assistant", answer)
@@ -5042,13 +5075,15 @@ def _voice_availability() -> str:
     with closing(db()) as conn:
         rows = conn.execute("SELECT date, need FROM bookings WHERE date >= ?",
                             (today.isoformat(),)).fetchall()
-    taken, nonservice = {}, {}
+    taken, nonservice, diag = {}, {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
         nl = (need or "").lower()
         if not any(w in nl for w in ("service", "servicing", "oil change",
                                      "oil and filter", "oil & filter")):
             nonservice[d] = nonservice.get(d, 0) + 1
+        if is_diagnostic_job(need or ""):
+            diag[d] = diag.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     out = []
@@ -5062,11 +5097,14 @@ def _voice_availability() -> str:
         reserve = 2 if (d.weekday() < 5 and (d - today).days > 3) else 0
         ns_left = min(left, max(0, (cap - reserve) - nonservice.get(iso, 0))) \
             if d.weekday() < 5 else 0
+        diag_left = min(left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0))) \
+            if d.weekday() < 5 else 0
         if left == 0:
             continue
         out.append({"date": iso, "day": d.strftime("%A"),
                     "slots_for_services": left,
-                    "slots_for_repairs_diagnostics_nct": ns_left,
+                    "slots_for_repairs_nct": ns_left,
+                    "slots_for_diagnostics": diag_left,
                     "saturday_services_only": d.weekday() == 5})
     return out
 
@@ -5089,9 +5127,13 @@ async def retell_function(request: Request):
         today = now_local().date()
         return {"today": f"{today.strftime('%A %d %B %Y')}",
                 "open_days": _voice_availability(),
-                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. ONLY offer "
-                         "days from open_days - if the caller wants a later date, "
-                         "say we book about a month ahead and take a message.")}
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Diagnostic "
+                         "jobs (unknown noises, leaks, warning lights, fault-finding) "
+                         "need a day with slots_for_diagnostics free - max 2 a day; "
+                         "services, NCT repairs and brakes use the normal slots. "
+                         "ONLY offer days from open_days - if the caller wants a "
+                         "later date, say we book about a month ahead and take a "
+                         "message.")}
 
     if fn == "book_appointment":
         fields = {"name": (args.get("name") or "").strip(),
