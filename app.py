@@ -2621,6 +2621,18 @@ def send_parts_orders() -> None:
         lines.append(f"- {label} — air, oil, fuel filter")
     msg = "\n".join(lines) + "\nThanks!"
     in_group = send_parts_to_group(msg)
+    # Telegram parts group (free, official — owner's preferred route): the
+    # setting parts_telegram_chat is filled by ?action=partsgroup once the
+    # alert bot is added to the suppliers' Telegram group.
+    tg_group = (get_setting("parts_telegram_chat") or "").strip()
+    if tg_group and TELEGRAM_BOT_TOKEN:
+        try:
+            httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                       json={"chat_id": tg_group, "text": msg[:4000],
+                             "disable_web_page_preview": True}, timeout=20)
+            in_group = True
+        except Exception:
+            log.exception("Parts order Telegram group send failed")
     if PARTS_ORDER_TO:
         try:
             send_whatsapp("".join(ch for ch in PARTS_ORDER_TO if ch.isdigit()), msg,
@@ -3639,7 +3651,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
-                     "tgadd", "tgremove", "partstest",
+                     "tgadd", "tgremove", "partstest", "partsgroup",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4552,6 +4564,32 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         except Exception as exc:
             out["error"] = str(exc)[:300]
         return out
+    if action == "partsgroup":
+        # Link the suppliers' Telegram group for daily parts orders.
+        # No param: list group chats the bot can currently see (add the bot to
+        # the group and send any message there first). ?date=<chat_id>: save it.
+        if not TELEGRAM_BOT_TOKEN:
+            return {"error": "Set TELEGRAM_BOT_TOKEN in Railway first."}
+        if (date or "").strip():
+            set_setting("parts_telegram_chat", date.strip())
+            return {"saved": date.strip(),
+                    "note": "Daily 2pm parts orders will post to this Telegram group."}
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          timeout=20)
+            groups = {}
+            for upd in r.json().get("result", []):
+                chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
+                if chat.get("type") in ("group", "supergroup"):
+                    groups[str(chat.get("id"))] = {"chat_id": chat.get("id"),
+                                                   "title": chat.get("title", "")}
+            return {"current": get_setting("parts_telegram_chat") or "(not set)",
+                    "groups_seen": list(groups.values()),
+                    "hint": "Add the alert bot to the suppliers' group, send any "
+                            "message there, refresh this, then call "
+                            "?action=partsgroup&date=<chat_id> to save it."}
+        except Exception as exc:
+            return {"error": str(exc)[:300]}
     if action == "tgchat":
         # After the owner messages their new Telegram bot, this shows the chat id(s)
         # to put in TELEGRAM_CHAT_IDS. Never returns the bot token.
