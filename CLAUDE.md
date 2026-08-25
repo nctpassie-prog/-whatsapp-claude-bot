@@ -31,9 +31,14 @@ Hours Mon–Fri 9–18, Sat 9–14 (Saturday = general services only), Sun close
 
 ## Standing rules (owner's words — keep them)
 - Booking order: problem → day → car+reg → name. Never ask for the phone number.
-- Capacity 9/day Mon–Fri (last 2 weekday slots reserved for services until 3
-  days out), Saturday 4 services-only, Sunday closed. New bookings from
-  2026-08-31 (BOOKINGS_FROM env).
+- Capacity 10/day Mon–Fri, Saturday 4 services-only, Sunday closed. New
+  bookings from 2026-08-31 (BOOKINGS_FROM env).
+- GOOD JOBS (book any day ahead): services/oil, NCT repairs/retest/fail,
+  brakes, DPF, timing belt/chain, cambelt, clutch, flywheel. Everything else
+  books only within AHEAD_ONLY_DAYS=2 of the date (honest AHEAD_ONLY_MSG, not
+  "fully booked"). Pure diagnostics capped at DIAG_SLOTS_PER_DAY=2 (good jobs
+  that include a diagnosis don't count). Re-confirmations of bookings already
+  in the diary skip all gates (booking_already_in_diary).
 - Prices always "from X plus VAT"; parts brand affects price; no discounts
   (one joke max, then soft handover). Free pre-NCT check WITH a service only.
 - Wages/mechanic data NEVER to shared Telegram or WhatsApp — owner's private
