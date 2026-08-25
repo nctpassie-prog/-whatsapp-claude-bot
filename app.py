@@ -3349,7 +3349,10 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
-                     "tgadd", "tgremove"}
+                     "tgadd", "tgremove",
+                     # Hands a staff-stalled chat back to the bot; no more exposing
+                     # than sendmsg, which is already allowed above.
+                     "botresume"}
 
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
@@ -4511,6 +4514,28 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         with closing(db()) as conn, conn:
             n = conn.execute("UPDATE unknowns SET reported = 1 WHERE reported = 0").rowcount
         return {"marked_done": n}
+    if action == "botresume":
+        # Hand a staff-stalled chat back to the bot RIGHT NOW: clear the
+        # human-takeover silence and have the bot continue the conversation from
+        # the existing history. ?action=botresume&date=<wa_number>
+        num = "".join(ch for ch in (date or "") if ch.isdigit())
+        if not num:
+            return {"error": "provide date=<wa_number> (the chat the bot should take over)"}
+        clear_human_takeover(num)
+        history = get_history(num)
+        if not history:
+            return {"resumed": num, "sent": False, "note": "no conversation history"}
+        dynamic = availability_block() + contact_hint(num) + customer_context(num)
+        system_prompt = (load_system_prompt(), dynamic)
+        messages = history + [{"role": "user", "content":
+            "(Internal note, not from the customer: the colleague who was handling "
+            "this chat has stepped away. Take the conversation over seamlessly from "
+            "the customer's last message - continue per your rules, and complete the "
+            "booking if that is what they wanted. ONE warm message, in the customer's "
+            "language, with no mention of any handover or colleague.)"}]
+        answer = _finish_reply(num, _call_claude_visible(messages, system_prompt, num))
+        sent = bool(answer) and send_whatsapp(num, answer) is not False
+        return {"resumed": num, "sent": bool(answer), "reply": (answer or "")[:300]}
     if action == "clearchat":
         # Delete one conversation (and its customer record) - e.g. to remove a test chat.
         if not date:
