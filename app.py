@@ -863,6 +863,11 @@ def db() -> sqlite3.Connection:
     conn.execute("CREATE TABLE IF NOT EXISTS followup_log ("
                  " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                  " wa_user TEXT, kind TEXT, ts REAL)")
+    # Delivery receipts, persisted: the in-memory deque dies on every deploy,
+    # which made "did that message land?" unanswerable minutes later.
+    conn.execute("CREATE TABLE IF NOT EXISTS delivery_log ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 " ts REAL, recipient TEXT, status TEXT, errors TEXT)")
     # Stores the Google Contacts resource id once a customer is pushed there, so we
     # update the same contact instead of creating duplicates.
     try:
@@ -4302,8 +4307,25 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         send_telegram("✅ Test alert from your NCTPass bot. Alerts are working.")
         return {"sent_to": telegram_chat_ids()}
     if action == "delivery":
-        # What WhatsApp told us about our recent outgoing messages.
-        return {"count": len(RECENT_STATUSES), "statuses": list(RECENT_STATUSES)[-40:]}
+        # What WhatsApp told us about our outgoing messages — read from the
+        # persisted log so restarts no longer wipe the answer.
+        # ?date=<number>  filters to one recipient; ?date=<N> (1-30) = last N days.
+        who = "".join(c for c in (date or "") if c.isdigit())
+        days = int(who) if who and len(who) <= 2 else 3
+        with closing(db()) as conn:
+            if who and len(who) > 2:
+                rows = conn.execute(
+                    "SELECT ts, recipient, status, errors FROM delivery_log "
+                    "WHERE recipient LIKE ? ORDER BY ts DESC LIMIT 60",
+                    ("%" + who[-9:],)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ts, recipient, status, errors FROM delivery_log "
+                    "WHERE ts > ? ORDER BY ts DESC LIMIT 60",
+                    (time.time() - days * 86400,)).fetchall()
+        return {"count": len(rows),
+                "statuses": [f"{_fmt_ts(ts)} {st} -> {r}" + (f" ERRORS: {e}" if e else "")
+                             for ts, r, st, e in rows]}
     if action == "testalert":
         # Fire a real alert at the owner's phone and report exactly what WhatsApp said.
         target = date or OWNER_WHATSAPP  # reuse ?date= to pass a number, e.g. 353858182839
@@ -5219,6 +5241,18 @@ async def receive(request: Request, background: BackgroundTasks):
                                  f"-> {st.get('recipient_id', '')}"
                                  + (f" ERRORS: {json.dumps(errs)[:300]}" if errs else ""))
                     RECENT_STATUSES.append(entry_txt)
+                    try:
+                        with closing(db()) as conn, conn:
+                            conn.execute(
+                                "INSERT INTO delivery_log (ts, recipient, status, errors)"
+                                " VALUES (?, ?, ?, ?)",
+                                (time.time(), st.get("recipient_id", ""),
+                                 state or "unknown",
+                                 json.dumps(errs)[:400] if errs else ""))
+                            conn.execute("DELETE FROM delivery_log WHERE ts < ?",
+                                         (time.time() - 30 * 86400,))
+                    except Exception:
+                        log.exception("Could not persist delivery status")
                     if state == "failed" or errs:
                         log.warning("Delivery FAILED to %s: %s",
                                     st.get("recipient_id", ""), json.dumps(errs)[:400])
