@@ -1686,6 +1686,10 @@ ASSIST_WHILE_STAFF = (
     "- If it is a simple wrap-up (a thank-you, a goodbye, an 'ok', or a status update "
     "with no question): reply with ONE short warm closing line in their language, "
     "inviting them to message any time.\n"
+    "- If they say they are ON THE WAY or give an arrival time ('I'll be there in "
+    "half an hour', 'coming at 3', 'on my way to collect the car'): reply with ONE "
+    "short warm line like 'No problem — see you soon 👍' in their language. Just "
+    "acknowledge; never confirm whether the car is ready or who will be there.\n"
     "- If it is a SIMPLE GENERAL question you can answer with certainty from the "
     "business information — opening hours, address/directions, the 9-11am drop-off "
     "window, the guarantee, what languages we speak, whether we do a type of work, "
@@ -1702,14 +1706,18 @@ def _maybe_courtesy_close(user: str) -> None:
     """While a colleague owns the chat, still handle the easy things.
 
     Owner's rule: the bot may 'talk over staff' for simple problems — wrap-up
-    thank-yous and general questions (hours, address, drop-off window...). Skipped
-    only if a colleague replied in the last 10 minutes (actively typing). Anything
+    thank-yous, ETAs and general questions (hours, address, drop-off window...).
+    Skipped only if a colleague replied in the last 3 minutes (mid-reply). Anything
     about the colleague's actual job/price/arrangement comes back SKIP from Claude.
     After AUTO_RESUME_HOURS of staff silence the bot resumes fully anyway."""
     with closing(db()) as conn:
         row = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
                            (user,)).fetchone()
-    if row and time.time() - (row[0] or 0) < 600:
+    # Only 3 minutes of "colleague is actively typing" grace: Nilesh said
+    # "I'll be there in half an hour" 9 minutes after Dima's message and got
+    # silence — the Claude SKIP-judge is the real guard against interfering,
+    # so the time window just needs to cover an in-flight reply.
+    if row and time.time() - (row[0] or 0) < 180:
         return  # a colleague replied moments ago — they have it
     history = get_history(user)
     if not history or history[-1]["role"] != "user":
