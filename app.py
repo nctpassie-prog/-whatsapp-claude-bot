@@ -4797,6 +4797,32 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
 # Things a customer sends that carry REAL content we can't read (a fail sheet PDF,
 # a video of a noise). Worth a human looking. Stickers, reactions, polls and the
 # like carry nothing — never promise a colleague will "check the attachment" for those.
+MISSED_CALL_TEXT = (
+    "Sorry — we were busy and couldn't answer your call 🙏 "
+    "But tell me here how I can help: I can answer questions, give prices "
+    "and book you in right here in this chat."
+)
+# One invitation per caller per hour, and never while a colleague has the chat.
+_missed_call_replied: dict = {}
+_accepted_calls: set = set()
+
+def handle_missed_call(caller: str, arrived_on: str = "") -> None:
+    """A WhatsApp call rang out unanswered — invite the caller to chat instead."""
+    digits = "".join(c for c in caller if c.isdigit())
+    if not digits or is_blocked(digits):
+        return
+    now = time.time()
+    if now - _missed_call_replied.get(digits, 0) < 3600:
+        return
+    _missed_call_replied[digits] = now
+    if arrived_on:
+        _ctx_phone_id.set(arrived_on)
+    if human_handling(digits):
+        return  # a colleague owns this chat; they saw the call too
+    send_whatsapp(digits, MISSED_CALL_TEXT)
+    save_message(digits, "assistant", MISSED_CALL_TEXT)
+    log.info("Missed WhatsApp call from %s — sent chat invitation", digits)
+
 REAL_ATTACHMENTS = {"document", "video", "audio", "voice"}
 # Only answer one sticker/reaction per customer per window, so a burst of them
 # doesn't produce a burst of identical replies.
@@ -5164,6 +5190,23 @@ async def receive(request: Request, background: BackgroundTasks):
                         if body and BOOKINGISH_RE.search(body):
                             background.add_task(watch_staff_booking, digits)
                 continue
+            # WhatsApp CALLS: when a call rings out unanswered, invite the caller
+            # to continue in chat. An accepted call must never trigger the text.
+            for call in value.get("calls", []) or []:
+                cid = call.get("id", "")
+                status = (call.get("status") or call.get("event") or "").lower()
+                caller = call.get("from", "")
+                log.info("Call event id=%s status=%r from=%s", cid or "?", status, caller)
+                if status in ("accepted", "connected", "answered") and cid:
+                    _accepted_calls.add(cid)
+                    continue
+                if not caller:
+                    continue
+                ended_unanswered = (
+                    status in ("missed", "no_answer", "unanswered", "rejected", "timeout")
+                    or (status == "terminated" and cid not in _accepted_calls))
+                if ended_unanswered and not (cid and already_seen("call-" + cid)):
+                    background.add_task(handle_missed_call, caller, arrived_on)
             # Delivery receipts (sent / delivered / read / failed). Nothing to reply to,
             # but this is the ONLY place WhatsApp explains why a message never landed,
             # so keep the last few and log failures loudly.
@@ -5221,6 +5264,10 @@ async def receive(request: Request, background: BackgroundTasks):
                     if sender and media_id:
                         background.add_task(handle_voice_message, sender, media_id,
                                             arrived_on)
+                elif mtype in ("call", "call_log", "missed_call", "voice_call"):
+                    # Some setups deliver a missed call as a message-type event.
+                    if sender:
+                        background.add_task(handle_missed_call, sender, arrived_on)
                 else:
                     if sender:
                         background.add_task(handle_unreadable_message, sender,
