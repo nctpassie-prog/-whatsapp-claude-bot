@@ -1154,6 +1154,27 @@ def customers_list(limit: int = 20) -> str:
         lines.append(f"{i}. " + " · ".join(bits))
     return "\n".join(lines)
 
+def booking_already_in_diary(fields: dict) -> bool:
+    """True when this car/phone already holds a slot on that exact date.
+
+    The model sometimes re-emits a BOOKING marker for a customer who is
+    already booked (e.g. they came back to ask for the address). That is a
+    re-confirmation, not a new request — it must never be bounced by the
+    bookings-open date or the full-day check, or the customer's real
+    question gets swallowed by a canned rejection (Gerry, 12KE4815)."""
+    reg = clean_reg(fields.get("reg", ""))
+    date_ = (fields.get("date") or "").strip()
+    phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
+    if not date_ or not (reg or phone):
+        return False
+    with closing(db()) as conn:
+        dupe = conn.execute(
+            "SELECT id FROM bookings WHERE date = ? AND ("
+            " (TRIM(COALESCE(reg,'')) <> '' AND UPPER(TRIM(reg)) = ?)"
+            " OR (? <> '' AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?))",
+            (date_, reg, phone, "%" + phone[-9:] if phone else "\x00")).fetchone()
+    return bool(dupe)
+
 def save_booking(fields: dict) -> bool:
     """Store a booking. Returns False if it was a duplicate and nothing was saved.
 
@@ -2097,10 +2118,13 @@ def _finish_reply(user: str, answer: str) -> str:
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     if booking:
+        # A re-confirmation of a booking already in the diary sails past every
+        # gate — save_booking dedupes it silently and the answer stays intact.
+        already_booked = booking_already_in_diary(booking)
         # Hard safety net: never confirm a booking on a day that is already full.
         # (Owner can override capacity when logging their own manual bookings.)
         # Not open for bookings yet (owner can still log their own).
-        if not is_owner and before_open_date(booking.get("date", "")):
+        if not is_owner and not already_booked and before_open_date(booking.get("date", "")):
             opens = bookings_open_from()
             log.info("Booking for %s rejected: before opening date", booking.get("date"))
             answer = NOT_OPEN_MSG.get(
@@ -2117,7 +2141,7 @@ def _finish_reply(user: str, answer: str) -> str:
                 log.exception("Failed to alert owner about an early-date request")
             save_message(user, "assistant", answer)
             return answer
-        if not is_owner and day_is_full(booking.get("date", ""), booking.get("need", "")):
+        if not is_owner and not already_booked and day_is_full(booking.get("date", ""), booking.get("need", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
             save_message(user, "assistant", answer)
