@@ -1288,6 +1288,18 @@ _DIAG_RE = re.compile(
 def is_diagnostic_job(need: str) -> bool:
     return bool(_DIAG_RE.search(need or ""))
 
+# Owner's rule (2026-08-25): only the money jobs — services, NCT repairs and
+# brakes — may book AHEAD. Every other job can only take a slot within
+# AHEAD_ONLY_DAYS of the date, so far-future days stay clear for good work.
+AHEAD_ONLY_DAYS = 2
+_GOOD_RE = re.compile(
+    r"servic|oil change|oil and filter|oil & filter|\bnct\b|retest|fail|brake|pads|discs",
+    re.IGNORECASE)
+
+def is_good_job(need: str) -> bool:
+    """Service / NCT repair / brakes — allowed to book any open day, any time."""
+    return bool(_GOOD_RE.search(need or "")) and not is_diagnostic_job(need)
+
 def _diag_count(date_str: str) -> int:
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?", (date_str,)).fetchall()
@@ -1305,6 +1317,8 @@ def day_is_full(date_str: str, need: str = "") -> bool:
         return True
     if is_diagnostic_job(need) and _diag_count(date_str) >= DIAG_SLOTS_PER_DAY:
         return True  # diagnostics quota used up — offer another day
+    if need and not is_good_job(need) and (d - now_local().date()).days > AHEAD_ONLY_DAYS:
+        return True  # non-money jobs may only book within the last 2 days
     return False
 
 # Templated "that day is full" message, per language (used when a booking hits a full day).
@@ -1385,30 +1399,24 @@ def availability_block() -> str:
             continue  # closed Sundays
         iso = d.isoformat()
         left = max(0, cap - taken.get(iso, 0))
-        # Owner's rule: on weekdays the LAST 2 slots of every day are reserved for
-        # general services — but only while the day is still far enough away for a
-        # service customer to claim them. Within 3 days of the date, unclaimed
-        # service slots are released to any job (an empty slot earns nothing).
-        if d.weekday() < 5:
-            reserve = 2 if (d - today).days > 3 else 0
-            nonservice_left = max(0, (cap - reserve) - nonservice.get(iso, 0))
-        else:
-            nonservice_left = 0  # Saturday is services-only anyway
-        nonservice_left = min(nonservice_left, left)
-        # Owner's rule: diagnostics (noises, leaks, warning lights, fault-finding)
-        # get at most 2 slots a day — the rest stay for the money jobs.
-        diag_left = min(left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0))) \
-            if d.weekday() < 5 else 0
+        # Owner's rule: only the MONEY JOBS (services, NCT repairs, brakes) book
+        # ahead. Every other job can only take a slot within 2 days of the date,
+        # so future days stay clear for good work. Saturday stays services-only.
+        near = (d - today).days <= AHEAD_ONLY_DAYS
+        other_left = left if (near and d.weekday() < 5) else 0
+        # Diagnostics additionally capped at 2 a day.
+        diag_left = min(other_left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0)))
         if left == 0:
             lines.append(f"{d.strftime('%a %d %b')}: FULL")
-        elif nonservice_left == 0 and d.weekday() < 5:
+        elif other_left == 0 and d.weekday() < 5:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left — "
-                         "SERVICE BOOKINGS ONLY (repairs/diagnostics/NCT are full "
-                         "this day, offer the next day for those)")
+                         "SERVICES / NCT REPAIRS / BRAKES ONLY (other jobs can "
+                         "only book within 2 days of the date — offer them a "
+                         "day that is at most 2 days away)")
         else:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left "
-                         f"({nonservice_left} usable for repairs/NCT, "
-                         f"{diag_left} for diagnostics)")
+                         f"({other_left} open to any job, {diag_left} of those "
+                         f"usable for diagnostics)")
     opening_note = ""
     if opens and opens > today:
         opening_note = (
@@ -1425,14 +1433,19 @@ def availability_block() -> str:
                   "When you say a day name with a date, it MUST match this calendar and "
                   "the availability list — never compute weekdays yourself.")
     return (today_line + opening_note +
-        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE LAST 2 SLOTS OF EVERY WEEKDAY ARE RESERVED FOR GENERAL SERVICES while the day is more than 3 days away: when a day shows SERVICE BOOKINGS ONLY, do NOT book repairs, diagnostics or NCT work on it — offer those customers the next day that shows repair space (services can always be booked on any open day). Within 3 days of a date the reservation is released automatically and the list simply shows the real space — always trust the numbers in the list. Saturday is GENERAL SERVICES "
+        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE MONEY JOBS — general "
+        "services, NCT repairs and brakes — can be booked on ANY open day, as far ahead as the "
+        "list goes. EVERY OTHER JOB (diagnostics, wheel bearings, AC, remaps, timing belts, "
+        "anything else) can ONLY be booked within 2 days of the date: when a day shows "
+        "SERVICES / NCT REPAIRS / BRAKES ONLY, do not book other work on it — offer those "
+        "customers today, tomorrow or the day after (whichever shows space open to any job). "
+        "Always trust the numbers in the list. Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
         "counted. Next 2 weeks:\n" + "\n".join(lines) +
         "\n\nDIAGNOSTIC JOBS (unknown noises, leaks, warning lights, misfires, 'can you check "
-        "it over') take AT MOST 2 slots per day — when a day shows 0 diagnostic slots, do NOT "
-        "book a diagnostic on it even if other slots remain: offer the nearest day that still "
-        "shows diagnostic space. Services, NCT repairs, brakes and clearly-named repairs are "
-        "NOT diagnostics and use the normal slots. "
+        "it over') additionally take AT MOST 2 slots per day — when a day shows 0 diagnostic "
+        "slots, do NOT book a diagnostic on it even if other slots remain: offer the nearest "
+        "day that still shows diagnostic space. "
         "\n\nOnly take a booking (only output the <<<BOOKING>>> marker) for a day that still has "
         "slots left. If the customer asks for a day marked FULL, or a Sunday, DO NOT confirm — "
         "tell them it's fully booked and offer the nearest day with space. On SATURDAY only book "
@@ -5094,16 +5107,14 @@ def _voice_availability() -> str:
             continue
         iso = d.isoformat()
         left = max(0, cap - taken.get(iso, 0))
-        reserve = 2 if (d.weekday() < 5 and (d - today).days > 3) else 0
-        ns_left = min(left, max(0, (cap - reserve) - nonservice.get(iso, 0))) \
-            if d.weekday() < 5 else 0
-        diag_left = min(left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0))) \
-            if d.weekday() < 5 else 0
         if left == 0:
             continue
+        near = (d - today).days <= AHEAD_ONLY_DAYS
+        other_left = left if (near and d.weekday() < 5) else 0
+        diag_left = min(other_left, max(0, DIAG_SLOTS_PER_DAY - diag.get(iso, 0)))
         out.append({"date": iso, "day": d.strftime("%A"),
-                    "slots_for_services": left,
-                    "slots_for_repairs_nct": ns_left,
+                    "slots_for_services_nct_brakes": left,
+                    "slots_for_other_jobs": other_left,
                     "slots_for_diagnostics": diag_left,
                     "saturday_services_only": d.weekday() == 5})
     return out
@@ -5127,13 +5138,15 @@ async def retell_function(request: Request):
         today = now_local().date()
         return {"today": f"{today.strftime('%A %d %B %Y')}",
                 "open_days": _voice_availability(),
-                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Diagnostic "
-                         "jobs (unknown noises, leaks, warning lights, fault-finding) "
-                         "need a day with slots_for_diagnostics free - max 2 a day; "
-                         "services, NCT repairs and brakes use the normal slots. "
-                         "ONLY offer days from open_days - if the caller wants a "
-                         "later date, say we book about a month ahead and take a "
-                         "message.")}
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Services, "
+                         "NCT repairs and brakes book any open day (slots_for_"
+                         "services_nct_brakes). ALL other jobs can only book within "
+                         "2 days of the date - they need slots_for_other_jobs, and "
+                         "diagnostics (noises, leaks, warning lights, fault-finding) "
+                         "also need slots_for_diagnostics (max 2 a day). For other "
+                         "jobs wanting a far date: offer today, tomorrow or the day "
+                         "after instead. ONLY offer days from open_days - if the "
+                         "caller wants a later date, take a message.")}
 
     if fn == "book_appointment":
         fields = {"name": (args.get("name") or "").strip(),
