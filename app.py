@@ -1297,8 +1297,12 @@ _GOOD_RE = re.compile(
     re.IGNORECASE)
 
 def is_good_job(need: str) -> bool:
-    """Service / NCT repair / brakes — allowed to book any open day, any time."""
-    return bool(_GOOD_RE.search(need or "")) and not is_diagnostic_job(need)
+    """Service / NCT repair / brakes — allowed to book any open day, any time.
+
+    A combined job ("service and DPF diagnosis") still counts as good: the
+    customer is paying for the service, so it may book ahead. It still eats a
+    diagnostics slot via the DIAG_SLOTS_PER_DAY check in day_is_full."""
+    return bool(_GOOD_RE.search(need or ""))
 
 def _diag_count(date_str: str) -> int:
     with closing(db()) as conn:
