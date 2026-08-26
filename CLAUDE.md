@@ -31,8 +31,8 @@ Hours Mon–Fri 9–18, Sat 9–14 (Saturday = general services only), Sun close
 
 ## Standing rules (owner's words — keep them)
 - Booking order: problem → day → car+reg → name. Never ask for the phone number.
-- Capacity 10/day Mon–Fri, Saturday 4 services-only, Sunday closed. New
-  bookings from 2026-08-31 (BOOKINGS_FROM env).
+- Capacity 10/day Mon–Fri, Saturday 4 services-only, Sunday closed.
+  (BOOKINGS_FROM gate dropped 2026-08-27 — any open day is bookable.)
 - GOOD JOBS (book any day ahead): services/oil, NCT repairs/retest/fail,
   brakes, DPF, timing belt/chain, cambelt, clutch, flywheel. Everything else
   books only within AHEAD_ONLY_DAYS=2 of the date (honest AHEAD_ONLY_MSG, not
