@@ -5249,6 +5249,9 @@ MISSED_CALL_TEXT = (
     "But tell me here how I can help: I can answer questions, give prices "
     "and book you in right here in this chat."
 )
+# Hang-up text-backs go out from the main 086 line so the reply lands in the
+# number customers already know.
+TEXTBACK_PHONE_ID = os.environ.get("TEXTBACK_PHONE_ID", "335852741443330")
 # One invitation per caller per hour, and never while a colleague has the chat.
 _missed_call_replied: dict = {}
 _accepted_calls: set = set()
@@ -5611,6 +5614,19 @@ async def retell_call_report(request: Request):
     if rec:
         lines.append(f"🎧 Listen: {rec}")
     send_telegram("\n".join(lines))
+    # Hang-ups get a WhatsApp text-back from the 086 line: most callers who bail
+    # on the robot in the first seconds will happily type instead — turn the
+    # dead call into a chat. Mobiles only; blocklist, staff-owned chats and the
+    # 1-hour cooldown are all enforced inside handle_missed_call.
+    try:
+        digits = "".join(ch for ch in frm if ch.isdigit())
+        if (digits.startswith("3538")
+                and (call.get("duration_ms") or 0) < 20000
+                and (call.get("disconnection_reason") or "") == "user_hangup"
+                and not analysis.get("call_successful")):
+            handle_missed_call(digits, arrived_on=TEXTBACK_PHONE_ID)
+    except Exception:
+        log.exception("Hang-up text-back failed")
     return {"ok": True}
 
 @app.post("/webhook")
