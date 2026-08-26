@@ -2766,6 +2766,10 @@ def _green_group_id() -> str:
     if cached:
         return cached
     want = PARTS_GROUP_NAME.strip().lower()
+    # The real group name may carry emojis ("ECP to NW Autos parts ⚙️") —
+    # match on starts-with, not equality.
+    def _match(label: str) -> bool:
+        return (label or "").strip().lower().startswith(want)
     try:
         r = requests.get(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                          f"/getChats/{GREEN_API_TOKEN}", timeout=30)
@@ -2774,7 +2778,7 @@ def _green_group_id() -> str:
             cid = chat.get("id") or ""
             if not cid.endswith("@g.us"):
                 continue
-            if (chat.get("name") or "").strip().lower() == want:
+            if _match(chat.get("name")):
                 set_setting("parts_group_id_green", cid)
                 return cid
             groups.append(cid)
@@ -2783,8 +2787,7 @@ def _green_group_id() -> str:
                 g = requests.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                                   f"/getGroupData/{GREEN_API_TOKEN}",
                                   json={"groupId": cid}, timeout=20)
-                subject = ((g.json() or {}).get("subject") or "").strip().lower()
-                if subject == want:
+                if _match((g.json() or {}).get("subject")):
                     set_setting("parts_group_id_green", cid)
                     return cid
             except Exception:
@@ -4812,6 +4815,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # the group and send any message there first). ?date=<chat_id>: save it.
         if not TELEGRAM_BOT_TOKEN:
             return {"error": "Set TELEGRAM_BOT_TOKEN in Railway first."}
+        if "@g.us" in (date or ""):
+            set_setting("parts_group_id_green", date.strip())
+            return {"saved": date.strip(),
+                    "note": "WhatsApp group id pinned for the daily parts orders."}
         if (date or "").strip():
             set_setting("parts_telegram_chat", date.strip())
             return {"saved": date.strip(),
