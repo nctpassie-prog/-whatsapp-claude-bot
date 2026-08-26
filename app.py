@@ -2833,22 +2833,28 @@ def send_parts_to_group(msg: str) -> bool:
 
 def send_parts_orders() -> None:
     now = now_local()
-    if now.hour < PARTS_ORDER_HOUR:
+    wd = now.weekday()  # Mon=0 ... Sat=5, Sun=6
+    if wd == 6:
+        return  # Sunday closed — Monday's parts were ordered Saturday morning
+    # Owner: Saturday's order goes out at 11am (garage closes at 2) and covers
+    # MONDAY, since Sunday is closed. Weekdays order at 2pm for tomorrow.
+    if now.hour < (11 if wd == 5 else PARTS_ORDER_HOUR):
         return
     today = now.date().isoformat()
     if get_setting("parts_order_sent") == today:
         return
-    tomorrow = (now.date() + timedelta(days=1)).isoformat()
+    target = (now.date() + timedelta(days=2 if wd == 5 else 1)).isoformat()
     with closing(db()) as conn:
         rows = conn.execute("SELECT reg, car, need FROM bookings WHERE date = ?",
-                            (tomorrow,)).fetchall()
+                            (target,)).fetchall()
     cars = [(clean_reg(r or ""), (c or "").strip()) for r, c, n in rows
             if _SERVICE_PARTS_RE.search(n or "") and "TEST" not in (r or "").upper()]
     set_setting("parts_order_sent", today)  # once per day, even when nothing to order
     if not cars:
         return
-    day_label = datetime.strptime(tomorrow, "%Y-%m-%d").strftime("%A %d %B")
-    lines = [f"Parts for tomorrow ({day_label}) please:"]
+    day_label = datetime.strptime(target, "%Y-%m-%d").strftime("%A %d %B")
+    when_word = "Monday" if wd == 5 else "tomorrow"
+    lines = [f"Parts for {when_word} ({day_label}) please:"]
     for reg, car in cars:
         label = reg or car or "?"
         if reg and car:
