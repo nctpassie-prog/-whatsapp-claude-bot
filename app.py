@@ -1106,6 +1106,44 @@ def sync_google_contact(number: str) -> None:
     except Exception:
         log.exception("Google Contacts sync failed for %s", number)
 
+_PHONE_NAME_CACHE: dict = {}
+
+def google_contact_name(digits: str) -> str:
+    """Name saved in the garage's Google Contacts for this number, '' if none.
+
+    Phone callers are usually NOT WhatsApp customers, so the bot's own database
+    draws a blank — but years of real customers live in the nctpass.ie@gmail.com
+    contact book. Cached per number; never raises."""
+    tail = digits[-9:] if len(digits) >= 9 else digits
+    if not tail:
+        return ""
+    cached = _PHONE_NAME_CACHE.get(tail)
+    if cached is not None:
+        return cached
+    name = ""
+    try:
+        if google_enabled():
+            token = _google_access_token()
+            if token:
+                headers = {"Authorization": f"Bearer {token}"}
+                url = "https://people.googleapis.com/v1/people:searchContacts"
+                # The search cache needs a warm-up request before the real one.
+                httpx.get(url, params={"query": "", "readMask": "phoneNumbers"},
+                          headers=headers, timeout=10)
+                r = httpx.get(url, params={"query": tail,
+                                           "readMask": "names,phoneNumbers"},
+                              headers=headers, timeout=10)
+                for res in (r.json() or {}).get("results", []) or []:
+                    nm = (((res.get("person") or {}).get("names") or [{}])[0]
+                          .get("displayName") or "").strip()
+                    if nm:
+                        name = nm
+                        break
+    except Exception:
+        log.exception("Google contact lookup failed for %s", digits)
+    _PHONE_NAME_CACHE[tail] = name
+    return name
+
 def customer_label(number: str) -> str:
     """Who this number belongs to, for alerts — 'Sam Ukaga (131MH704) +3538…'.
 
@@ -1118,6 +1156,10 @@ def customer_label(number: str) -> str:
         with closing(db()) as conn:
             row = conn.execute(
                 "SELECT name, reg FROM customers WHERE wa_number = ?", (digits,)).fetchone()
+            if not row and len(digits) >= 9:
+                row = conn.execute(
+                    "SELECT name, reg FROM customers WHERE wa_number LIKE ?",
+                    (f"%{digits[-9:]}",)).fetchone()
             if row:
                 name, reg = (row[0] or "").strip(), (row[1] or "").strip()
             # Bookings often know more (the car, a name given on the phone) and
@@ -1133,6 +1175,8 @@ def customer_label(number: str) -> str:
                     reg = reg or (b[2] or "").strip()
     except Exception:
         log.exception("Could not look up customer name for %s", number)
+    if not name:
+        name = google_contact_name(digits)
     bits = [b for b in [name, car, f"({reg})" if reg else ""] if b]
     return (" ".join(bits) + f" +{digits}") if bits else f"+{digits}"
 
@@ -5520,9 +5564,11 @@ async def retell_function(request: Request):
 
     if fn == "take_message":
         label = customer_label(caller) if caller else f"+{args.get('phone', '?')}"
+        to_num = str(call.get("to_number") or "").strip()
         send_telegram("📞 PHONE MESSAGE (voice agent)\n"
                       f"From: {args.get('name', '?')} — {label}\n"
-                      f"{args.get('message', '')}")
+                      + (f"📱 They rang: {to_num}\n" if to_num else "")
+                      + f"{args.get('message', '')}")
         return {"ok": True, "confirm": "Message passed to the team."}
 
     return JSONResponse({"error": f"unknown function {fn!r}"}, status_code=400)
@@ -5552,6 +5598,11 @@ async def retell_call_report(request: Request):
     reason = (call.get("disconnection_reason") or "").replace("_", " ")
     lines = [f"{mark} PHONE CALL — {label}",
              f"⏱ {dur} min · ended: {reason}"]
+    to_num = str(call.get("to_number") or "").strip()
+    if to_num:
+        lines.insert(1, f"📱 They rang: {to_num}"
+                        + (" (garage line)" if "12659310" in to_num.replace(" ", "")
+                           else ""))
     if sentiment:
         lines.append(f"Mood: {sentiment}")
     if summary:
