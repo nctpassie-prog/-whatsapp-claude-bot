@@ -3898,7 +3898,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
-                     "waitlist",
+                     "waitlist", "waitlistadd",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4950,6 +4950,25 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "waitlistadd":
+        # Manually put a customer on the cancellation list.
+        # ?phone=...&date=<earlier day they WANT>&car=...&reg=...&name=...&need=...
+        # The 'booked' anchor is their current booking if one exists, else a far
+        # future date so ANY freed slot from their wanted day onward is offered.
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        wanted = (date or "").strip()
+        if not (digits and wanted):
+            return {"error": "need phone and date=<wanted earlier day>"}
+        with closing(db()) as conn:
+            b = conn.execute(
+                "SELECT date FROM bookings WHERE REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','')"
+                " LIKE ? AND date >= ? ORDER BY date LIMIT 1",
+                ("%" + digits[-9:], now_local().date().isoformat())).fetchone()
+        booked = b[0] if b else (now_local().date() + timedelta(days=60)).isoformat()
+        add_to_waitlist({"phone": digits, "name": name, "car": car, "reg": reg,
+                         "need": need, "date": booked, "wanted": wanted})
+        return {"added": True, "phone": digits, "wanted": wanted,
+                "anchor_booking": booked}
     if action == "waitlist":
         # Who is waiting for an earlier slot, and who has an open offer.
         with closing(db()) as conn:
