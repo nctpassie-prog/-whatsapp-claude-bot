@@ -2760,21 +2760,37 @@ def _whapi_group_id() -> str:
     return ""
 
 def _green_group_id() -> str:
-    """Chat id of the parts group via Green API's getChats, cached."""
+    """Chat id of the parts group, cached. getChats rarely carries group names,
+    so unnamed @g.us chats are resolved one by one via getGroupData (subject)."""
     cached = get_setting("parts_group_id_green")
     if cached:
         return cached
+    want = PARTS_GROUP_NAME.strip().lower()
     try:
         r = requests.get(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                          f"/getChats/{GREEN_API_TOKEN}", timeout=30)
+        groups = []
         for chat in (r.json() or []):
             cid = chat.get("id") or ""
-            if cid.endswith("@g.us") and (chat.get("name") or "").strip().lower() \
-                    == PARTS_GROUP_NAME.strip().lower():
+            if not cid.endswith("@g.us"):
+                continue
+            if (chat.get("name") or "").strip().lower() == want:
                 set_setting("parts_group_id_green", cid)
                 return cid
-        log.warning("Green API: group '%s' not found among this number's chats",
-                    PARTS_GROUP_NAME)
+            groups.append(cid)
+        for cid in groups[:40]:
+            try:
+                g = requests.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
+                                  f"/getGroupData/{GREEN_API_TOKEN}",
+                                  json={"groupId": cid}, timeout=20)
+                subject = ((g.json() or {}).get("subject") or "").strip().lower()
+                if subject == want:
+                    set_setting("parts_group_id_green", cid)
+                    return cid
+            except Exception:
+                continue
+        log.warning("Green API: group '%s' not found among %d group chats",
+                    PARTS_GROUP_NAME, len(groups))
     except Exception:
         log.exception("Green API chat lookup failed")
     return ""
