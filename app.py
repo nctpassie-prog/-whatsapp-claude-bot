@@ -2731,6 +2731,8 @@ WHAPI_TOKEN = os.environ.get("WHAPI_TOKEN", "")
 # capped at 3 chats — we only ever use the one supplier group).
 GREEN_API_ID = os.environ.get("GREEN_API_ID", "")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
+# Each instance lives on its own API host (shown as apiUrl on the instance page).
+GREEN_API_URL = os.environ.get("GREEN_API_URL", "https://7107.api.greenapi.com").rstrip("/")
 PARTS_GROUP_NAME = os.environ.get("PARTS_GROUP_NAME", "ECP to NW Autos parts")
 _SERVICE_PARTS_RE = re.compile(r"servic|oil change|oil and filter|oil & filter",
                                re.IGNORECASE)
@@ -2763,7 +2765,7 @@ def _green_group_id() -> str:
     if cached:
         return cached
     try:
-        r = requests.get(f"https://api.green-api.com/waInstance{GREEN_API_ID}"
+        r = requests.get(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                          f"/getChats/{GREEN_API_TOKEN}", timeout=30)
         for chat in (r.json() or []):
             cid = chat.get("id") or ""
@@ -2784,7 +2786,7 @@ def send_parts_to_group(msg: str) -> bool:
         gid = _green_group_id()
         if gid:
             try:
-                r = requests.post(f"https://api.green-api.com/waInstance{GREEN_API_ID}"
+                r = requests.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                                   f"/sendMessage/{GREEN_API_TOKEN}",
                                   json={"chatId": gid, "message": msg}, timeout=30)
                 if r.status_code < 300:
