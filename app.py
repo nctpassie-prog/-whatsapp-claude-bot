@@ -267,6 +267,15 @@ confirmed, and put nothing after it. If any field is still missing, or the custo
 not yet confirmed, do NOT output the line — ask for the missing detail or wait for their \
 confirmation instead. The customer must never see or hear about this line.
 
+WAITING LIST: if the customer wanted an EARLIER day that was full or not available and \
+they settled for a later date, add one extra field to the booking line: \
+wanted=YYYY-MM-DD (the earlier day they originally asked for). Also tell them in your \
+visible confirmation: "I've also put you on our cancellation list — if an earlier slot \
+frees up, I'll message you straight away." When we later offer a freed earlier slot and \
+the customer replies YES (or agrees), confirm warmly and output the BOOKING line again \
+immediately with the NEW date and the same car/reg/need details — no need to re-ask \
+anything, and their old booking is moved automatically.
+
 BUSINESS INFORMATION:
 {kb}
 """
@@ -571,7 +580,114 @@ def cancel_booking(user: str, fields: dict) -> dict:
             except Exception:
                 log.exception("Could not remove calendar event for cancellation")
     log.info("Cancelled %d booking(s) for %s", len(removed), user)
+    # Every freed future slot may make someone on the waiting list happy.
+    try:
+        for d in sorted({b["date"] for b in removed if b.get("date")}):
+            offer_freed_slot(d, skip_phone=digits)
+    except Exception:
+        log.exception("Waitlist offer after cancellation failed")
     return {"cancelled": len(removed), "bookings": removed}
+
+def add_to_waitlist(fields: dict) -> None:
+    """Customer settled for a later date than they wanted (marker field wanted=).
+    Remember them so a cancellation can bump them earlier. One live row each."""
+    phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
+    booked = (fields.get("date") or "").strip()
+    wanted = (fields.get("wanted") or "").strip()
+    if not (phone and booked and wanted) or wanted >= booked:
+        return
+    with closing(db()) as conn, conn:
+        row = conn.execute(
+            "SELECT id FROM waitlist WHERE phone LIKE ? AND status IN ('waiting','offered')",
+            ("%" + phone[-9:],)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE waitlist SET booked_date=?, wanted_date=?, need=?, car=?,"
+                " reg=?, name=? WHERE id=?",
+                (booked, wanted, fields.get("need", ""), fields.get("car", ""),
+                 clean_reg(fields.get("reg", "")), fields.get("name", ""), row[0]))
+        else:
+            conn.execute(
+                "INSERT INTO waitlist (phone, name, car, reg, need, booked_date,"
+                " wanted_date, created_ts) VALUES (?,?,?,?,?,?,?,?)",
+                (phone, fields.get("name", ""), fields.get("car", ""),
+                 clean_reg(fields.get("reg", "")), fields.get("need", ""),
+                 booked, wanted, time.time()))
+    log.info("Waitlist: %s wants %s, currently booked %s", phone, wanted, booked)
+
+def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
+    """A future slot just freed up — offer it to the longest-waiting customer whose
+    booking is later than this date. One offer per freed slot; their reply is
+    handled by the normal conversation (YES -> new BOOKING marker -> old booking
+    auto-cancelled in settle_waitlist_after_booking, which may free ANOTHER slot
+    and cascade)."""
+    try:
+        today = now_local().date().isoformat()
+        if not freed_date or freed_date <= today:
+            return  # same-day swaps are the team's call, not the bot's
+        skip = "".join(ch for ch in str(skip_phone) if ch.isdigit())[-9:]
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT id, phone, name, car, reg, need, booked_date FROM waitlist "
+                "WHERE status IN ('waiting','offered') AND booked_date > ? "
+                "AND offered_date != ? ORDER BY created_ts",
+                (freed_date, freed_date)).fetchall()
+        for wid, phone, name, car, reg, need, booked in rows:
+            digits = "".join(ch for ch in str(phone) if ch.isdigit())
+            if not digits or is_blocked(digits) or (skip and digits.endswith(skip)):
+                continue
+            if human_handling(digits):
+                continue  # a colleague owns that chat — don't talk over them
+            if day_is_full(freed_date, need):
+                continue  # day won't take THIS job (e.g. diag quota) — try next waiter
+            nice = datetime.strptime(freed_date, "%Y-%m-%d").strftime("%A %d %B")
+            old = datetime.strptime(booked, "%Y-%m-%d").strftime("%A %d %B")
+            first = (name or "").strip().split(" ")[0]
+            msg = (f"Good news{', ' + first if first else ''} — a slot has just freed "
+                   f"up on {nice}, earlier than your booking on {old}! Would you like "
+                   f"me to move your {car or 'car'} to {nice}? Just reply YES and "
+                   "I'll switch it — drop-off between 9 and 11am as usual 👍")
+            send_whatsapp(digits, msg)
+            save_message(digits, "assistant", msg)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE waitlist SET status='offered', offered_date=?,"
+                             " offered_ts=? WHERE id=?", (freed_date, time.time(), wid))
+            send_telegram(f"📋 Waiting list: offered the freed {freed_date} slot to "
+                          f"{customer_label(digits)} (currently booked {booked})")
+            return
+    except Exception:
+        log.exception("Waitlist offer failed for %s", freed_date)
+
+def settle_waitlist_after_booking(fields: dict) -> None:
+    """A new booking just saved. If this customer was on the waiting list and the
+    new date is EARLIER than their old booking, they accepted a move: cancel the
+    old booking (which frees that slot and may cascade to the next waiter)."""
+    phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
+    new_date = (fields.get("date") or "").strip()
+    if not (phone and new_date and len(phone) >= 9):
+        return
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT id, booked_date, reg FROM waitlist WHERE phone LIKE ? "
+                "AND status IN ('waiting','offered')", ("%" + phone[-9:],)).fetchone()
+        if not row or new_date >= row[1]:
+            return
+        wid, old_date, wreg = row
+        # Same car only: a second car booked earlier must never cancel the
+        # waitlisted car's booking.
+        new_reg = clean_reg(fields.get("reg", ""))
+        if wreg and new_reg and clean_reg(wreg) != new_reg:
+            return
+        with closing(db()) as conn, conn:
+            conn.execute("UPDATE waitlist SET status='done' WHERE id = ?", (wid,))
+        result = cancel_booking(phone, {"date": old_date,
+                                        "reg": wreg or fields.get("reg", "")})
+        if result.get("cancelled"):
+            send_telegram(f"📋 Waiting list: {customer_label(phone)} moved "
+                          f"{old_date} → {new_date}; the {old_date} slot is free again.")
+    except Exception:
+        log.exception("Waitlist settle failed for %s", phone)
 
 def notify_owner_booking(fields: dict) -> None:
     """Send the owner a booking summary (Telegram + WhatsApp) with a calendar link."""
@@ -863,6 +979,15 @@ def db() -> sqlite3.Connection:
     conn.execute("CREATE TABLE IF NOT EXISTS followup_log ("
                  " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                  " wa_user TEXT, kind TEXT, ts REAL)")
+    # Customers who took a later date than they wanted — the cancellation list.
+    # When a booking is cancelled, its slot is offered to the earliest waiter.
+    conn.execute("CREATE TABLE IF NOT EXISTS waitlist ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 " phone TEXT, name TEXT DEFAULT '', car TEXT DEFAULT '',"
+                 " reg TEXT DEFAULT '', need TEXT DEFAULT '',"
+                 " booked_date TEXT, wanted_date TEXT DEFAULT '',"
+                 " created_ts REAL, status TEXT DEFAULT 'waiting',"
+                 " offered_date TEXT DEFAULT '', offered_ts REAL DEFAULT 0)")
     # Delivery receipts, persisted: the in-memory deque dies on every deploy,
     # which made "did that message land?" unanswerable minutes later.
     conn.execute("CREATE TABLE IF NOT EXISTS delivery_log ("
@@ -2237,6 +2362,13 @@ def _finish_reply(user: str, answer: str) -> str:
                 email_booking(booking)
             except Exception:
                 log.exception("Failed to email booking")
+            try:
+                wl = dict(booking)
+                wl["phone"] = wl.get("phone") or user
+                add_to_waitlist(wl)             # wanted= field -> cancellation list
+                settle_waitlist_after_booking(wl)  # accepted an earlier slot -> move
+            except Exception:
+                log.exception("Waitlist bookkeeping failed")
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -3734,6 +3866,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
+                     "waitlist",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4781,6 +4914,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "waitlist":
+        # Who is waiting for an earlier slot, and who has an open offer.
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT phone, name, car, reg, need, booked_date, wanted_date,"
+                " status, offered_date FROM waitlist"
+                " WHERE status IN ('waiting','offered') ORDER BY created_ts").fetchall()
+        keys = ("phone", "name", "car", "reg", "need", "booked", "wanted",
+                "status", "offered")
+        return {"waiting": [dict(zip(keys, r)) for r in rows]}
     if action == "cancel":
         # Manually cancel a booking: ?action=cancel&date=<phone or reg>
         who = (date or "").strip()
