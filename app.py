@@ -2743,7 +2743,7 @@ def _whapi_group_id() -> str:
     if cached:
         return cached
     try:
-        r = requests.get("https://gate.whapi.cloud/groups?count=200",
+        r = httpx.get("https://gate.whapi.cloud/groups?count=200",
                          headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}, timeout=20)
         for g in (r.json() or {}).get("groups", []) or []:
             if (g.get("name") or "").strip().lower() == PARTS_GROUP_NAME.strip().lower():
@@ -2771,7 +2771,7 @@ def _green_group_id() -> str:
     def _match(label: str) -> bool:
         return (label or "").strip().lower().startswith(want)
     try:
-        r = requests.get(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
+        r = httpx.get(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                          f"/getChats/{GREEN_API_TOKEN}", timeout=30)
         groups = []
         for chat in (r.json() or []):
@@ -2784,7 +2784,7 @@ def _green_group_id() -> str:
             groups.append(cid)
         for cid in groups[:40]:
             try:
-                g = requests.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
+                g = httpx.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                                   f"/getGroupData/{GREEN_API_TOKEN}",
                                   json={"groupId": cid}, timeout=20)
                 if _match((g.json() or {}).get("subject")):
@@ -2805,7 +2805,7 @@ def send_parts_to_group(msg: str) -> bool:
         gid = _green_group_id()
         if gid:
             try:
-                r = requests.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
+                r = httpx.post(f"{GREEN_API_URL}/waInstance{GREEN_API_ID}"
                                   f"/sendMessage/{GREEN_API_TOKEN}",
                                   json={"chatId": gid, "message": msg}, timeout=30)
                 if r.status_code < 300:
@@ -2820,7 +2820,7 @@ def send_parts_to_group(msg: str) -> bool:
     if not gid:
         return False
     try:
-        r = requests.post("https://gate.whapi.cloud/messages/text",
+        r = httpx.post("https://gate.whapi.cloud/messages/text",
                           json={"to": gid, "body": msg},
                           headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}, timeout=20)
         if r.status_code < 300:
