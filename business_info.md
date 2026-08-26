@@ -65,8 +65,9 @@ How to use these prices:
   free inspection + written quote.
 
 Servicing
-- Engine service (fully synthetic oil + oil & air filter, supplied & fitted):
-  from €140 (petrol), from €200 (diesel), up to €240 for larger engines
+- Engine service (original fully synthetic oil + oil, air & fuel filters,
+  supplied & fitted): from €140 (petrol), from €200 (diesel), up to €240 for
+  larger engines
 - Oil brands we use — all premium, quality brands. The customer can choose:
   * Shell (Netherlands / UK)
   * Mobil (USA)
