@@ -107,7 +107,12 @@ REVIEW_ENABLED = os.environ.get("REVIEW_ENABLED", "1") == "1"
 REVIEW_DELAY_DAYS = int(os.environ.get("REVIEW_DELAY_DAYS", "2"))  # days after appointment
 # Direct link to the garage's Google listing (4.8 stars) — only ever sent AFTER a
 # customer says they were happy, so unhappy feedback stays private.
-REVIEW_LINK = os.environ.get("REVIEW_LINK", "https://maps.google.com/?cid=1793275012653342365")
+# Direct write-review deep link: opens the star box in ONE tap. The old
+# maps.google.com/?cid= link only opened the listing — people replied "5" in
+# chat, tapped, saw the listing, and never found the Reviews button.
+REVIEW_LINK = os.environ.get(
+    "REVIEW_LINK",
+    "https://search.google.com/local/writereview?placeid=ChIJq_tJ8YASZ0gRnV7JcR_-4hg")
 # Start cautious: only customers whose job was a service get the review ask.
 REVIEW_SERVICE_ONLY = os.environ.get("REVIEW_SERVICE_ONLY", "1") == "1"
 # Answering instantly feels robotic — replies wait until at least this many
