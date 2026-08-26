@@ -5690,7 +5690,9 @@ async def retell_function(request: Request):
                   "car": (args.get("car") or "").strip(),
                   "reg": (args.get("reg") or "").strip(),
                   "need": (args.get("job") or args.get("need") or "").strip(),
-                  "date": (args.get("date") or "").strip(), "time": "", "lang": ""}
+                  "date": (args.get("date") or "").strip(), "time": "", "lang": "",
+                  # Earlier day the caller wanted but couldn't have -> waiting list.
+                  "wanted": (args.get("wanted") or "").strip()}
         if not fields["date"]:
             return {"booked": False, "reason": "no date given"}
         added = save_booking(fields)
@@ -5699,12 +5701,23 @@ async def retell_function(request: Request):
                 create_calendar_event(fields)
             except Exception:
                 log.exception("Voice booking calendar event failed")
+            try:
+                add_to_waitlist(fields)
+                settle_waitlist_after_booking(fields)
+            except Exception:
+                log.exception("Voice waitlist bookkeeping failed")
             send_telegram("📞 PHONE BOOKING (voice agent)\n"
                           f"{fields['name']} — {fields['car']} {fields['reg']}\n"
                           f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
-                          f"Caller: +{fields['phone']}")
-            return {"booked": True, "date": fields["date"],
-                    "confirm": "Booked. Drop-off between 9 and 11am."}
+                          f"Caller: +{fields['phone']}"
+                          + (f"\n📋 Waiting for earlier ({fields['wanted']})"
+                             if fields["wanted"] else ""))
+            confirm = "Booked. Drop-off between 9 and 11am."
+            if fields["wanted"]:
+                confirm += (" Also tell them: they are on our cancellation list — "
+                            "if an earlier slot frees up we'll message them on "
+                            "WhatsApp straight away.")
+            return {"booked": True, "date": fields["date"], "confirm": confirm}
         return {"booked": False,
                 "reason": "duplicate - this car already has a booking that day"}
 
