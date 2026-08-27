@@ -4992,22 +4992,25 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # One live Gemini call; returns the reply or the EXACT error, so quota /
         # key / model problems are diagnosable without reading tracebacks.
         # ?need=<model> probes a specific model instead of the configured one.
-        global GEMINI_MODEL
-        probe = (need or "").strip()
-        saved_model = GEMINI_MODEL
-        if probe:
-            GEMINI_MODEL = probe
+        model = (need or "").strip() or GEMINI_MODEL
         try:
-            out = _call_gemini([{"role": "user", "content": "Reply with exactly: OK"}],
-                               "You are a test.")
-            return {"ok": True, "reply": out[:100], "model": GEMINI_MODEL}
+            resp = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY,
+                         "content-type": "application/json"},
+                json={"contents": [{"role": "user",
+                                    "parts": [{"text": "Reply with exactly: OK"}]}]},
+                timeout=60)
+            resp.raise_for_status()
+            cands = (resp.json().get("candidates") or [{}])
+            text = "".join(p.get("text", "") for p in
+                           (cands[0].get("content") or {}).get("parts") or [])
+            return {"ok": True, "reply": text[:100], "model": model}
         except httpx.HTTPStatusError as exc:
             return {"ok": False, "status": exc.response.status_code,
-                    "body": exc.response.text[:600], "model": GEMINI_MODEL}
+                    "body": exc.response.text[:600], "model": model}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)[:400], "model": GEMINI_MODEL}
-        finally:
-            GEMINI_MODEL = saved_model
+            return {"ok": False, "error": str(exc)[:400], "model": model}
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
         # the fingerprint of an inbound that died unsaved (photo reader crash
