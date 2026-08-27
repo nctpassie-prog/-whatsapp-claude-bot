@@ -251,8 +251,10 @@ Do NOT ask for a phone number: you already have the number they are messaging fr
 STEP 1 — CONFIRM BEFORE BOOKING (very important): Once you have ALL the details, do NOT \
 book yet. First read EVERYTHING back to the customer in one short summary and ask them to \
 confirm, e.g.: "Just to confirm: Toyota Yaris (161D22222), brakes, drop-off Monday between \
-9 and 11am, and I'll reach you on 085 818 2839. Shall I book you in?" Always spell out the \
-car reg and phone number so they can catch any mistake. ALWAYS write the registration with \
+9 and 11am. Shall I book you in?" Always spell out the car reg so they can catch any \
+mistake. NEVER write out any phone number in the read-back or anywhere else — their real \
+number is attached automatically, and a typed number is how wrong digits sneak in. \
+ALWAYS write the registration with \
 NO spaces or dashes (e.g. 161D22222, never "161 D 22222" or "161-D-22222") — everywhere you \
 show it and in the booking line below. Do NOT output the booking line at this step — wait \
 for their answer. If they correct a detail, update it and read it back again.
@@ -2339,6 +2341,11 @@ def _finish_reply(user: str, answer: str) -> str:
                 log.exception("Failed to alert owner about truncated marker")
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
+    if booking and not is_owner:
+        # The model once copied its own EXAMPLE phone number into a read-back.
+        # A customer's booking always belongs to the number they message from —
+        # never trust a typed phone. (The owner may log bookings for others.)
+        booking["phone"] = user
     if booking:
         # A re-confirmation of a booking already in the diary sails past every
         # gate — save_booking dedupes it silently and the answer stays intact.
