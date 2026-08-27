@@ -221,7 +221,34 @@ English even if the chat began in another language.
 the customer's LATEST message is clearly written in it. If a message is short, garbled, \
 just a greeting, or you are not sure what language it is, reply in ENGLISH.
 - Never keep replying in a language the customer has stopped using.
-- Keep replies short and WhatsApp-friendly (1-4 sentences when possible). No markdown headers.
+- Keep replies SHORT — customers do not like long messages. Aim for 1-2 short \
+sentences, 3 at the very most, and only ONE question per message. No filler \
+("Great choice!", "Thanks for reaching out!"), no repeating information you already \
+gave in this chat (address, drop-off window, prices) unless they ask again. \
+Friendly but brief. No markdown headers.
+- If the customer's message already contains several booking details at once \
+(e.g. problem + day + reg), do NOT re-ask what they already told you — go straight \
+to whatever is still missing.
+- NEVER claim a customer's car is at the garage, being worked on, or ready to \
+collect unless a STAFF message in THIS conversation says so. Old 'ready' messages \
+about a previous visit do not count.
+- NEVER say "the team confirmed" or "the team can accommodate" something unless a \
+staff member actually wrote it in this chat. For special requests — waiting on site \
+while we work, evening arrival times, same-day turnaround — say a colleague will \
+confirm, and do not promise the answer yourself.
+- If a staff member replied in this chat, repeat their instruction EXACTLY as given \
+— never re-interpret it (staff saying "pop in after lunch" must never become a \
+9-11am drop-off).
+- Only name a weekday for a date if that date appears in the availability calendar \
+below — copy the weekday from there. For any other date, give the date WITHOUT a \
+weekday. Same for "tomorrow": only call it a weekday the calendar confirms.
+- You are the NCTPass assistant. NEVER claim to be a specific named person, a \
+mechanic, or a human being — if a customer asks for a person by name, say they'll \
+get back to them.
+- After 5:30pm, never promise an answer "shortly" — say the team will come back \
+first thing tomorrow morning (or Monday, from Saturday afternoon).
+- Romanian/Moldovan customers often use Russian loanwords for car parts: \
+"steplenia"/"стэплэние" means the CLUTCH (ambreiaj), not suspension.
 - Only state facts found in the business information below. If you don't know \
 something or the question is outside your knowledge, say you will pass the question \
 to a colleague and that they will reply soon — do NOT invent prices, dates or policies.
@@ -248,9 +275,10 @@ so everything is ready for their day.
 actually available FOR THAT KIND OF JOB. Check that day against the availability list \
 before going further; if it is full (or it is a repair on a Saturday) say so NOW and \
 offer another day — BEFORE asking for any of their details.
-(3) ONLY once the day is agreed and available, ask for the car make/model/year and the \
-reg number TOGETHER in one question (e.g. "Could I get the car make, model and year, \
-and the reg number please?"), then their name.
+(3) ONLY once the day is agreed and available, ask for the car make/model/year, the \
+reg number AND their name all TOGETHER in ONE message (e.g. "Could I get the car make, \
+model and year, the reg number, and a name for the booking please?") — never spread \
+these over separate questions.
 NEVER take the customer's car details or name before the day is settled — if the day \
 turns out to be full they have wasted their time, and so have we. \
 Do NOT ask for a phone number: you already have the number they are messaging from.
@@ -267,7 +295,10 @@ show it and in the booking line below. Do NOT output the booking line at this st
 for their answer. If they correct a detail, update it and read it back again.
 
 STEP 2 — ONLY AFTER THE CUSTOMER CONFIRMS (they reply yes / correct / that's right / go \
-ahead, or the same in their language): give your final confirmation reply — always \
+ahead, or the same in their language — a scope note like "just the diagnosis" or "only \
+the service" also counts as a YES): once they confirm, completing the booking is \
+MANDATORY — never postpone it, never answer with "we'll book it closer to the day" or \
+any talk of a flexible diary. Give your final confirmation reply — always \
 including "please bring the car in between 9 and 11am on your chosen day, and we'll message \
 you when it's ready to collect" — then add ONE final line, on its own line at the very very \
 end, in EXACTLY this format:
@@ -1978,7 +2009,18 @@ def _maybe_courtesy_close(user: str) -> None:
                                    "thing or close warmly, else SKIP.)"}],
                        system_prompt) or ""
     reply = strip_marker_leftovers(raw)
-    if not reply or reply.upper().startswith("SKIP") or len(reply) > 600:
+    # Anything that smells like the model deliberating instead of answering must
+    # NEVER reach the customer: a SKIP verdict anywhere in the text (it once put
+    # '**SKIP**' at the END of its reasoning and the reasoning got sent), a reply
+    # that is one big parenthesised note, or talk about its own internal rules.
+    if (not reply or len(reply) > 600
+            or re.search(r"\bSKIP\b", reply)
+            or (reply.startswith("(") and reply.endswith(")"))
+            or re.search(r"SPECIAL SITUATION|customer's last message|the colleague is handling",
+                         reply, re.IGNORECASE)):
+        if reply and not re.fullmatch(r"SKIP\.?", reply.strip(), re.IGNORECASE):
+            log.warning("Assist reply for %s suppressed as internal deliberation: %r",
+                        user, reply[:200])
         return
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
@@ -2462,6 +2504,13 @@ def _finish_reply(user: str, answer: str) -> str:
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
     answer = strip_marker_leftovers(answer)
+    # A reply that is one big parenthesised note is the model thinking out loud
+    # (it once sent '(The colleague is handling the specifics...)' to a customer).
+    # Treat it as no answer at all so the fallback + owner alert kick in.
+    if answer.strip().startswith("(") and answer.strip().endswith(")"):
+        log.warning("Reply for %s looked like internal deliberation — dropped: %r",
+                    user, answer[:200])
+        answer = ""
     if not answer.strip():
         log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
                     user, (raw_answer or "")[:300])
@@ -2690,6 +2739,22 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
     if not (text and text.strip()):
         log.info("Skipping empty message to %s", to)
         return
+    # Never send the exact same text to the same customer twice in quick
+    # succession — that is only ever a glitch (double webhook, two triggers
+    # firing together), and customers got identical doubles from it.
+    # (The reply being sent right now is often already saved a moment ago, so
+    # only rows older than 5 seconds count as an earlier, separate send.)
+    try:
+        with closing(db()) as conn:
+            dup = conn.execute(
+                "SELECT 1 FROM messages WHERE wa_user = ? AND role IN ('assistant','staff') "
+                "AND content = ? AND ts > ? AND ts < ? LIMIT 1",
+                (to, text.strip(), time.time() - 15 * 60, time.time() - 5)).fetchone()
+        if dup:
+            log.warning("Duplicate message to %s suppressed (same text within 15 min)", to)
+            return
+    except Exception:
+        pass  # the dedupe check must never stop a real send
     # Background jobs (reminders, chases, follow-ups) have no webhook context, so
     # fall back to whichever of our numbers this customer actually messages.
     if not from_phone_id and not _ctx_phone_id.get():
@@ -3288,7 +3353,8 @@ def _make_followup(user: str) -> str:
                            "reply SKIP if a follow-up is not appropriate, otherwise write it.)"}]
     raw = _call_claude(messages, FOLLOWUP_SYSTEM) or ""
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
-    if not text or text.strip().upper().startswith("SKIP"):
+    if (not text or re.search(r"\bSKIP\b", text)
+            or (text.startswith("(") and text.endswith(")"))):
         return ""
     return text
 
