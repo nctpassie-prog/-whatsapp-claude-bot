@@ -3601,7 +3601,7 @@ def _maybe_nextday(user: str, nowts: float) -> None:
             "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
             "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
             ((last_in[0] if last_in else nowts), "%" + tail)).fetchone()
-        name_row = conn.execute("SELECT name FROM customers WHERE wa_user = ?",
+        name_row = conn.execute("SELECT name FROM customers WHERE wa_number = ?",
                                 (user,)).fetchone()
     if not last or last[0] != "assistant":
         return  # customer came back — nothing to chase
