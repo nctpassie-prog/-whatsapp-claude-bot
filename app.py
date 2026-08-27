@@ -5679,14 +5679,37 @@ def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: s
         if cap:
             captions.append(cap)
     if not images:
-        send_whatsapp(
-            sender,
-            "Sorry, I couldn't open that photo. Please try sending it again, "
-            "or type out what you need and we'll help.",
-        )
+        apology = ("Sorry, I couldn't open that photo. Please try sending it again, "
+                   "or type out what you need and we'll help.")
+        send_whatsapp(sender, apology)
+        save_message(sender, "user", "[Customer sent a photo we couldn't download]")
+        save_message(sender, "assistant", apology)
+        try:
+            alert_owner(sender, "📷 Couldn't download a customer's photo",
+                        "Open WhatsApp on the phone to see what they sent and reply.")
+        except Exception:
+            log.exception("Photo-download alert failed for %s", sender)
         return
-    answer = ask_claude_image(sender, images, " ".join(captions))
-    send_whatsapp(sender, answer)
+    try:
+        answer = ask_claude_image(sender, images, " ".join(captions))
+        send_whatsapp(sender, answer)
+    except Exception:
+        # The customer must NEVER get silence after sending a photo (a fail
+        # sheet went unanswered this way — the AI reader died and nothing was
+        # saved, nobody told). Record it, apologise, and wave at the team.
+        log.exception("Photo reply failed for %s — falling back", sender)
+        try:
+            save_message(sender, "user", "[Customer sent a photo we couldn't read]")
+            fallback = ("Thanks for the photo! I'm having trouble opening it right "
+                        "now — the team will take a look and come back to you. If "
+                        "it's urgent, just type out what you need 👍")
+            send_whatsapp(sender, fallback)
+            save_message(sender, "assistant", fallback)
+            alert_owner(sender, "📷 Couldn't read a customer's photo",
+                        "The bot failed to process a photo — open the WhatsApp app "
+                        "to see it and reply.")
+        except Exception:
+            log.exception("Photo fallback also failed for %s", sender)
 
 # ---------------------------------------------------------------- voice agent (Retell)
 # The phone answerer's hands: Retell's voice agent calls these mid-conversation to
@@ -5981,6 +6004,8 @@ async def receive(request: Request, background: BackgroundTasks):
                     log.info("Blocked number %s — ignoring %s", sender, msg.get("type"))
                     continue
                 mtype = msg.get("type")
+                log.info("Inbound %s from %s on %s (id=%s)",
+                         mtype, sender, arrived_on, msg_id[-12:])
                 if mtype == "text":
                     text = msg.get("text", {}).get("body", "")
                     if sender and text:
