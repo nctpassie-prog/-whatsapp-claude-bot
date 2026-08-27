@@ -3936,7 +3936,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
-                     "waitlist", "waitlistadd", "lines", "ghosts",
+                     "waitlist", "waitlistadd", "lines", "ghosts", "geminitest",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4988,6 +4988,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "geminitest":
+        # One live Gemini call; returns the reply or the EXACT error, so quota /
+        # key / model problems are diagnosable without reading tracebacks.
+        try:
+            out = _call_gemini([{"role": "user", "content": "Reply with exactly: OK"}],
+                               "You are a test.")
+            return {"ok": True, "reply": out[:100], "model": GEMINI_MODEL}
+        except httpx.HTTPStatusError as exc:
+            return {"ok": False, "status": exc.response.status_code,
+                    "body": exc.response.text[:600], "model": GEMINI_MODEL}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:400], "model": GEMINI_MODEL}
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
         # the fingerprint of an inbound that died unsaved (photo reader crash
