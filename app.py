@@ -536,11 +536,13 @@ def send_invoice_template(to: str, fields: dict, user: str) -> bool:
         return False
 
 def send_invoice_request(user: str, fields: dict) -> None:
-    """Email the accountant a customer's invoice request, and note it on Telegram.
+    """Send a customer's invoice request to the accountant's PHONE, note on Telegram.
 
+    Owner's rule 2026-08-28: the accountant gets too many emails — invoice
+    requests always go to her WhatsApp. Email is only the emergency fallback
+    when the WhatsApp template cannot be confirmed, so a request is never lost.
     The customer's WhatsApp number rides along automatically — the bot never asks
     for a phone number."""
-    to = get_setting("invoice_email", "").strip()
     body = (
         "Invoice request from a WhatsApp customer:\n\n"
         f"Make out to: {fields.get('name', '(not given)')}\n"
@@ -550,31 +552,31 @@ def send_invoice_request(user: str, fields: dict) -> None:
         f"Customer phone: +{user}\n\n"
         f"Conversation: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}&user={user}\n"
     )
-    ok, err = (False, "no accountant email configured")
-    if to:
-        ok, err = send_email(f"Invoice request — {fields.get('reg', '')} "
-                             f"{fields.get('name', '')}", body, to=to)
-    if not ok:
-        log.warning("Invoice email not sent (%s) — falling back to owner email", err)
-        send_email(f"Invoice request — {fields.get('reg', '')}", body)
-    # Best-effort WhatsApp copy to the accountant. Business-initiated WhatsApp only
-    # delivers inside a 24h window of the recipient's last message, so this works
-    # when the accountant chats with the line; email above is the reliable channel.
     wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
+    delivered = False
     if wa:
-        # Template first (deliverable any time once approved); plain message as a
-        # bonus copy — it only lands inside her 24h reply window.
-        if not send_invoice_template(wa, fields, user):
-            log.warning("Invoice template not delivered — trying plain message")
+        # Template first — an approved template delivers any time; the plain-text
+        # copy with the full details lands whenever her 24h reply window is open.
+        delivered = bool(send_invoice_template(wa, fields, user))
         try:
             send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body)
         except Exception:
             log.exception("Invoice WhatsApp to accountant failed")
+    if not delivered:
+        # WhatsApp could not be confirmed — email so the request isn't lost.
+        to = get_setting("invoice_email", "").strip()
+        ok, err = (False, "no accountant email configured")
+        if to:
+            ok, err = send_email(f"Invoice request — {fields.get('reg', '')} "
+                                 f"{fields.get('name', '')}", body, to=to)
+        if not ok:
+            log.warning("Invoice email not sent (%s) — falling back to owner email", err)
+            send_email(f"Invoice request — {fields.get('reg', '')}", body)
     send_telegram("🧾 Invoice request\n"
                   f"{fields.get('name', '?')} — {fields.get('reg', '?')}\n"
                   f"Email: {fields.get('email', '?')}\n"
-                  + ("Sent to accountant ✓" if ok and to else
-                     "⚠️ No accountant email set — sent to your own inbox instead"))
+                  + ("Sent to Lenka's WhatsApp ✓" if delivered else
+                     "⚠️ WhatsApp didn't go — emailed as backup instead"))
 
 def process_cancel(answer: str):
     """Pull the hidden cancellation marker out of the reply."""
