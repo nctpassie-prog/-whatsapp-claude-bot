@@ -1644,7 +1644,7 @@ def availability_block() -> str:
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     lines = []
-    for i in range(14):
+    for i in range(28):
         d = start + timedelta(days=i)
         cap = day_capacity(d)
         if cap == 0:
@@ -1662,7 +1662,8 @@ def availability_block() -> str:
             lines.append(f"{d.strftime('%a %d %b')}: FULL")
         elif other_left == 0 and d.weekday() < 5:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left — "
-                         "SERVICES / NCT REPAIRS / BRAKES ONLY (other jobs can "
+                         "GOOD JOBS ONLY — service/NCT/brakes/DPF/timing belt/"
+                         "clutch/headlights (other jobs can "
                          "only book within 2 days of the date — offer them a "
                          "day that is at most 2 days away)")
         else:
@@ -1685,15 +1686,18 @@ def availability_block() -> str:
                   "When you say a day name with a date, it MUST match this calendar and "
                   "the availability list — never compute weekdays yourself.")
     return (today_line + opening_note +
-        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE MONEY JOBS — general "
-        "services, NCT repairs and brakes — can be booked on ANY open day, as far ahead as the "
-        "list goes. EVERY OTHER JOB (diagnostics, wheel bearings, AC, remaps, timing belts, "
+        "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. THE GOOD JOBS — general "
+        "services, NCT repairs, brakes, DPF work, timing belts/cambelts, clutches and "
+        "headlight repairs — can be booked on ANY open weekday, as far ahead as the "
+        "list goes (and for a GOOD job even beyond this list: any future weekday is "
+        "bookable — never claim a far date is full unless the list says FULL). "
+        "EVERY OTHER JOB (diagnostics, wheel bearings, AC, remaps, "
         "anything else) can ONLY be booked within 2 days of the date: when a day shows "
-        "SERVICES / NCT REPAIRS / BRAKES ONLY, do not book other work on it — offer those "
+        "GOOD JOBS ONLY, do not book other work on it — offer those "
         "customers today, tomorrow or the day after (whichever shows space open to any job). "
         "Always trust the numbers in the list. Saturday is GENERAL SERVICES "
         "ONLY, up to 4 cars (no repairs on Saturday); closed Sunday. Slots already booked are "
-        "counted. Next 2 weeks:\n" + "\n".join(lines) +
+        "counted. Next 4 weeks:\n" + "\n".join(lines) +
         "\n\nDIAGNOSTIC JOBS (unknown noises, leaks, warning lights, misfires, 'can you check "
         "it over') additionally take AT MOST 2 slots per day — when a day shows 0 diagnostic "
         "slots, do NOT book a diagnostic on it even if other slots remain: offer the nearest "
@@ -5851,8 +5855,9 @@ async def retell_function(request: Request):
         today = now_local().date()
         return {"today": f"{today.strftime('%A %d %B %Y')}",
                 "open_days": _voice_availability(),
-                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Services, "
-                         "NCT repairs and brakes book any open day (slots_for_"
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. GOOD JOBS - "
+                         "services, NCT repairs, brakes, DPF, timing belts, clutches, "
+                         "headlight repairs - book any open day (slots_for_"
                          "services_nct_brakes). ALL other jobs can only book within "
                          "2 days of the date - they need slots_for_other_jobs, and "
                          "diagnostics (noises, leaks, warning lights, fault-finding) "
