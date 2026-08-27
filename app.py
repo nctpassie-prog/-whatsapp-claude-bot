@@ -646,12 +646,25 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
             if day_is_full(freed_date, need):
                 continue  # day won't take THIS job (e.g. diag quota) — try next waiter
             nice = datetime.strptime(freed_date, "%Y-%m-%d").strftime("%A %d %B")
-            old = datetime.strptime(booked, "%Y-%m-%d").strftime("%A %d %B")
             first = (name or "").strip().split(" ")[0]
+            # Only mention their current booking if it's a REAL near-term one —
+            # manual waitlistadd entries carry a far-future anchor date that a
+            # customer must never see ("your booking on Monday 26 October").
+            real_booking = ""
+            try:
+                days_out = (datetime.strptime(booked, "%Y-%m-%d").date()
+                            - now_local().date()).days
+                if days_out <= 45:
+                    old = datetime.strptime(booked, "%Y-%m-%d").strftime("%A %d %B")
+                    real_booking = f", earlier than your booking on {old}"
+            except Exception:
+                pass
+            action_bit = (f"move your {car or 'car'} to {nice}" if real_booking
+                          else f"book your {car or 'car'} in for {nice}")
             msg = (f"Good news{', ' + first if first else ''} — a slot has just freed "
-                   f"up on {nice}, earlier than your booking on {old}! Would you like "
-                   f"me to move your {car or 'car'} to {nice}? Just reply YES and "
-                   "I'll switch it — drop-off between 9 and 11am as usual 👍")
+                   f"up on {nice}{real_booking}! Would you like me to {action_bit}? "
+                   "Just reply YES and I'll sort it — drop-off between 9 and 11am "
+                   "as usual 👍")
             send_whatsapp(digits, msg)
             save_message(digits, "assistant", msg)
             with closing(db()) as conn, conn:
