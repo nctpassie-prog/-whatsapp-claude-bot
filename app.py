@@ -3998,7 +3998,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -4699,6 +4699,19 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         send_whatsapp(digits, text)
         save_message(digits, "assistant", text)
         return {"sent": True, "to": digits, "text": text}
+    if action == "invoicereq":
+        # Send a REAL invoice request to the accountant through the normal
+        # pipeline (approved WhatsApp template — delivers outside the 24h window
+        # — plus email + Telegram note). ?phone=<customer>&name=<make out to>
+        # &reg=<reg>&need=<job/amount>&car=<email to send the invoice to>.
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if not digits or not (name or reg):
+            return {"error": "need phone and at least name or reg"}
+        send_invoice_request(digits, {"name": name, "reg": reg,
+                                      "email": car, "job": need})
+        return {"sent": True, "customer": digits,
+                "accountant_wa": get_setting("invoice_whatsapp", "") or "(unset)",
+                "accountant_email": get_setting("invoice_email", "") or "(owner inbox fallback)"}
     if action == "invoicetest":
         # Send a demo invoice request through the real pipeline.
         send_invoice_request("353860000000", {
