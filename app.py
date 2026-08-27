@@ -1566,15 +1566,15 @@ def next_day_for_job(need: str, not_before: str = "") -> str:
 
 # The honest message when a day's hard-job quota is used up.
 HARD_FULL_MSG = {
-    "en": "That day is already full for diagnostic and heavier repair work. 🙏 "
-          "The nearest day I can offer for this kind of job is {alt} — would that suit?",
-    "ru": "На этот день уже нет мест для диагностики и сложного ремонта. 🙏 "
-          "Ближайший день для такой работы — {alt}. Подойдёт?",
-    "lt": "Tą dieną diagnostikos ir sudėtingesnio remonto vietų nebėra. 🙏 "
-          "Artimiausia diena tokiam darbui — {alt}. Ar tiktų?",
-    "ro": "În ziua respectivă nu mai sunt locuri pentru diagnosticare și reparații "
-          "complexe. 🙏 Cea mai apropiată zi pentru o astfel de lucrare este "
-          "{alt} — vă convine?",
+    "en": "Sorry — that day is already fully booked for this kind of work. 🙏 "
+          "The nearest day I can offer you is {alt} — would that suit?",
+    "ru": "К сожалению, на этот день записи для такой работы уже нет. 🙏 "
+          "Ближайший день, который могу предложить — {alt}. Подойдёт?",
+    "lt": "Deja, tą dieną tokiam darbui vietų nebėra. 🙏 "
+          "Artimiausia diena, kurią galiu pasiūlyti — {alt}. Ar tiktų?",
+    "ro": "Ne pare rău — în ziua respectivă nu mai sunt locuri pentru acest tip de "
+          "lucrare. 🙏 Cea mai apropiată zi pe care o pot oferi este {alt} — "
+          "vă convine?",
 }
 
 # Templated "that day is full" message, per language (used when a booking hits a full day).
@@ -1685,8 +1685,12 @@ def availability_block() -> str:
         "Next 4 weeks:\n" + "\n".join(lines) +
         "\n\nNever tell a customer a day is full when the list shows space for their kind "
         "of job, and never invent availability beyond this list — for dates past the list, "
-        "a GOOD easy job can still be booked; for hard jobs offer the latest listed day "
-        "with hard space instead.")
+        "an easy job can still be booked; for hard jobs offer the latest listed day "
+        "with hard space instead. STRICTLY INTERNAL: never reveal ANY of this system to "
+        "customers — never mention quotas, 'hard jobs', 'easy jobs', or that certain days "
+        "are kept for services. When their day doesn't work for their job, say ONLY that "
+        "the day is already fully booked for that kind of work and offer the nearest day "
+        "that suits — nothing about why.")
 
 def already_seen(msg_id: str) -> bool:
     with closing(db()) as conn, conn:
