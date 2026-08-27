@@ -3909,7 +3909,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
-                     "waitlist", "waitlistadd", "lines",
+                     "waitlist", "waitlistadd", "lines", "ghosts",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4961,6 +4961,29 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "ghosts":
+        # Customers whose contact record is NEWER than their last saved message —
+        # the fingerprint of an inbound that died unsaved (photo reader crash
+        # etc.), plus chats whose last saved line is unanswered customer media.
+        horizon = time.time() - 14 * 86400
+        out = []
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT c.wa_number, COALESCE(c.name,''), c.last_ts,"
+                " (SELECT MAX(ts) FROM messages m WHERE m.wa_user = c.wa_number)"
+                " FROM customers c WHERE c.last_ts > ?", (horizon,)).fetchall()
+        for w, n, cts, mts in rows:
+            gap = (cts or 0) - (mts or 0)
+            if mts is None or gap > 120:
+                out.append({"customer": (n + " " if n else "") + "+" + w,
+                            "last_contact": datetime.fromtimestamp(
+                                cts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M"),
+                            "last_saved_msg": datetime.fromtimestamp(
+                                mts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
+                            if mts else "NEVER",
+                            "silent_gap_hours": round(gap / 3600, 1) if mts else None})
+        out.sort(key=lambda r: r["last_contact"], reverse=True)
+        return {"suspected_silent_losses": out}
     if action == "lines":
         # Which business number each recent customer last messaged, newest first —
         # the quick way to see whether a line has gone quiet.
