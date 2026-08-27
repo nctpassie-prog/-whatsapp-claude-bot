@@ -641,11 +641,14 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
             return  # same-day swaps are the team's call, not the bot's
         skip = "".join(ch for ch in str(skip_phone) if ch.isdigit())[-9:]
         with closing(db()) as conn:
+            # One offer per customer per 20h — a burst of cancellations must
+            # never turn into a burst of "good news!" messages to one person.
             rows = conn.execute(
                 "SELECT id, phone, name, car, reg, need, booked_date FROM waitlist "
                 "WHERE status IN ('waiting','offered') AND booked_date > ? "
-                "AND offered_date != ? ORDER BY created_ts",
-                (freed_date, freed_date)).fetchall()
+                "AND offered_date != ? AND COALESCE(offered_ts, 0) < ? "
+                "ORDER BY created_ts",
+                (freed_date, freed_date, time.time() - 20 * 3600)).fetchall()
         for wid, phone, name, car, reg, need, booked in rows:
             digits = "".join(ch for ch in str(phone) if ch.isdigit())
             if not digits or is_blocked(digits) or (skip and digits.endswith(skip)):
@@ -3923,7 +3926,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
-                     "waitlist", "waitlistadd", "lines", "ghosts", "geminitest", "avail",
+                     "waitlist", "waitlistadd", "waitlistremove", "lines", "ghosts", "geminitest", "avail",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -5059,6 +5062,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                          "need": need, "date": booked, "wanted": wanted})
         return {"added": True, "phone": digits, "wanted": wanted,
                 "anchor_booking": booked}
+    if action == "waitlistremove":
+        # Take a customer off the cancellation list (?phone=): sorted elsewhere,
+        # passed their NCT, or just doesn't want the offers.
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if not digits:
+            return {"error": "need phone"}
+        with closing(db()) as conn, conn:
+            n = conn.execute(
+                "UPDATE waitlist SET status='done' WHERE phone LIKE ? "
+                "AND status IN ('waiting','offered')",
+                ("%" + digits[-9:],)).rowcount
+        return {"removed": n, "phone": digits}
     if action == "waitlist":
         # Who is waiting for an earlier slot, and who has an open offer.
         with closing(db()) as conn:
