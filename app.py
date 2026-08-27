@@ -3909,7 +3909,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
-                     "waitlist", "waitlistadd",
+                     "waitlist", "waitlistadd", "lines",
                      # Hands a staff-stalled chat back to the bot; no more exposing
                      # than sendmsg, which is already allowed above.
                      "botresume"}
@@ -4961,6 +4961,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "calendar_id": GOOGLE_CALENDAR_ID,
                 "ready": google_enabled(),
                 "connect_url": f"{PUBLIC_URL.rstrip('/')}/google/connect?token=<VERIFY_TOKEN>"}
+    if action == "lines":
+        # Which business number each recent customer last messaged, newest first —
+        # the quick way to see whether a line has gone quiet.
+        label = {"1314437165075333": "085", "335852741443330": "086"}
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_number, COALESCE(name,''), COALESCE(last_phone_id,''),"
+                " last_ts FROM customers WHERE last_ts IS NOT NULL"
+                " ORDER BY last_ts DESC LIMIT 60").fetchall()
+        out = [{"customer": (n + " " if n else "") + "+" + w,
+                "line": label.get(p, p or "?"),
+                "last_inbound": datetime.fromtimestamp(
+                    ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
+                if ts else "?"} for w, n, p, ts in rows]
+        newest085 = next((r for r in out if r["line"] == "085"), None)
+        return {"newest_on_085": newest085, "recent": out}
     if action == "waitlistadd":
         # Manually put a customer on the cancellation list.
         # ?phone=...&date=<earlier day they WANT>&car=...&reg=...&name=...&need=...
