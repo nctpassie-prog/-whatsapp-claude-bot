@@ -1515,6 +1515,9 @@ def is_diagnostic_job(need: str) -> bool:
 # the 4-week horizon); when a day's hard quota is used, offer the nearest day
 # that still has hard space.
 HARD_JOBS_PER_DAY = int(os.environ.get("HARD_JOBS_PER_DAY", "4"))
+# A hard job only books onto a day that still has this many free slots — a
+# nearly-full day keeps its tail for easy service work.
+HARD_NEEDS_FREE_SLOTS = int(os.environ.get("HARD_NEEDS_FREE_SLOTS", "4"))
 _HARD_RE = re.compile(
     r"injector|turbo|clutch|flywheel|gearbox|transmission|wheel bearing|"
     r"suspension|shock|coil spring|axle|electric|emission|head gasket|"
@@ -1542,12 +1545,17 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     with closing(db()) as conn:
         n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?",
                          (date_str,)).fetchone()[0]
-    if n >= day_capacity(d):
+    cap = day_capacity(d)
+    if n >= cap:
         return "capacity"
     if need and is_hard_job(need):
         if d.weekday() == 5:
             return "hard"  # Saturday is general services only
         if _hard_count(date_str) >= HARD_JOBS_PER_DAY:
+            return "hard"
+        # Owner 2026-08-27: a nearly-booked day keeps its LAST slots for easy
+        # work — hard jobs only go onto days with plenty of room left.
+        if cap - n < HARD_NEEDS_FREE_SLOTS:
             return "hard"
     return ""
 
@@ -1654,6 +1662,8 @@ def availability_block() -> str:
         iso = d.isoformat()
         left = max(0, cap - taken.get(iso, 0))
         hard_left = max(0, HARD_JOBS_PER_DAY - hard.get(iso, 0))
+        if left < HARD_NEEDS_FREE_SLOTS:
+            hard_left = 0  # nearly-full day: remaining slots are for easy work
         if left == 0:
             lines.append(f"{d.strftime('%a %d %b')}: FULL")
         elif d.weekday() == 5:
@@ -5823,7 +5833,7 @@ def _voice_availability() -> str:
         left = max(0, cap - taken.get(iso, 0))
         if left == 0:
             continue
-        hard_left = 0 if d.weekday() == 5 else min(
+        hard_left = 0 if (d.weekday() == 5 or left < HARD_NEEDS_FREE_SLOTS) else min(
             left, max(0, HARD_JOBS_PER_DAY - hard.get(iso, 0)))
         out.append({"date": iso, "day": d.strftime("%A"),
                     "slots_for_services_nct_brakes": left,
