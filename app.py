@@ -1958,7 +1958,7 @@ def _maybe_courtesy_close(user: str) -> None:
                                    "the customer's last message — answer the simple "
                                    "thing or close warmly, else SKIP.)"}],
                        system_prompt) or ""
-    reply = re.sub(r"<<<.*?>>>", "", raw).strip()
+    reply = strip_marker_leftovers(raw)
     if not reply or reply.upper().startswith("SKIP") or len(reply) > 600:
         return
     send_whatsapp(user, reply)
@@ -2274,6 +2274,16 @@ def visible_text(answer: str) -> str:
     """What the customer would actually see once the hidden markers are removed."""
     return ALL_MARKERS_RE.sub("", answer or "").strip()
 
+# The model sometimes closes a marker with '>>' instead of '>>>' — one such
+# HANDOVER marker sailed past the strict regexes and was SENT to a customer
+# (Francis, 24 Aug). This catches any marker-ish debris however it's closed.
+LENIENT_MARKER_RE = re.compile(r"<<<[A-Z]+\|.*?(?:>>>|>>|>|$)", re.DOTALL)
+
+def strip_marker_leftovers(text: str) -> str:
+    out = LENIENT_MARKER_RE.sub("", text or "")
+    out = re.sub(r"\n\s*[.…]\s*$", "", out)  # stripped markers leave lone dots behind
+    return out.strip()
+
 RETRY_NUDGE = (
     "\n\nIMPORTANT: your previous attempt contained NO visible message for the customer. "
     "Reply now with a normal, complete, friendly message in plain words. Do NOT output any "
@@ -2424,6 +2434,7 @@ def _finish_reply(user: str, answer: str) -> str:
     # Safety net: if the visible reply came out blank (e.g. Claude returned only a
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
+    answer = strip_marker_leftovers(answer)
     if not answer.strip():
         log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
                     user, (raw_answer or "")[:300])
