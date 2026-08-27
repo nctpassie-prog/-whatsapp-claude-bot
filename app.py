@@ -4991,6 +4991,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "geminitest":
         # One live Gemini call; returns the reply or the EXACT error, so quota /
         # key / model problems are diagnosable without reading tracebacks.
+        # ?need=<model> probes a specific model instead of the configured one.
+        global GEMINI_MODEL
+        probe = (need or "").strip()
+        saved_model = GEMINI_MODEL
+        if probe:
+            GEMINI_MODEL = probe
         try:
             out = _call_gemini([{"role": "user", "content": "Reply with exactly: OK"}],
                                "You are a test.")
@@ -5000,6 +5006,8 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "body": exc.response.text[:600], "model": GEMINI_MODEL}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400], "model": GEMINI_MODEL}
+        finally:
+            GEMINI_MODEL = saved_model
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
         # the fingerprint of an inbound that died unsaved (photo reader crash
