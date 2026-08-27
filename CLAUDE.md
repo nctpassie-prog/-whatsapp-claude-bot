@@ -33,12 +33,14 @@ Hours Mon–Fri 9–18, Sat 9–14 (Saturday = general services only), Sun close
 - Booking order: problem → day → car+reg → name. Never ask for the phone number.
 - Capacity 10/day Mon–Fri, Saturday 4 services-only, Sunday closed.
   (BOOKINGS_FROM gate dropped 2026-08-27 — any open day is bookable.)
-- GOOD JOBS (book any day ahead): services/oil, NCT repairs/retest/fail,
-  brakes, DPF, timing belt/chain, cambelt, clutch, flywheel. Everything else
-  books only within AHEAD_ONLY_DAYS=2 of the date (honest AHEAD_ONLY_MSG, not
-  "fully booked"). Pure diagnostics capped at DIAG_SLOTS_PER_DAY=2 (good jobs
-  that include a diagnosis don't count). Re-confirmations of bookings already
-  in the diary skip all gates (booking_already_in_diary).
+- HARD-JOB QUOTA (owner's rule 2026-08-27, replaced the old book-ahead system):
+  ANY job books any open day up to 4 weeks ahead. HARD JOBS — diagnostics,
+  injectors, turbo, clutch, engine work/noise, electrical, suspension, gearbox,
+  wheel bearings (is_hard_job) — max HARD_JOBS_PER_DAY=4 per day and never on
+  Saturday; the rest of each day is kept hunting easy service work. Hard-full
+  day → honest HARD_FULL_MSG naming the nearest day with hard space.
+  ?action=avail shows the exact calendar text the AI sees.
+  Re-confirmations of bookings already in the diary skip all gates.
 - Prices always "from X plus VAT"; parts brand affects price; no discounts
   (one joke max, then soft handover). Free pre-NCT check WITH a service only.
 - Wages/mechanic data NEVER to shared Telegram or WhatsApp — owner's private
