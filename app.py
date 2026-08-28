@@ -758,12 +758,22 @@ def notify_owner_booking(fields: dict) -> None:
     reg = fields.get("reg", "")
     need = fields.get("need", "")
     when = fields.get("time", "")
+    date_str = fields.get("date", "")
     name = fields.get("name", "")
     phone = fields.get("phone", "")
+    # The date field is the one always guaranteed to be a real calendar date —
+    # 'time' is free text the model wrote and can be blank (e.g. a manually
+    # logged addbooking), which once left this note with no date on it at all.
+    date_label = date_str
+    try:
+        date_label = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a %d %b")
+    except Exception:
+        pass
     summary = (
         f"Car: {car}\n"
         f"Reg: {reg}\n"
         f"Need: {need}\n"
+        f"Date: {date_label or '(not given)'}\n"
         f"Preferred: {when}\n"
         f"Name: {name}\n"
         f"Phone: {phone}\n"
@@ -775,7 +785,10 @@ def notify_owner_booking(fields: dict) -> None:
         in_calendar = create_calendar_event(fields)
     except Exception:
         log.exception("Calendar event creation failed")
-    note = "\U0001F514 New booking request\n\n" + summary
+    header = "\U0001F514 New booking request"
+    if "comeback" in need.lower():
+        header = "⚠️ COMEBACK — may need to jump the queue\n" + header
+    note = header + "\n\n" + summary
     if in_calendar:
         note += "\n\n\U0001F4C5 Added to your bookings calendar automatically."
     else:
@@ -2154,10 +2167,18 @@ def customer_context(user: str) -> str:
     name = (cust[0] if cust else "") or ""
     reg = (cust[1] if cust else "") or ""
     past = []
+    today = now_local().date()
     for d, car, r, need, phone in rows:
         pdigits = "".join(ch for ch in (phone or "") if ch.isdigit())
         if (tail and pdigits.endswith(tail)) or (reg and r and r == reg):
-            past.append(f"{d}: {' '.join(x for x in (car, r) if x)} - {need}".strip())
+            ago = ""
+            try:
+                days = (today - datetime.strptime(d, "%Y-%m-%d").date()).days
+                if 0 <= days <= 14:
+                    ago = f" ({days} day{'s' if days != 1 else ''} ago)"
+            except Exception:
+                pass
+            past.append(f"{d}{ago}: {' '.join(x for x in (car, r) if x)} - {need}".strip())
     if not (name or reg or past):
         return ""  # brand new customer, nothing to add
     out = ["\n\nWHAT WE ALREADY KNOW ABOUT THIS CUSTOMER (internal — use it naturally, "
@@ -2173,6 +2194,14 @@ def customer_context(user: str) -> str:
                    "refer to their car naturally, e.g. \"good to hear from you again\". Do not "
                    "recite their history at them, and do not ask again for details we already "
                    "have — confirm instead, e.g. \"still the Yaris, 12D3456?\".")
+        out.append("COMEBACK CHECK (important): if what they're describing now sounds like the "
+                   "SAME or a related problem to one of the bookings above from the last two "
+                   "weeks, this is very likely a COMEBACK — the earlier work didn't fully fix "
+                   "it (e.g. a noise/fault that 'came back' or 'is still there'). For a comeback: "
+                   "never tell them the day is fully booked to push them further out — offer the "
+                   "soonest day the calendar shows, same as any other job. When you write the "
+                   "final BOOKING line, start the need= field with 'COMEBACK - ' so the team "
+                   "sees it immediately and can decide whether it's a free warranty visit.")
     if charges:
         out.append("- What we charged them before (INTERNAL ONLY — never quote these back "
                    "as today's price):")
