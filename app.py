@@ -2578,6 +2578,17 @@ def _finish_reply(user: str, answer: str) -> str:
         # A re-confirmation of a booking already in the diary sails past every
         # gate — save_booking dedupes it silently and the answer stays intact.
         already_booked = booking_already_in_diary(booking)
+        # Owner's rule: NEVER finalize a booking without both the car make/model
+        # AND the registration — this also catches website-form submissions,
+        # which arrive pre-filled with everything EXCEPT the car (the form has
+        # no make/model field), so the model must never treat that as complete.
+        if not is_owner and not already_booked and not (booking.get("car", "").strip()
+                                                          and clean_reg(booking.get("reg", ""))):
+            missing = "the car make and model" if not booking.get("car", "").strip() else "the registration number"
+            log.info("Booking for %s rejected: missing %s", booking.get("date"), missing)
+            answer = f"Just before I book you in — could I get {missing} please? 👍"
+            save_message(user, "assistant", answer)
+            return answer
         # Hard safety net: never confirm a booking on a day that is already full.
         # (Owner can override capacity when logging their own manual bookings.)
         # Not open for bookings yet (owner can still log their own).
@@ -6200,6 +6211,12 @@ async def retell_function(request: Request):
                   "wanted": (args.get("wanted") or "").strip()}
         if not fields["date"]:
             return {"booked": False, "reason": "no date given"}
+        # Owner's rule: NEVER finalize a booking without both the car make/model
+        # AND the registration — ask the caller for whichever is still missing.
+        if not fields["car"]:
+            return {"booked": False, "reason": "still need the car make and model before I can book this"}
+        if not clean_reg(fields["reg"]):
+            return {"booked": False, "reason": "still need the car registration number before I can book this"}
         added = save_booking(fields)
         if added:
             try:
