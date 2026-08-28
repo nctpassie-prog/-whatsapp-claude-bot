@@ -497,6 +497,84 @@ def create_calendar_event(fields: dict) -> bool:
 
 CANCEL_RE = re.compile(r"<<<CANCEL\|(.*?)>>>", re.DOTALL)
 INVOICE_RE = re.compile(r"<<<INVOICE\|(.*?)>>>", re.DOTALL)
+RECOVERY_RE = re.compile(r"<<<RECOVERY\|(.*?)>>>", re.DOTALL)
+
+def process_recovery(answer: str):
+    """Pull the hidden recovery/tow-truck request marker out of the reply."""
+    m = RECOVERY_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = RECOVERY_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k.strip().lower()] = v.strip()
+    return clean, fields
+
+RECOVERY_TEMPLATE = "recovery_pickup_request"
+# Owner's own number for Dublin Brothers Recovery — set once via
+# ?action=recoverynumber&date=<phone>, defaults to the number already
+# published to customers in business_info.md.
+DEFAULT_RECOVERY_WHATSAPP = "353830290103"
+
+def send_recovery_template(to: str, fields: dict) -> bool:
+    """Template message to the recovery company — deliverable at ANY time, no
+    24h window. This is the ONLY reliable way to reach a number that has never
+    messaged the business first (a plain text send fails with error 131047)."""
+    params = [fields.get("name") or "(no name)",
+              fields.get("phone") or "-",
+              fields.get("car") or "(not given)",
+              fields.get("reg") or "-",
+              fields.get("address") or "(not given)",
+              fields.get("when") or "as soon as possible"]
+    try:
+        url, tok = send_endpoint(phone_id_for_customer(to))
+        r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
+                       json={"messaging_product": "whatsapp", "to": to,
+                             "type": "template",
+                             "template": {"name": RECOVERY_TEMPLATE,
+                                          "language": {"code": "en"},
+                                          "components": [{"type": "body",
+                                                          "parameters": [{"type": "text", "text": p}
+                                                                         for p in params]}]}},
+                       timeout=30)
+        if r.status_code >= 300:
+            log.warning("Recovery template send failed %s: %s", r.status_code, (r.text or "")[:300])
+        return r.status_code < 300
+    except Exception:
+        log.exception("Recovery template send failed")
+        return False
+
+def send_recovery_request(user: str, fields: dict) -> None:
+    """A car needs to be towed in — ping the recovery company's WhatsApp with
+    the pickup details, every time, automatically. Uses the approved template
+    first (works even if they've never messaged us — the normal case), falls
+    back to a plain-text copy for when their reply window happens to be open,
+    and always tells the owner on Telegram either way so nothing silently
+    fails to reach anyone."""
+    to = "".join(ch for ch in (get_setting("recovery_whatsapp", "") or DEFAULT_RECOVERY_WHATSAPP)
+                 if ch.isdigit())
+    body = (
+        "Hi, NCTPass here — could you collect a car for us please?\n\n"
+        f"Customer: {fields.get('name', '(no name)')}, {fields.get('phone', '')}\n"
+        f"Car: {fields.get('car', '(not given)')}, reg {fields.get('reg', '-')}\n"
+        f"Pickup address: {fields.get('address', '(not given)')}\n"
+        f"Bring to: NCTPass, Unit 6, Old Quarry Campus, Blanchardstown, Dublin 15, D15 HX03\n\n"
+        f"When: {fields.get('when', 'as soon as possible')}"
+    )
+    delivered = bool(send_recovery_template(to, fields)) if to else False
+    try:
+        send_whatsapp(to, body)
+    except Exception:
+        log.exception("Recovery plain-text copy failed")
+    try:
+        send_telegram("🚚 Recovery request sent\n\n" + body
+                      + ("\n\nDelivered via approved template ✓" if delivered else
+                         "\n\n⚠️ Template not confirmed delivered — please also call "
+                         "Dublin Brothers directly to be sure."))
+    except Exception:
+        log.exception("Failed to notify owner of recovery request")
 
 def process_invoice(answer: str):
     """Pull the hidden invoice-request marker out of the reply."""
@@ -2543,6 +2621,13 @@ def _finish_reply(user: str, answer: str) -> str:
             send_invoice_request(user, invoice)
         except Exception:
             log.exception("Failed to process invoice request for %s", user)
+    answer, recovery = process_recovery(answer)
+    if recovery:
+        recovery.setdefault("phone", "+" + user)
+        try:
+            send_recovery_request(user, recovery)
+        except Exception:
+            log.exception("Failed to process recovery request for %s", user)
     answer, cancel = process_cancel(answer)
     if cancel and not is_owner:
         try:
@@ -4084,7 +4169,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -4681,6 +4766,53 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 (time.time() - days * 86400,)).fetchall()
         return {"summary": followup_week_stats(days),
                 "log": [{"user": u, "kind": k, "at": t} for u, k, t in recent]}
+    if action == "mkrecoverytemplate":
+        # One-time setup: submit the recovery-pickup-request template on both
+        # WABAs so send_recovery_request() can always reach Dublin Brothers (or
+        # whoever the recovery company is) even though they've never messaged
+        # the business number first — a plain-text send always fails with
+        # error 131047 in that case.
+        text_ = ("Hi, NCTPass here — could you collect a car for us please? "
+                 "Customer: {{1}}, {{2}}. Car: {{3}}, reg {{4}}. Pickup address: "
+                 "{{5}}. When: {{6}}. Bring to NCTPass, Unit 6, Old Quarry "
+                 "Campus, Blanchardstown, Dublin 15, D15 HX03. Thanks!")
+        example = ["Philip Baker", "086 310 9093", "Jaguar XF 2017", "171D53210",
+                   "W91Y8PC, key on driver seat", "Monday morning"]
+        wabas = ["1713722639843344", "236685551234423"]
+        out = []
+        for waba in wabas:
+            payload = {
+                "name": RECOVERY_TEMPLATE,
+                "language": "en",
+                "category": "UTILITY",
+                "components": [{"type": "BODY", "text": text_,
+                                "example": {"body_text": [example]}}],
+            }
+            try:
+                r = httpx.post(f"https://graph.facebook.com/{WA_API_VERSION}/{waba}/"
+                               "message_templates",
+                               headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                               json=payload, timeout=30)
+                out.append({"waba": waba[-6:], "http": r.status_code, "body": (r.text or "")[:300]})
+            except Exception as exc:
+                out.append({"waba": waba[-6:], "error": str(exc)[:200]})
+        return {"template": RECOVERY_TEMPLATE, "results": out}
+    if action == "recoverynumber":
+        # View or set the recovery company's WhatsApp number.
+        # ?action=recoverynumber&date=<phone> to set it.
+        want = (date or "").strip()
+        if want:
+            set_setting("recovery_whatsapp", want)
+        return {"recovery_whatsapp": get_setting("recovery_whatsapp", "") or DEFAULT_RECOVERY_WHATSAPP}
+    if action == "recoveryreq":
+        # Manually trigger a recovery request (owner/staff arranged it outside
+        # the normal customer chat flow). ?name=&phone=&car=&reg=&need=<address>
+        if not (name and (phone or need)):
+            return {"error": "need at least name and (phone or need=address)"}
+        fields = {"name": name, "phone": phone, "car": car, "reg": reg,
+                  "address": need, "when": date or "as soon as possible"}
+        send_recovery_request((phone or "").lstrip("+"), fields)
+        return {"sent": True, "fields": fields}
     if action == "mktemplate":
         # Create the appointment reminder template on every WhatsApp account we send
         # from, in each language our customers speak. Templates live per-account AND
