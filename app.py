@@ -6138,6 +6138,30 @@ async def retell_call_report(request: Request):
         log.exception("Hang-up text-back failed")
     return {"ok": True}
 
+# Two messages from the same customer landing moments apart (e.g. "yes" then
+# "thanks" seconds later, or a photo followed instantly by a caption) each
+# fire their own background task. Unsynchronized, both read the SAME chat
+# history at once, neither sees what the other is about to say, and each
+# calls Claude independently — the customer then gets two separate, sometimes
+# CONTRADICTORY replies (two different guesses about one photo, two different
+# prices a minute apart). This forces every inbound event for one customer to
+# be handled one at a time, in order, so the second one always sees the
+# first's finished reply before it starts.
+_user_locks: dict[str, threading.Lock] = {}
+_user_locks_guard = threading.Lock()
+
+def _get_user_lock(user: str) -> threading.Lock:
+    with _user_locks_guard:
+        lock = _user_locks.get(user)
+        if lock is None:
+            lock = threading.Lock()
+            _user_locks[user] = lock
+        return lock
+
+def _serialized(user: str, fn, *args, **kwargs) -> None:
+    with _get_user_lock(user):
+        fn(*args, **kwargs)
+
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
@@ -6257,31 +6281,33 @@ async def receive(request: Request, background: BackgroundTasks):
                 if mtype == "text":
                     text = msg.get("text", {}).get("body", "")
                     if sender and text:
-                        background.add_task(handle_message, sender, text, arrived_on)
+                        background.add_task(_serialized, sender, handle_message,
+                                            sender, text, arrived_on)
                 elif mtype == "image":
                     media_id = msg.get("image", {}).get("id", "")
                     caption = msg.get("image", {}).get("caption", "")
                     if sender and media_id:
-                        background.add_task(handle_image_message, sender, media_id,
-                                            caption, arrived_on)
+                        background.add_task(_serialized, sender, handle_image_message,
+                                            sender, media_id, caption, arrived_on)
                 elif mtype == "document":
                     doc = msg.get("document", {}) or {}
                     media_id = doc.get("id", "")
                     if sender and media_id:
-                        background.add_task(handle_document_message, sender, media_id,
-                                            doc.get("caption", ""), doc.get("filename", ""),
-                                            arrived_on)
+                        background.add_task(_serialized, sender, handle_document_message,
+                                            sender, media_id, doc.get("caption", ""),
+                                            doc.get("filename", ""), arrived_on)
                 elif mtype in ("audio", "voice"):
                     media_id = (msg.get(mtype, {}) or {}).get("id", "")
                     if sender and media_id:
-                        background.add_task(handle_voice_message, sender, media_id,
-                                            arrived_on)
+                        background.add_task(_serialized, sender, handle_voice_message,
+                                            sender, media_id, arrived_on)
                 elif mtype in ("call", "call_log", "missed_call", "voice_call"):
                     # Some setups deliver a missed call as a message-type event.
                     if sender:
-                        background.add_task(handle_missed_call, sender, arrived_on)
+                        background.add_task(_serialized, sender, handle_missed_call,
+                                            sender, arrived_on)
                 else:
                     if sender:
-                        background.add_task(handle_unreadable_message, sender,
-                                            mtype or "unsupported", arrived_on)
+                        background.add_task(_serialized, sender, handle_unreadable_message,
+                                            sender, mtype or "unsupported", arrived_on)
     return {"status": "ok"}
