@@ -30,7 +30,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -2023,7 +2023,7 @@ def _maybe_courtesy_close(user: str) -> None:
                                    "the customer's last message — answer the simple "
                                    "thing or close warmly, else SKIP.)"}],
                        system_prompt) or ""
-    reply = strip_marker_leftovers(raw)
+    reply = fix_weekday_mentions(strip_phone_readback(strip_marker_leftovers(raw)))
     # Anything that smells like the model deliberating instead of answering must
     # NEVER reach the customer: a SKIP verdict anywhere in the text (it once put
     # '**SKIP**' at the END of its reasoning and the reasoning got sent), a reply
@@ -2376,6 +2376,59 @@ def strip_marker_leftovers(text: str) -> str:
     out = re.sub(r"\n\s*[.…]\s*$", "", out)  # stripped markers leave lone dots behind
     return out.strip()
 
+# Despite the prompt telling the model to never write a phone number in a
+# read-back, it kept doing it anyway — and once leaked the OWNER'S OWN mobile
+# to a customer (it copied a stale example). Prompting alone wasn't reliable
+# enough, so this is a hard backstop: strip the whole "...and I'll reach/call/
+# contact you on <number>" clause before anything goes out to a customer.
+_PHONE_CLAUSE_RE = re.compile(
+    r",?\s*(?:and\s+)?I['’]?ll (?:reach|call|contact) you on [\d][\d\s\-+()]{5,17}\d\.?",
+    re.IGNORECASE)
+
+def strip_phone_readback(text: str) -> str:
+    out = _PHONE_CLAUSE_RE.sub(".", text or "")
+    out = re.sub(r"\.\s*\.+", ".", out)  # removing the clause can leave a doubled '..'
+    return out.strip()
+
+# The model is repeatedly getting weekday-for-date wrong in its own free-text
+# sentences (e.g. calling 1 September "Monday" when it's a Tuesday) even
+# though the availability calendar it's given lists the correct weekday next
+# to every date — it just doesn't reliably do the arithmetic itself when
+# restating a date mid-sentence. Rather than trust it, recompute the real
+# weekday for every "<Weekday> <day> <Month>" the model writes and correct it
+# in place before the customer ever sees it.
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+_DATE_IN_TEXT_RE = re.compile(
+    r"\b(" + "|".join(_WEEKDAYS) + r")\s+(\d{1,2})\s+(" + "|".join(_MONTHS) + r")\b")
+
+def fix_weekday_mentions(text: str) -> str:
+    if not text:
+        return text
+    today = now_local().date()
+    def fix(m):
+        said_day, day_num, month_name = m.group(1), int(m.group(2)), m.group(3)
+        month_num = _MONTHS.index(month_name) + 1
+        year = today.year
+        try:
+            d = date(year, month_num, day_num)
+        except ValueError:
+            return m.group(0)
+        # A date that's already well in the past almost certainly means next year
+        # (e.g. mentioning "3 January" in December); a small look-back is normal
+        # (recapping a recent job), so only roll forward past a ~30 day margin.
+        if d < today - timedelta(days=30):
+            try:
+                d = date(year + 1, month_num, day_num)
+            except ValueError:
+                return m.group(0)
+        real_day = _WEEKDAYS[d.weekday()]
+        if real_day != said_day:
+            return f"{real_day} {day_num} {month_name}"
+        return m.group(0)
+    return _DATE_IN_TEXT_RE.sub(fix, text)
+
 RETRY_NUDGE = (
     "\n\nIMPORTANT: your previous attempt contained NO visible message for the customer. "
     "Reply now with a normal, complete, friendly message in plain words. Do NOT output any "
@@ -2535,6 +2588,8 @@ def _finish_reply(user: str, answer: str) -> str:
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
     answer = strip_marker_leftovers(answer)
+    answer = strip_phone_readback(answer)
+    answer = fix_weekday_mentions(answer)
     # A reply that is one big parenthesised note is the model thinking out loud
     # (it once sent '(The colleague is handling the specifics...)' to a customer).
     # Treat it as no answer at all so the fallback + owner alert kick in.
@@ -3387,7 +3442,7 @@ def _make_followup(user: str) -> str:
     if (not text or re.search(r"\bSKIP\b", text)
             or (text.startswith("(") and text.endswith(")"))):
         return ""
-    return text
+    return fix_weekday_mentions(strip_phone_readback(text))
 
 ALERT_CHASE_HOURS = float(os.environ.get("ALERT_CHASE_HOURS", "3"))
 
@@ -3414,7 +3469,7 @@ def _make_chase(user: str) -> str:
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
     if not text or text.upper().startswith("SKIP"):
         return ""
-    return text
+    return fix_weekday_mentions(strip_phone_readback(text))
 
 STAFF_STALL_HOURS = float(os.environ.get("STAFF_STALL_HOURS", "1"))
 
