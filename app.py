@@ -521,15 +521,22 @@ DEFAULT_RECOVERY_WHATSAPP = "353830290103"
 def send_recovery_template(to: str, fields: dict) -> bool:
     """Template message to the recovery company — deliverable at ANY time, no
     24h window. This is the ONLY reliable way to reach a number that has never
-    messaged the business first (a plain text send fails with error 131047)."""
+    messaged the business first (a plain text send fails with error 131047).
+
+    A never-messaged number has no phone_id on file, so phone_id_for_customer
+    would fall through to default_send_phone_id() — whichever line that
+    resolves to may not have this specific template approved yet (Meta
+    approves templates per-WABA, not globally). Always route explicitly
+    through the 086 line, which is where this template is confirmed approved."""
     params = [fields.get("name") or "(no name)",
               fields.get("phone") or "-",
               fields.get("car") or "(not given)",
               fields.get("reg") or "-",
               fields.get("address") or "(not given)",
               fields.get("when") or "as soon as possible"]
+    send_from = phone_id_for_customer(to) or "335852741443330"  # 086 667 7666
     try:
-        url, tok = send_endpoint(phone_id_for_customer(to))
+        url, tok = send_endpoint(send_from)
         r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
                        json={"messaging_product": "whatsapp", "to": to,
                              "type": "template",
