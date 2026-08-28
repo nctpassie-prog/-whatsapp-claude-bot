@@ -487,11 +487,13 @@ def _register_check_followup(fields: dict, source: str):
         return
     if fields.get("phone"):
         try:
-            send_whatsapp(fields["phone"],
+            followup_text = (
                 f"Quick check on your booking — reg {fields.get('reg', '')} is "
                 f"registered to a {conflict}, but we have the car down as "
                 f"\"{fields.get('car', '')}\". Could you double check the reg or "
                 f"the car for me? 🙏")
+            send_whatsapp(fields["phone"], followup_text)
+            save_message(fields["phone"], "assistant", followup_text)
         except Exception:
             log.exception("Register-check WhatsApp follow-up failed")
     try:
@@ -6453,18 +6455,25 @@ async def retell_function(request: Request):
                         + "If anything above is wrong, just reply here and we'll fix it 👍"
                     )
                     send_whatsapp(fields["phone"], confirm_text)
+                    # Owner's rule 2026-08-29: log every outbound voice-booking text
+                    # to the message history too — previously these never showed up
+                    # on the /chats page, so staff looking up a phone-booked customer
+                    # saw nothing even though a confirmation had actually been sent.
+                    save_message(fields["phone"], "assistant", confirm_text)
                     # Owner's rule 2026-08-28: after a voice booking, check the
                     # captured reg for anything that looks garbled by the phone
                     # transcription, and if so send a SEPARATE follow-up asking
                     # the customer to confirm/correct it — not folded into the
                     # main confirmation, so it stands out as needing a reply.
                     if reg_looks_off(fields["reg"]):
-                        send_whatsapp(fields["phone"],
+                        reg_check_text = (
                             "One more check — I have your registration down as "
                             f"\"{fields['reg'] or '(nothing captured)'}\", but phone "
                             "calls can sometimes mishear a plate. Could you reply "
                             "with the exact reg so I can make sure the booking is "
                             "correct? 🙏")
+                        send_whatsapp(fields["phone"], reg_check_text)
+                        save_message(fields["phone"], "assistant", reg_check_text)
                 except Exception:
                     log.exception("Voice booking WhatsApp confirmation failed")
             threading.Thread(target=_register_check_followup,
