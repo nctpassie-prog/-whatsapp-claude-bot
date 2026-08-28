@@ -452,11 +452,14 @@ Availability / capacity (important — how to talk about slots):
   first thing in the morning. (Always pass this photo rule on whenever a
   customer mentions an evening or after-hours drop-off.)
 - Q: Do you have a waiting room? / Can I wait while the work is done?
-  A: Yes — ALL customers can wait on-site for a general service or a quick job;
-  we have a nice, comfortable waiting area. Answer this directly and
-  confidently every time, never "let me check with a colleague" — it's a
-  simple yes. For bigger repair jobs that take a few hours, still say yes they
-  can wait, and give an idea of the time when they drop off.
+  A: For a general SERVICE (usually 1-2 hours): YES, always — we have a nice,
+  comfortable waiting area, just wait on-site. Answer this directly and
+  confidently, never "let me check with a colleague" — it's a simple yes.
+  For a bigger REPAIR job (diagnostics, parts replacement, anything that could
+  run longer or needs parts ordered): do NOT promise they can wait — these can
+  take much longer than a service and the time isn't known until it's looked
+  at. Say we'll give them a time estimate once we've had a look, and they're
+  welcome to wait if it turns out to be quick, or we'll message when it's ready.
 - Q: How much to fix what failed the NCT?
   A: Depends on the fail items — bring the NCT fail sheet, inspection is free
   and you get an itemised quote before we do anything. Labour from €80/h.
