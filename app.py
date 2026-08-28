@@ -387,6 +387,19 @@ def clean_reg(reg: str) -> str:
         return ""
     return cleaned
 
+# A loose sanity check on a captured reg — real Irish (and UK-import) regs
+# always mix letters and digits and run roughly 4-10 characters. This can't
+# catch a reg with the right SHAPE but wrong digits (a misheard "1" for "7"
+# still looks like a real reg — only the customer can catch that), but it
+# does catch a badly garbled voice capture (too short, all-digits, etc).
+_PLAUSIBLE_REG_RE = re.compile(r"^(?=.*[A-Z])(?=.*\d)[A-Z0-9]{4,10}$")
+
+def reg_looks_off(reg: str) -> bool:
+    r = clean_reg(reg)
+    if not r:
+        return True
+    return not _PLAUSIBLE_REG_RE.match(r)
+
 def process_booking(answer: str):
     """Pull the hidden booking marker out of Claude's reply.
 
@@ -6221,12 +6234,26 @@ async def retell_function(request: Request):
                         + "If anything above is wrong, just reply here and we'll fix it 👍"
                     )
                     send_whatsapp(fields["phone"], confirm_text)
+                    # Owner's rule 2026-08-28: after a voice booking, check the
+                    # captured reg for anything that looks garbled by the phone
+                    # transcription, and if so send a SEPARATE follow-up asking
+                    # the customer to confirm/correct it — not folded into the
+                    # main confirmation, so it stands out as needing a reply.
+                    if reg_looks_off(fields["reg"]):
+                        send_whatsapp(fields["phone"],
+                            "One more check — I have your registration down as "
+                            f"\"{fields['reg'] or '(nothing captured)'}\", but phone "
+                            "calls can sometimes mishear a plate. Could you reply "
+                            "with the exact reg so I can make sure the booking is "
+                            "correct? 🙏")
                 except Exception:
                     log.exception("Voice booking WhatsApp confirmation failed")
             send_telegram("📞 PHONE BOOKING (voice agent)\n"
                           f"{fields['name']} — {fields['car']} {fields['reg']}\n"
                           f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
                           f"Caller: +{fields['phone']}"
+                          + ("\n⚠️ Reg looks unusual — asked the customer to confirm it"
+                             if reg_looks_off(fields["reg"]) else "")
                           + (f"\n📋 Waiting for earlier ({fields['wanted']})"
                              if fields["wanted"] else ""))
             confirm = "Booked. Drop-off between 9 and 11am."
