@@ -6198,6 +6198,31 @@ async def retell_function(request: Request):
                 settle_waitlist_after_booking(fields)
             except Exception:
                 log.exception("Voice waitlist bookkeeping failed")
+            # Owner's rule: voice transcription can mishear a reg, name or date —
+            # always text the customer a written confirmation so they can catch
+            # and correct any mistake before their actual drop-off day.
+            if fields["phone"]:
+                try:
+                    date_label = fields["date"]
+                    try:
+                        date_label = datetime.strptime(fields["date"], "%Y-%m-%d").strftime("%A %d %B")
+                    except Exception:
+                        pass
+                    confirm_text = (
+                        f"Hi{' ' + fields['name'] if fields['name'] else ''}! Confirming "
+                        f"your phone booking with NCTPass:\n\n"
+                        f"Car: {fields['car'] or '(not given)'}\n"
+                        f"Reg: {fields['reg'] or '(not given)'}\n"
+                        f"Job: {fields['need'] or '(not given)'}\n"
+                        f"Date: {date_label}, drop-off between 9 and 11am\n\n"
+                        + (f"You're also on our cancellation list — if an earlier "
+                           f"slot frees up we'll message you here straight away.\n\n"
+                           if fields["wanted"] else "")
+                        + "If anything above is wrong, just reply here and we'll fix it 👍"
+                    )
+                    send_whatsapp(fields["phone"], confirm_text)
+                except Exception:
+                    log.exception("Voice booking WhatsApp confirmation failed")
             send_telegram("📞 PHONE BOOKING (voice agent)\n"
                           f"{fields['name']} — {fields['car']} {fields['reg']}\n"
                           f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
