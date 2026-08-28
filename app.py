@@ -4027,6 +4027,56 @@ def send_waiting_conversations(limit: int = 10) -> int:
         send_telegram("✅ Nobody is waiting on a reply right now.")
     return sent
 
+EVENING_REG_CHECK_HOUR = int(os.environ.get("EVENING_REG_CHECK_HOUR", "19"))
+
+def evening_reg_check() -> None:
+    """Owner's rule 2026-08-28: every evening, compare every upcoming booking's
+    reg and make/model — if either is missing or the reg looks garbled, text
+    the customer to confirm/fill it in. Runs once a day; each booking is only
+    ever flagged once (reg_checked table) so a customer isn't nagged nightly."""
+    now = now_local()
+    if now.hour != EVENING_REG_CHECK_HOUR:
+        return
+    if get_setting("last_reg_check") == now.date().isoformat():
+        return
+    set_setting("last_reg_check", now.date().isoformat())
+    with closing(db()) as conn, conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS reg_checked (booking_id INTEGER PRIMARY KEY)")
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, name, phone, car, reg, date FROM bookings WHERE date >= ?",
+            (now.date().isoformat(),)).fetchall()
+        checked = {r[0] for r in conn.execute("SELECT booking_id FROM reg_checked").fetchall()}
+    flagged = 0
+    for bid, name, phone, car, reg, date_ in rows:
+        if bid in checked:
+            continue
+        car = (car or "").strip()
+        missing_car = not car or car.lower() in ("unknown", "(none)")
+        missing_reg = reg_looks_off(reg)
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if (missing_car or missing_reg) and digits and not is_blocked(digits) and not is_paused(digits):
+            what = []
+            if missing_car:
+                what.append("the car make/model")
+            if missing_reg:
+                what.append("the registration")
+            try:
+                date_label = datetime.strptime(date_, "%Y-%m-%d").strftime("%A %d %B")
+            except Exception:
+                date_label = date_
+            text = (f"Hi{' ' + name if name else ''} — quick check before your "
+                    f"{date_label} booking: could you confirm {' and '.join(what)}? 👍")
+            try:
+                send_whatsapp(digits, text)
+                flagged += 1
+            except Exception:
+                log.exception("Evening reg-check text failed for booking %s", bid)
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT OR IGNORE INTO reg_checked (booking_id) VALUES (?)", (bid,))
+    if flagged:
+        log.info("Evening reg check: flagged %d bookings", flagged)
+
 def send_daily_briefing(force: bool = False) -> None:
     """Every morning: who's in today, and who is still waiting on a person.
 
@@ -4114,6 +4164,10 @@ def reminder_loop() -> None:
         except Exception:
             log.exception("Daily briefing error")
         try:
+            evening_reg_check()
+        except Exception:
+            log.exception("Evening reg check error")
+        try:
             sweep_stalled_staff_chats()
         except Exception:
             log.exception("Stalled staff chat sweep error")
@@ -4200,7 +4254,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -5033,6 +5087,48 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"date": target.isoformat(),
                 "cars": [{"name": n or "(no name)", "car": c, "reg": rg,
                           "job": nd, "phone": p} for n, p, c, rg, nd in rows]}
+    if action == "regcheck":
+        # Force the evening reg/make-model check to run right now, regardless
+        # of the hour — for testing, or to run it on demand.
+        now = now_local()
+        with closing(db()) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS reg_checked (booking_id INTEGER PRIMARY KEY)")
+        with closing(db()) as conn:
+            checked = {r[0] for r in conn.execute(
+                "SELECT booking_id FROM reg_checked").fetchall()}
+            rows = conn.execute(
+                "SELECT id, name, phone, car, reg, date FROM bookings WHERE date >= ?",
+                (now.date().isoformat(),)).fetchall()
+        flagged = []
+        for bid, n, p, c, r, d in rows:
+            if bid in checked:
+                continue
+            car_ = (c or "").strip()
+            missing_car = not car_ or car_.lower() in ("unknown", "(none)")
+            missing_reg = reg_looks_off(r)
+            digits = "".join(ch for ch in (p or "") if ch.isdigit())
+            if (missing_car or missing_reg) and digits and not is_blocked(digits) and not is_paused(digits):
+                what = []
+                if missing_car:
+                    what.append("the car make/model")
+                if missing_reg:
+                    what.append("the registration")
+                try:
+                    date_label = datetime.strptime(d, "%Y-%m-%d").strftime("%A %d %B")
+                except Exception:
+                    date_label = d
+                text = (f"Hi{' ' + n if n else ''} — quick check before your "
+                        f"{date_label} booking: could you confirm {' and '.join(what)}? 👍")
+                try:
+                    send_whatsapp(digits, text)
+                    flagged.append({"name": n, "phone": digits, "sent": text})
+                except Exception:
+                    log.exception("Manual reg-check text failed for booking %s", bid)
+            with closing(db()) as conn, conn:
+                conn.execute("INSERT OR IGNORE INTO reg_checked (booking_id) VALUES (?)", (bid,))
+        set_setting("last_reg_check", now.date().isoformat())
+        return {"checked": len(rows), "already_flagged_before": len(checked),
+                "newly_texted": flagged}
     if action == "remindercheck":
         # Who is due a reminder, and what WhatsApp actually says if we try to send one.
         tomorrow = (now_local().date() + timedelta(days=1)).isoformat()
