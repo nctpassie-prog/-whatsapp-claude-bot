@@ -400,6 +400,108 @@ def reg_looks_off(reg: str) -> bool:
         return True
     return not _PLAUSIBLE_REG_RE.match(r)
 
+_REGISTER_MAKES = ["volkswagen", "audi", "bmw", "ford", "hyundai", "mercedes",
+                    "skoda", "renault", "peugeot", "opel", "nissan", "kia",
+                    "seat", "volvo", "land rover", "range rover", "mitsubishi",
+                    "fiat", "citroen", "jaguar", "mini", "chevrolet", "honda",
+                    "mazda", "suzuki", "dacia", "jeep", "lexus", "tesla",
+                    "porsche", "toyota"]
+
+def _register_make(text: str) -> str | None:
+    """Pull just the make out of a free-text car description, for comparing
+    against the make the public vehicle register returns for a reg."""
+    t = (text or "").lower()
+    for make in _REGISTER_MAKES:
+        if make in t:
+            if make == "volkswagen":
+                return "vw"
+            if "mercedes" in make:
+                return "mercedes"
+            if "land rover" in make or "range rover" in make:
+                return "land rover"
+            return make
+    return None
+
+def motorcheck_lookup(reg: str) -> dict | None:
+    """Free one-off vehicle-identity check on motorcheck.ie's public consumer
+    tool. Owner's rule 2026-08-29: only ONE lookup per NEW booking, exactly
+    as a person checking one car would use it — motorcheck.ie's own anti-bot
+    protection blocks bulk automated use, and this must never be run as a
+    backfill/batch job over the whole diary. Returns {"make_model", "year"}
+    or None if not found/unavailable; never raises — this is a soft extra
+    check, not a hard gate on the booking itself.
+    """
+    r = clean_reg(reg)
+    if not r:
+        return None
+    try:
+        resp = httpx.get("https://www.motorcheck.ie/free-car-check/",
+                          params={"vrm": r, "campaign": "1"},
+                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
+                                                  "Win64; x64) AppleWebKit/537.36"},
+                          timeout=10)
+        html = resp.text
+        if "VRM Not Found" in html:
+            return None
+        m = re.search(
+            r'vehicle-title[^>]*><strong><span class="text-success">([^<]*)'
+            r'</span>\s*([^<]*)</strong>,\s*([0-9]{4})', html)
+        if not m:
+            return None
+        return {"make_model": m.group(2).strip(), "year": m.group(3).strip()}
+    except Exception:
+        log.exception("motorcheck_lookup failed for %s", r)
+        return None
+
+def car_conflicts_with_register(stored_car: str, reg: str) -> str | None:
+    """Best-effort check: does our stored car's make actually match the make
+    the public vehicle register has on file for this reg? Returns the
+    register's own "Make Model, Year" text if there's a genuine conflict
+    (e.g. we have "BMW" but the register says Toyota), else None. A blank or
+    unrecognised make on either side is never treated as a conflict — this
+    only flags a clear mismatch, never a lookup miss or an ambiguous read.
+    """
+    info = motorcheck_lookup(reg)
+    if not info:
+        return None
+    stored_make = _register_make(stored_car)
+    real_make = _register_make(info["make_model"])
+    if not stored_make or not real_make or stored_make == real_make:
+        return None
+    return f"{info['make_model']}, {info['year']}"
+
+def _register_check_followup(fields: dict, source: str):
+    """Owner's rule 2026-08-29: after EVERY new booking, check the reg against
+    the free public vehicle register — but always as one single lookup for
+    this one booking, never as a batch. Runs on a background thread (the
+    lookup is a live network call to a third party and must never delay the
+    customer's or caller's own response); sends a follow-up ONLY when there's
+    a genuine make/model conflict, never on a lookup miss.
+    """
+    try:
+        conflict = car_conflicts_with_register(fields.get("car", ""), fields.get("reg", ""))
+    except Exception:
+        log.exception("Register check failed for booking reg=%s", fields.get("reg"))
+        return
+    if not conflict:
+        return
+    if fields.get("phone"):
+        try:
+            send_whatsapp(fields["phone"],
+                f"Quick check on your booking — reg {fields.get('reg', '')} is "
+                f"registered to a {conflict}, but we have the car down as "
+                f"\"{fields.get('car', '')}\". Could you double check the reg or "
+                f"the car for me? 🙏")
+        except Exception:
+            log.exception("Register-check WhatsApp follow-up failed")
+    try:
+        send_telegram(f"⚠️ REG/CAR MISMATCH vs public register ({source})\n"
+                      f"{fields.get('name', '')} — diary says "
+                      f"\"{fields.get('car', '')}\" ({fields.get('reg', '')}), "
+                      f"register says {conflict}. Asked customer to confirm.")
+    except Exception:
+        log.exception("Register-check Telegram alert failed")
+
 def process_booking(answer: str):
     """Pull the hidden booking marker out of Claude's reply.
 
@@ -2646,6 +2748,10 @@ def _finish_reply(user: str, answer: str) -> str:
                 settle_waitlist_after_booking(wl)  # accepted an earlier slot -> move
             except Exception:
                 log.exception("Waitlist bookkeeping failed")
+            bf = dict(booking)
+            bf["phone"] = bf.get("phone") or user
+            threading.Thread(target=_register_check_followup,
+                              args=(bf, "chat booking"), daemon=True).start()
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -6361,6 +6467,8 @@ async def retell_function(request: Request):
                             "correct? 🙏")
                 except Exception:
                     log.exception("Voice booking WhatsApp confirmation failed")
+            threading.Thread(target=_register_check_followup,
+                              args=(fields, "voice booking"), daemon=True).start()
             send_telegram("📞 PHONE BOOKING (voice agent)\n"
                           f"{fields['name']} — {fields['car']} {fields['reg']}\n"
                           f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
