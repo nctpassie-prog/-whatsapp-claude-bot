@@ -3803,7 +3803,24 @@ def chase_unresolved_alerts() -> None:
                 booked = conn.execute(
                     "SELECT 1 FROM bookings WHERE created_ts >= ? AND phone LIKE ?",
                     (alert_ts, "%" + user[-9:])).fetchone()
-            handled = (staff and (staff[0] or 0) > alert_ts) or booked
+            # Owner's finding 2026-08-30 (Callum): a HANDOVER can fire on the SAME
+            # turn the bot also gives the customer a perfectly good answer — the
+            # alert row gets created, but the conversation itself keeps flowing
+            # normally afterwards. Without this check the chase later sent Callum
+            # an unprompted "sorry for the wait, still on it" for something that
+            # was never actually left open, and he ended up asking if he was
+            # talking to a real person. If the bot has had at least one real
+            # customer message answered with a real (non-fallback) reply since
+            # the alert was raised, treat it as already handled by the bot itself.
+            with closing(db()) as conn:
+                since_alert = conn.execute(
+                    "SELECT role, content FROM messages WHERE wa_user = ? AND ts > ? "
+                    "ORDER BY id ASC", (user, alert_ts)).fetchall()
+            bot_moved_on = (
+                any(role == "user" for role, _ in since_alert)
+                and any(role == "assistant" and (content or "").strip()
+                        and content != BLANK_REPLY_FALLBACK for role, content in since_alert))
+            handled = (staff and (staff[0] or 0) > alert_ts) or booked or bot_moved_on
             with closing(db()) as conn, conn:  # mark either way; only chase once
                 conn.execute("UPDATE alerts SET chased_ts = ? WHERE wa_user = ?",
                              (nowts, user))
