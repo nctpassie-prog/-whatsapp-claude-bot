@@ -2629,7 +2629,32 @@ def fix_weekday_mentions(text: str) -> str:
         if real_day != said_day:
             return f"{real_day} {day_num} {month_name}"
         return m.group(0)
-    return _DATE_IN_TEXT_RE.sub(fix, text)
+    text = _DATE_IN_TEXT_RE.sub(fix, text)
+    return _fix_today_weekday_claims(text)
+
+# Second, separate failure mode found 2026-08-30 (on the headlights bot, same
+# underlying model behaviour so ported here too): the model can flatly assert
+# "today (Saturday)" / "today is Saturday" with no date attached at all — the
+# above regex only catches an explicit "<Weekday> <day> <Month>", so it never
+# touches this. Apparently caused by the model anchoring on a weekday repeated
+# many times earlier in the conversation rather than checking the actual
+# current day.
+_TODAY_WEEKDAY_RE = re.compile(
+    r"\b(today|tomorrow)\b(\s*\(?\s*(?:is\s+)?)(" + "|".join(_WEEKDAYS) + r")\b(\)?)",
+    re.IGNORECASE)
+
+def _fix_today_weekday_claims(text: str) -> str:
+    if not text:
+        return text
+    real_today = _WEEKDAYS[now_local().date().weekday()]
+    real_tomorrow = _WEEKDAYS[(now_local().date() + timedelta(days=1)).weekday()]
+    def fix(m):
+        word, mid, said_day, close = m.group(1), m.group(2), m.group(3), m.group(4)
+        real_day = real_today if word.lower() == "today" else real_tomorrow
+        if said_day.lower() != real_day.lower():
+            return f"{word}{mid}{real_day}{close}"
+        return m.group(0)
+    return _TODAY_WEEKDAY_RE.sub(fix, text)
 
 RETRY_NUDGE = (
     "\n\nIMPORTANT: your previous attempt contained NO visible message for the customer. "
