@@ -387,6 +387,23 @@ def clean_reg(reg: str) -> str:
         return ""
     return cleaned
 
+# Owner's finding 2026-08-31 (James Galagher, 192D8296): the hard "car is
+# required" gate below only checked the field was non-empty, so the model
+# could satisfy it by writing a placeholder like "Unknown" instead of ever
+# actually asking the customer — booked him in without a make/model at all.
+# Reject the same kind of placeholder text a human would recognise as "not a
+# real answer", the same way clean_reg() already does for the reg field.
+_NOT_A_CAR = {"UNKNOWN", "N/A", "NA", "TBC", "TBA", "NOT GIVEN", "NOT PROVIDED",
+              "NONE", "-", "?", "UNSURE", "NOT SURE", "DON'T KNOW", "DONT KNOW"}
+
+def clean_car(car: str) -> str:
+    """Returns "" for a blank car field or a placeholder that isn't really an
+    answer (e.g. "Unknown") — never trust bare truthiness on this field."""
+    c = (car or "").strip()
+    if not c or c.upper() in _NOT_A_CAR:
+        return ""
+    return c
+
 # A loose sanity check on a captured reg — real Irish (and UK-import) regs
 # always mix letters and digits and run roughly 4-10 characters. This can't
 # catch a reg with the right SHAPE but wrong digits (a misheard "1" for "7"
@@ -2737,9 +2754,9 @@ def _finish_reply(user: str, answer: str) -> str:
         # AND the registration — this also catches website-form submissions,
         # which arrive pre-filled with everything EXCEPT the car (the form has
         # no make/model field), so the model must never treat that as complete.
-        if not is_owner and not already_booked and not (booking.get("car", "").strip()
+        if not is_owner and not already_booked and not (clean_car(booking.get("car", ""))
                                                           and clean_reg(booking.get("reg", ""))):
-            missing = "the car make and model" if not booking.get("car", "").strip() else "the registration number"
+            missing = "the car make and model" if not clean_car(booking.get("car", "")) else "the registration number"
             log.info("Booking for %s rejected: missing %s", booking.get("date"), missing)
             answer = f"Just before I book you in — could I get {missing} please? 👍"
             save_message(user, "assistant", answer)
@@ -6485,7 +6502,7 @@ async def retell_function(request: Request):
             return {"booked": False, "reason": "no date given"}
         # Owner's rule: NEVER finalize a booking without both the car make/model
         # AND the registration — ask the caller for whichever is still missing.
-        if not fields["car"]:
+        if not clean_car(fields["car"]):
             return {"booked": False, "reason": "still need the car make and model before I can book this"}
         if not clean_reg(fields["reg"]):
             return {"booked": False, "reason": "still need the car registration number before I can book this"}
