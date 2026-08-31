@@ -3190,9 +3190,21 @@ def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
         log.exception("Failed to send reminder template to %s", to)
         return False
 
+# Diary rows sometimes hold literal placeholder TEXT rather than an empty field
+# ("Unknown", "(no name)", "-"), and `or "there"` only catches the empty case —
+# a real customer genuinely received "Hi. Unknown. Just a reminder that your
+# rental traffic is booked in tomorrow" and had to ask what it meant.
+_NOT_A_NAME = {"unknown", "(no name)", "no name", "n/a", "na", "-", "?", "customer", "(none)"}
+
+def _reminder_name(name: str) -> str:
+    n = (name or "").strip()
+    return "there" if not n or n.lower() in _NOT_A_NAME else n
+
 def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> bool:
     """Send the appointment reminder in the customer's language, falling back to the default."""
-    params = [name or "there", car or "car", reg or "-", when or "your appointment time"]
+    # Drop-off is 9-11am for everyone — a real window beats "your appointment time".
+    params = [_reminder_name(name), clean_car(car) or "car", clean_reg(reg) or "-",
+              when or "9 and 11am"]
     code = reminder_lang_code(lang)
     if _send_reminder_in(to, params, code):
         return True
@@ -3397,6 +3409,19 @@ def send_due_reminders() -> None:
         if phone and send_reminder_template(phone, name, car, reg, tt, lang):
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            # Save the reminder to chat history (English rendering, same pattern
+            # as come_back_nudge) — otherwise the /chats page shows nothing and,
+            # worse, the AI has no idea a reminder was sent when the customer
+            # replies to it ("what time?" made no sense to the model before).
+            try:
+                save_message(phone, "assistant",
+                    f"Hi {_reminder_name(name)}, just a reminder that your "
+                    f"{clean_car(car) or 'car'} ({clean_reg(reg) or '-'}) is booked in "
+                    f"with NCTPass tomorrow. Please drop the car in between "
+                    f"{tt or '9 and 11am'} and we'll message you when it's ready. "
+                    f"Reply here if you need to change anything.")
+            except Exception:
+                log.exception("Failed to save reminder to history for %s", phone)
             log.info("Sent appointment reminder for booking %s to %s", bid, phone)
 
 def _send_review_in(to: str, params: list, lang_code: str) -> bool:
