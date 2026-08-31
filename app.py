@@ -1661,6 +1661,32 @@ def save_booking(fields: dict) -> bool:
                 (date_, reg, phone, "%" + phone[-9:] if phone else "\x00")).fetchone()
         if dupe:
             log.info("Duplicate booking ignored: %s %s on %s", reg or phone, date_, date_)
+            # Owner's finding 2026-08-31 (Callum, Audi A5): a re-confirmation was
+            # silently dropped even when it carried a detail the ORIGINAL booking
+            # was still missing (e.g. answering the evening reg-check with just a
+            # reg number) - the reg got saved to the customer profile below but
+            # never backfilled onto the actual booking row, so the diary stayed
+            # incomplete forever even though the bot had already said "Got it,
+            # thank you". Only fill a field that's currently BLANK - never
+            # overwrite one that already has a value, in case this really is an
+            # unrelated duplicate rather than a follow-up detail.
+            try:
+                with closing(db()) as conn:
+                    existing = conn.execute(
+                        "SELECT reg, car FROM bookings WHERE id = ?", (dupe[0],)).fetchone()
+                fills = {}
+                if reg and existing and not (existing[0] or "").strip():
+                    fills["reg"] = reg
+                if fields.get("car", "").strip() and existing and not (existing[1] or "").strip():
+                    fills["car"] = fields["car"].strip()
+                if fills:
+                    with closing(db()) as conn, conn:
+                        conn.execute(
+                            "UPDATE bookings SET " + ", ".join(f"{k} = ?" for k in fills) +
+                            " WHERE id = ?", (*fills.values(), dupe[0]))
+                    log.info("Backfilled %s on existing booking id=%s", list(fills), dupe[0])
+            except Exception:
+                log.exception("Failed to backfill existing booking id=%s", dupe[0])
             record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
             return False
     try:
