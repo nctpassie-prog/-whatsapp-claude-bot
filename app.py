@@ -4472,7 +4472,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -5380,6 +5380,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 out["test_send"] = {"error": str(exc)[:300]}
         return out
+    if action == "remindertest":
+        # Send the day-before reminder template with SAMPLE data to any number
+        # (default: the owner), so the wording can be checked without touching a
+        # real customer: ?action=remindertest&phone=353858182839
+        to = "".join(ch for ch in (phone or "")) or "353858182839"
+        to = "".join(ch for ch in to if ch.isdigit())
+        ok = send_reminder_template(to, "Tadas", "VW Golf TEST", "161D22222",
+                                    "9 and 11am", "en")
+        return {"sent": bool(ok), "to": to,
+                "note": "sample reminder - name Tadas, car VW Golf TEST, reg 161D22222"}
     if action == "clearwaiting":
         # Wipe the waiting list so tomorrow starts fresh (owner declared the backlog
         # handled). New alerts build the list again from scratch.
