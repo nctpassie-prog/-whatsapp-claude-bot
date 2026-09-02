@@ -4553,9 +4553,13 @@ def escalate_unclaimed_alerts() -> None:
     now = time.time()
     hour = now_local().hour
     with closing(db()) as conn:
+        # Only alerts that actually carry buttons: rows from before this feature
+        # (no Telegram handles) are covered by the old chase + 18:00 digest and
+        # must not flood the owner the first morning.
         rows = conn.execute(
             "SELECT wa_user, ts, claimed_by, escalated_ts, owner_ts, headline FROM alerts "
-            "WHERE COALESCE(closed_ts, 0) < ts AND ts > ?", (now - 3 * 86400,)).fetchall()
+            "WHERE COALESCE(closed_ts, 0) < ts AND ts > ? AND COALESCE(tg_msgs, '') != ''",
+            (now - 3 * 86400,)).fetchall()
     for user, ts, claimed_by, esc_ts, own_ts, headline in rows:
         try:
             with closing(db()) as conn:
