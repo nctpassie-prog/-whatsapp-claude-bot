@@ -4995,7 +4995,7 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
-                     "waiting", "claimboard", "claimtest",
+                     "waiting", "claimboard", "claimtest", "claimstatus",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
@@ -5389,6 +5389,34 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         if sending and text:
             send_telegram_private(text)
         return {"scoreboard": text or f"no alerts in the last {days} days", "sent": sending and bool(text)}
+    if action == "claimstatus":
+        # Who has what right now: every alert from the last 3 days with its claim state.
+        nowts = time.time()
+
+        def when(t: float) -> str:
+            try:
+                return datetime.fromtimestamp(t, ZoneInfo("Europe/Dublin")).strftime("%a %H:%M")
+            except Exception:
+                return ""
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT wa_user, ts, claimed_by, claimed_ts, closed_ts, escalated_ts, owner_ts,"
+                " headline, tg_msgs FROM alerts WHERE ts > ? ORDER BY ts DESC LIMIT 40",
+                (nowts - 3 * 86400,)).fetchall()
+        out = []
+        for user, ts, by, cts, clts, ets, ots, headline, tg_msgs in rows:
+            if (clts or 0) >= ts:
+                state = f"closed {when(clts)}" + (f" (was with {by})" if by else "")
+            elif (by or "").strip():
+                state = f"claimed by {by} at {when(cts)}"
+            else:
+                state = "open — nobody has claimed it"
+            out.append({"customer": customer_label(user), "headline": headline or "",
+                        "raised": when(ts), "state": state,
+                        "reposted_30min": bool(ets and ets >= ts),
+                        "sent_to_owner_2h": bool(ots and ots >= ts),
+                        "telegram_copies": len([h for h in (tg_msgs or "").split(",") if ":" in h])})
+        return {"alerts_last_3_days": out}
     if action == "claimtest":
         # A SAMPLE alert with the claim buttons, to the owner's private chat only,
         # so the buttons can be tried without confusing the team. The "customer"
