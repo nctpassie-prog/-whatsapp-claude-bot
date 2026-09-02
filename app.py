@@ -3128,7 +3128,18 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
                 "SELECT 1 FROM messages WHERE wa_user = ? AND role IN ('assistant','staff') "
                 "AND content = ? AND ts > ? AND ts < ? LIMIT 1",
                 (to, text.strip(), time.time() - 15 * 60, time.time() - 5)).fetchone()
-        if dup:
+            # Second guard (2026-09-02): the 5-second grace above let a fast
+            # follow-up slip through — a customer typed his reg, then "2007"
+            # seconds later, and both turns produced the identical "Just to
+            # confirm..." which went out twice within the same minute. The
+            # chat path saves its reply BEFORE sending, so at the second send
+            # there are already TWO identical rows (the first reply + this
+            # one); a single row is just this reply's own save.
+            twice = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE wa_user = ? AND role = 'assistant' "
+                "AND content = ? AND ts > ?",
+                (to, text.strip(), time.time() - 15 * 60)).fetchone()[0]
+        if dup or twice >= 2:
             log.warning("Duplicate message to %s suppressed (same text within 15 min)", to)
             return
     except Exception:
