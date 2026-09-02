@@ -184,6 +184,12 @@ OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_IDS = [c for c in (x.strip() for x in
                      os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")) if c]
+# Staff claim buttons on Telegram alerts: minutes an alert may sit unclaimed
+# before it is reposted tagging the manager, and before it goes to the owner's
+# private chat.
+CLAIM_ESCALATE_MIN = int(os.environ.get("CLAIM_ESCALATE_MIN", "30"))
+CLAIM_OWNER_MIN = int(os.environ.get("CLAIM_OWNER_MIN", "120"))
+CLAIM_MANAGER_MENTION = os.environ.get("CLAIM_MANAGER_MENTION", "@Tadasdiesel")
 
 # Last delivery receipts from WhatsApp, so ?action=delivery can show whether an
 # alert actually landed without digging through the platform logs.
@@ -1052,6 +1058,43 @@ def send_telegram(text: str) -> None:
         except Exception:
             log.exception("Failed to send Telegram alert to %s", chat_id)
 
+def tg_api(method: str, **payload) -> dict:
+    """One Telegram Bot API call; returns the JSON reply or {} — never raises."""
+    if not TELEGRAM_BOT_TOKEN:
+        return {}
+    try:
+        r = httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                       json=payload, timeout=20)
+        if r.status_code >= 300:
+            log.warning("Telegram %s: HTTP %s %s", method, r.status_code, (r.text or "")[:200])
+        return r.json() if r.content else {}
+    except Exception:
+        log.exception("Telegram %s failed", method)
+        return {}
+
+def claim_keyboard(user: str, alert_ts: float, claimed: bool = False) -> dict:
+    """Inline buttons under a staff alert. Once claimed only 'Done' remains."""
+    tag = f"{user}:{int(alert_ts)}"
+    row = [] if claimed else [{"text": "\U0001F64B I've got this", "callback_data": f"claim:{tag}"}]
+    row.append({"text": "✅ Done", "callback_data": f"done:{tag}"})
+    return {"inline_keyboard": [row]}
+
+def send_telegram_buttons(text: str, user: str, alert_ts: float,
+                          chat_ids: list | None = None, claimed: bool = False) -> list:
+    """Send an alert WITH claim buttons to every alert chat. Returns the
+    'chat_id:message_id' handles so the copies can be edited when someone taps."""
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    handles = []
+    for chat_id in (chat_ids if chat_ids is not None else telegram_chat_ids()):
+        res = tg_api("sendMessage", chat_id=chat_id, text=(text or "")[:4000],
+                     disable_web_page_preview=True,
+                     reply_markup=claim_keyboard(user, alert_ts, claimed))
+        mid = (res.get("result") or {}).get("message_id")
+        if mid:
+            handles.append(f"{chat_id}:{mid}")
+    return handles
+
 def send_email(subject: str, body: str, to: str = "") -> tuple[bool, str]:
     """Send an email over HTTPS via Resend. Returns (ok, detail)."""
     to = to or BOOKING_EMAIL_TO
@@ -1318,6 +1361,23 @@ def db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE alerts ADD COLUMN chased_ts REAL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Staff claim buttons: who tapped "I've got this", when, which Telegram
+    # messages carry the buttons (so they can be edited) and the escalation clock.
+    for ddl in ("claimed_by TEXT DEFAULT ''", "claimed_ts REAL DEFAULT 0",
+                "tg_msgs TEXT DEFAULT ''", "tg_text TEXT DEFAULT ''",
+                "headline TEXT DEFAULT ''", "escalated_ts REAL DEFAULT 0",
+                "owner_ts REAL DEFAULT 0", "closed_ts REAL DEFAULT 0"):
+        try:
+            conn.execute(f"ALTER TABLE alerts ADD COLUMN {ddl}")
+        except sqlite3.OperationalError:
+            pass
+    # One row per alert raised, kept for the Monday scoreboard (the alerts table
+    # only holds the latest alert per customer).
+    conn.execute("CREATE TABLE IF NOT EXISTS claim_log ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT, wa_user TEXT, alert_ts REAL,"
+                 " headline TEXT, claimed_by TEXT DEFAULT '', claimed_ts REAL DEFAULT 0,"
+                 " closed_ts REAL DEFAULT 0, closed_by TEXT DEFAULT '',"
+                 " owner_ts REAL DEFAULT 0)")
     # What we actually charged for a job, logged by the owner after the work.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS charges ("
@@ -2158,8 +2218,28 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
             except Exception:
                 log.exception("Failed to alert %s", number)
     # Telegram alert — free, instant, no 24h window. The primary phone channel.
+    # Alerts that need a person carry the staff claim buttons ("I've got this" /
+    # "Done"). If this customer is already claimed and still open, the new alert
+    # says so and keeps that person on it instead of asking for another tap.
+    alert_ts = time.time()
+    tg_text = "\U0001F514 " + body
+    tg_handles: list = []
+    keep_claim = ("", 0.0)
+    if needs_reply:
+        with closing(db()) as conn:
+            prev = conn.execute(
+                "SELECT ts, claimed_by, claimed_ts, closed_ts FROM alerts WHERE wa_user = ?",
+                (user,)).fetchone()
+        if (prev and (prev[1] or "") and (prev[3] or 0) < (prev[0] or 0)
+                and alert_ts - (prev[2] or 0) < 24 * 3600):
+            keep_claim = (prev[1], prev[2])
+            tg_text += f"\n\n\U0001F64B Already with {prev[1]}"
     try:
-        send_telegram("\U0001F514 " + body)
+        if needs_reply:
+            tg_handles = send_telegram_buttons(tg_text, user, alert_ts,
+                                               claimed=bool(keep_claim[0]))
+        else:
+            send_telegram(tg_text)
     except Exception:
         log.exception("Failed to send Telegram owner alert")
     # Email alert (reliable — always delivered). This is the channel the owner can rely on.
@@ -2175,9 +2255,20 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
     # check-ins to happy customers.
     if needs_reply:
         with closing(db()) as conn, conn:
-            conn.execute("INSERT INTO alerts (wa_user, ts) VALUES (?, ?) "
-                         "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts",
-                         (user, time.time()))
+            conn.execute(
+                "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
+                " headline, escalated_ts, owner_ts, closed_ts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)"
+                " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
+                " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
+                " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
+                " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0",
+                (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
+                 tg_text, headline))
+            conn.execute(
+                "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (user, alert_ts, headline, keep_claim[0], keep_claim[1]))
 
 def alerted_recently(user: str) -> bool:
     """True if we already warned the owner about this chat lately."""
@@ -2234,6 +2325,13 @@ def mark_human_reply(user: str) -> None:
             "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts", (user, time.time()))
     log.info("Human replied to %s from the app; bot will stay quiet for %sh",
              user, AUTO_RESUME_HOURS)
+    # A real reply is the best possible "Done" — close the claim alert for them.
+    try:
+        _toast, after = close_alert(user, "replied in WhatsApp", auto=True)
+        if after:
+            after()
+    except Exception:
+        log.exception("Could not close the claim alert for %s", user)
 
 def clear_human_takeover(user: str) -> None:
     """Hand the chat back to the bot (e.g. owner sends the resume keyword)."""
@@ -4299,6 +4397,314 @@ def alert_resolved(conn, user: str, alert_ts: float) -> bool:
         (alert_ts, "%" + tail)).fetchone()
     return bool(booked)
 
+# ---------------------------------------------------------------- staff claim buttons
+# Every alert that needs a person carries two Telegram buttons. "I've got this"
+# stamps the tapper's name on every copy of the alert, stops the escalation
+# clock and tells the customer who is looking after them. "Done" closes it.
+# Nobody taps? After CLAIM_ESCALATE_MIN the alert is reposted tagging the
+# manager; after CLAIM_OWNER_MIN it goes to the owner's private chat. A staff
+# reply from the WhatsApp app, or a booking, closes the alert by itself.
+
+CLAIM_BUSINESS_NAME = "NCTPass"
+CLAIMED_CUSTOMER_TEXT = {
+    "en": "Hi{name}, {who} from {biz} is looking after this for you now and will be "
+          "in touch shortly \U0001F44D",
+    "ru": "{who} из {biz} сейчас занимается "
+          "вашим вопросом и скоро "
+          "свяжется с вами \U0001F44D",
+    "ro": "{who} de la {biz} se ocupă acum de solicitarea dumneavoastră și vă va "
+          "contacta în curând \U0001F44D",
+    "lt": "{who} iš {biz} dabar rūpinasi jūsų klausimu ir netrukus su jumis "
+          "susisieks \U0001F44D",
+}
+
+def _alert_row(conn, user: str):
+    return conn.execute(
+        "SELECT ts, claimed_by, claimed_ts, tg_msgs, tg_text, headline, closed_ts "
+        "FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+
+def _edit_alert_copies(tg_msgs: str, text: str, keyboard: dict | None) -> None:
+    """Rewrite every Telegram copy of an alert (all chats) with a status line.
+    No keyboard = the buttons disappear."""
+    for handle in (tg_msgs or "").split(","):
+        if ":" not in handle:
+            continue
+        chat_id, mid = handle.split(":", 1)
+        payload = {"chat_id": chat_id, "message_id": int(mid), "text": text[:4090],
+                   "disable_web_page_preview": True}
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        tg_api("editMessageText", **payload)
+
+def _customer_first_name(user: str) -> str:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT name FROM customers WHERE wa_number = ?",
+                           (user,)).fetchone()
+    name = (row[0] or "").strip() if row else ""
+    first = name.split()[0] if name else ""
+    return "" if not first or first.lower() in _NOT_A_NAME else first
+
+def tell_customer_claimed(user: str, who: str) -> None:
+    """'Dima is looking after this for you now' — in the customer's language."""
+    if not (8 <= now_local().hour < 22):
+        return
+    with closing(db()) as conn:
+        last = conn.execute(
+            "SELECT content FROM messages WHERE wa_user = ? AND role = 'user' "
+            "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+    lang = _guess_lang_code(last[0] if last and last[0] else "")
+    first = _customer_first_name(user)
+    text = CLAIMED_CUSTOMER_TEXT.get(lang, CLAIMED_CUSTOMER_TEXT["en"]).format(
+        name=f" {first}" if first else "", who=who, biz=CLAIM_BUSINESS_NAME)
+    send_whatsapp(user, text)
+    save_message(user, "assistant", text)
+
+def claim_alert(user: str, who: str) -> tuple:
+    """Staff tapped 'I've got this'. Returns (toast, follow-up callable or None) —
+    the database is updated here; the slower Telegram edits and the customer
+    text run in the follow-up so the button answers instantly."""
+    now = time.time()
+    with closing(db()) as conn:
+        row = _alert_row(conn, user)
+    if not row:
+        return "That alert is gone already.", None
+    ts, claimed_by, _claimed_ts, tg_msgs, tg_text, headline, closed_ts = row
+    if (closed_ts or 0) >= (ts or 0):
+        return "Already closed — thanks anyway.", None
+    first_claim = not (claimed_by or "").strip()
+    with closing(db()) as conn, conn:
+        conn.execute("UPDATE alerts SET claimed_by = ?, claimed_ts = ? WHERE wa_user = ?",
+                     (who, now, user))
+        if first_claim:
+            conn.execute("UPDATE claim_log SET claimed_by = ?, claimed_ts = ? "
+                         "WHERE wa_user = ? AND alert_ts = ?", (who, now, user, ts))
+        else:
+            conn.execute("UPDATE claim_log SET claimed_by = ? "
+                         "WHERE wa_user = ? AND alert_ts = ?", (who, user, ts))
+    stamp = now_local().strftime("%H:%M")
+    line = (f"\n\n\U0001F64B Claimed by {who} at {stamp}" if first_claim
+            else f"\n\n\U0001F64B Taken over by {who} at {stamp} (was {claimed_by})")
+
+    def after() -> None:
+        _edit_alert_copies(tg_msgs, (tg_text or headline or "Alert") + line,
+                           claim_keyboard(user, ts, claimed=True))
+        if first_claim:
+            try:
+                tell_customer_claimed(user, who)
+            except Exception:
+                log.exception("Could not tell %s who claimed their alert", user)
+    log.info("Alert for %s claimed by %s", user, who)
+    toast = (f"It's yours, {who}. The customer has been told." if first_claim
+             else f"Now with you, {who}.")
+    return toast, after
+
+def close_alert(user: str, who: str, auto: bool = False) -> tuple:
+    """'Done' tapped, or a staff reply / booking sorted it. Same (toast, after) shape."""
+    now = time.time()
+    with closing(db()) as conn:
+        row = _alert_row(conn, user)
+    if not row:
+        return "Nothing open for that customer.", None
+    ts, claimed_by, _claimed_ts, tg_msgs, tg_text, headline, closed_ts = row
+    if (closed_ts or 0) >= (ts or 0):
+        return "Already closed.", None
+    with closing(db()) as conn, conn:
+        conn.execute("UPDATE alerts SET closed_ts = ? WHERE wa_user = ?", (now, user))
+        conn.execute("UPDATE claim_log SET closed_ts = ?, closed_by = ? "
+                     "WHERE wa_user = ? AND alert_ts = ?", (now, who, user, ts))
+    stamp = now_local().strftime("%H:%M")
+    if auto:
+        line = f"\n\n✅ {who} at {stamp}" + (f" — {claimed_by}" if claimed_by else "")
+    else:
+        line = f"\n\n✅ Done by {who} at {stamp}"
+
+    def after() -> None:
+        if tg_msgs:
+            _edit_alert_copies(tg_msgs, (tg_text or headline or "Alert") + line, None)
+    log.info("Alert for %s closed (%s)", user, who)
+    return "Closed — thanks.", after
+
+def handle_claim_callback(cq: dict) -> None:
+    """A button tap from Telegram. Answer within seconds or the phone shows a
+    spinner, so the database work happens first and the edits afterwards."""
+    data = str(cq.get("data") or "")
+    frm = cq.get("from") or {}
+    who = (frm.get("first_name") or frm.get("username") or "Staff").strip()[:30]
+    toast, after = "Sorry, I didn't understand that button.", None
+    try:
+        kind, user, _tag = (data.split(":") + ["", ""])[:3]
+        user = "".join(ch for ch in user if ch.isdigit())
+        if kind == "claim" and user:
+            toast, after = claim_alert(user, who)
+        elif kind == "done" and user:
+            toast, after = close_alert(user, who)
+    except Exception:
+        log.exception("Claim button failed: %s", data)
+        toast = "Something went wrong — try again."
+    tg_api("answerCallbackQuery", callback_query_id=cq.get("id"), text=toast[:200])
+    if after:
+        try:
+            after()
+        except Exception:
+            log.exception("Claim follow-up failed: %s", data)
+
+def escalate_unclaimed_alerts() -> None:
+    """The clock on every open alert (runs every minute, 8am–8pm)."""
+    now = time.time()
+    hour = now_local().hour
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_user, ts, claimed_by, escalated_ts, owner_ts, headline FROM alerts "
+            "WHERE COALESCE(closed_ts, 0) < ts AND ts > ?", (now - 3 * 86400,)).fetchall()
+    for user, ts, claimed_by, esc_ts, own_ts, headline in rows:
+        try:
+            with closing(db()) as conn:
+                sorted_already = alert_resolved(conn, user, ts)
+            if sorted_already:
+                _toast, after = close_alert(user, "sorted (booked or replied)", auto=True)
+                if after:
+                    after()
+                continue
+            if (claimed_by or "").strip() or not (8 <= hour < 20):
+                continue
+            mins = int((now - ts) / 60)
+            label = customer_label(user)
+            if mins >= CLAIM_OWNER_MIN and (own_ts or 0) < ts:
+                send_telegram_private(
+                    f"\U0001F6A8 Nobody has claimed this customer for {mins} min\n"
+                    f"{headline}\n{label}\nReply: https://wa.me/{user}")
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE alerts SET owner_ts = ? WHERE wa_user = ?", (now, user))
+                    conn.execute("UPDATE claim_log SET owner_ts = ? "
+                                 "WHERE wa_user = ? AND alert_ts = ?", (now, user, ts))
+            elif mins >= CLAIM_ESCALATE_MIN and (esc_ts or 0) < ts:
+                handles = send_telegram_buttons(
+                    f"⏰ Still unclaimed after {mins} min {CLAIM_MANAGER_MENTION}\n"
+                    f"{headline}\n{label}\n"
+                    f"Tap the button to take it, or reply: https://wa.me/{user}", user, ts)
+                with closing(db()) as conn, conn:
+                    conn.execute(
+                        "UPDATE alerts SET escalated_ts = ?, tg_msgs = "
+                        "CASE WHEN COALESCE(tg_msgs,'') = '' THEN ? ELSE tg_msgs || ',' || ? END "
+                        "WHERE wa_user = ?", (now, ",".join(handles), ",".join(handles), user))
+        except Exception:
+            log.exception("Escalation failed for %s", user)
+
+def claim_scoreboard_text(days: int = 7) -> str:
+    """Per-person claim stats for the owner — who picks alerts up and how fast."""
+    now = time.time()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_user, alert_ts, claimed_by, claimed_ts, closed_ts, closed_by, owner_ts "
+            "FROM claim_log WHERE alert_ts >= ? ORDER BY alert_ts", (now - days * 86400,)).fetchall()
+    if not rows:
+        return ""
+    per: dict = {}
+    quiet = untouched = to_owner = 0
+    open_now = []
+    for user, ats, by, cts, clts, _clby, ots in rows:
+        if ots:
+            to_owner += 1
+        if (by or "").strip():
+            p = per.setdefault(by, {"claimed": 0, "claim_mins": [], "closed": 0, "close_mins": []})
+            p["claimed"] += 1
+            p["claim_mins"].append(max(0.0, ((cts or ats) - ats) / 60))
+            if clts:
+                p["closed"] += 1
+                p["close_mins"].append(max(0.0, (clts - ats) / 60))
+        elif clts:
+            quiet += 1  # answered from the app without tapping — fine
+        else:
+            untouched += 1
+        if not clts:
+            open_now.append((user, ats, by))
+
+    def fmt(m: float) -> str:
+        return f"{int(round(m))} min" if m < 90 else f"{m / 60:.1f}h"
+    lines = [f"\U0001F3C1 Claim scoreboard — last {days} days: {len(rows)} customer(s) "
+             "needed a person"]
+    for by, p in sorted(per.items(), key=lambda kv: -kv[1]["claimed"]):
+        avg_claim = sum(p["claim_mins"]) / len(p["claim_mins"])
+        text = f"• {by}: claimed {p['claimed']}, picked up in {fmt(avg_claim)} on average"
+        if p["close_mins"]:
+            text += f", sorted in {fmt(sum(p['close_mins']) / len(p['close_mins']))}"
+        if p["claimed"] - p["closed"]:
+            text += f", still open {p['claimed'] - p['closed']}"
+        lines.append(text)
+    if quiet:
+        lines.append(f"• Answered from the app without tapping: {quiet}")
+    lines.append(f"• Nobody touched at all: {untouched}"
+                 + (f" ({to_owner} escalated to you)" if to_owner else ""))
+    if open_now:
+        oldest = min(open_now, key=lambda r: r[1])
+        hrs = (now - oldest[1]) / 3600
+        lines.append(f"⚠️ Oldest still open: {customer_label(oldest[0])} — "
+                     f"{int(hrs)}h" + (f" (with {oldest[2]})" if oldest[2] else " (nobody)"))
+    return "\n".join(lines)
+
+def send_weekly_claim_scoreboard(force: bool = False) -> None:
+    """Monday morning, owner's private chat only."""
+    now = now_local()
+    if not force:
+        if now.weekday() != 0 or not (8 <= now.hour <= 10):
+            return
+        week = now.strftime("%G-W%V")
+        if get_setting("claim_scoreboard_sent") == week:
+            return
+        set_setting("claim_scoreboard_sent", week)
+    text = claim_scoreboard_text()
+    if text:
+        send_telegram_private(text)
+
+def _remember_tg_chat(upd: dict) -> None:
+    """The button poller eats every Telegram update, so keep a note of who has
+    messaged the bot for ?action=tgchat / tgpending (chat-id discovery)."""
+    chat = ((upd.get("message") or upd.get("channel_post") or upd.get("my_chat_member")
+             or {}).get("chat") or {})
+    cid = str(chat.get("id") or "")
+    if not cid:
+        return
+    name = ((chat.get("first_name") or chat.get("title") or "")
+            + (f" @{chat['username']}" if chat.get("username") else ""))
+    seen = tg_seen_chats()
+    seen[cid] = name
+    set_setting("tg_seen_chats", json.dumps(dict(list(seen.items())[-30:])))
+
+def tg_seen_chats() -> dict:
+    try:
+        return dict(json.loads(get_setting("tg_seen_chats") or "{}"))
+    except Exception:
+        return {}
+
+def telegram_button_loop() -> None:
+    """Long-poll Telegram for button taps; run the escalation clock every minute."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    offset = 0
+    last_tick = 0.0
+    while True:
+        try:
+            r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                          params={"offset": offset, "timeout": 20}, timeout=30)
+            data = r.json() if r.content else {}
+            if not data.get("ok"):
+                time.sleep(5)  # e.g. 409 while the previous deploy is still polling
+            for upd in data.get("result", []):
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                if upd.get("callback_query"):
+                    handle_claim_callback(upd["callback_query"])
+                else:
+                    _remember_tg_chat(upd)
+        except Exception:
+            log.exception("Telegram button poll error")
+            time.sleep(5)
+        if time.time() - last_tick >= 60:
+            last_tick = time.time()
+            try:
+                escalate_unclaimed_alerts()
+            except Exception:
+                log.exception("Claim escalation error")
+
 UNRESOLVED_DIGEST_HOUR = int(os.environ.get("UNRESOLVED_DIGEST_HOUR", "18"))
 
 def send_unresolved_digest() -> None:
@@ -4316,15 +4722,17 @@ def send_unresolved_digest() -> None:
     nowts = time.time()
     with closing(db()) as conn:
         alerts = conn.execute(
-            "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
-        waiting = [(u, ts) for u, ts in alerts if not alert_resolved(conn, u, ts)]
+            "SELECT wa_user, ts, claimed_by FROM alerts WHERE COALESCE(closed_ts, 0) < ts "
+            "ORDER BY ts DESC LIMIT 40").fetchall()
+        waiting = [(u, ts, by) for u, ts, by in alerts if not alert_resolved(conn, u, ts)]
     if not waiting:
         return  # a quiet list needs no message
     lines = [f"🚨 Still unanswered today — {len(waiting)} customer(s) waiting on a person:"]
-    for user, ts in waiting[:15]:
+    for user, ts, by in waiting[:15]:
         hrs = (nowts - ts) / 3600
         waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)}d"
-        lines.append(f"• {customer_label(user)} — waiting {waited} — wa.me/{user}")
+        who = f"with {by}, no reply yet" if (by or "").strip() else "NOBODY claimed it"
+        lines.append(f"• {customer_label(user)} — waiting {waited} — {who} — wa.me/{user}")
     lines.append("The bot has alerted and chased each one; they need a human reply.")
     send_telegram_private("\n".join(lines))
     log.info("Sent unresolved digest: %d waiting", len(waiting))
@@ -4520,6 +4928,10 @@ def reminder_loop() -> None:
             send_weekly_mechanic_report()
         except Exception:
             log.exception("Mechanic report error")
+        try:
+            send_weekly_claim_scoreboard()
+        except Exception:
+            log.exception("Claim scoreboard error")
         time.sleep(3600)  # check hourly
 
 # ---------------------------------------------------------------- webhook
@@ -4528,6 +4940,7 @@ app = FastAPI(title="WhatsApp Claude Bot")
 @app.on_event("startup")
 def _start_reminder_thread() -> None:
     threading.Thread(target=reminder_loop, daemon=True).start()
+    threading.Thread(target=telegram_button_loop, daemon=True).start()
     log.info("Reminder scheduler started (template=%s, lang=%s, enabled=%s)",
              REMINDER_TEMPLATE, REMINDER_LANG, REMINDER_ENABLED)
 
@@ -4582,7 +4995,7 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
-                     "waiting",
+                     "waiting", "claimboard", "claimtest",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
@@ -4967,12 +5380,48 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             except Exception as exc:
                 results.append({"chat": cid, "error": str(exc)[:120]})
         return {"swept_ids": span, "results": results}
+    if action == "claimboard":
+        # Preview the Monday claim scoreboard (&need=<days>); &date=send posts it
+        # to the owner's private chat now.
+        days = int(need) if (need or "").strip().isdigit() else 7
+        text = claim_scoreboard_text(days)
+        sending = (date or "").strip().lower() == "send"
+        if sending and text:
+            send_telegram_private(text)
+        return {"scoreboard": text or f"no alerts in the last {days} days", "sent": sending and bool(text)}
+    if action == "claimtest":
+        # A SAMPLE alert with the claim buttons, to the owner's private chat only,
+        # so the buttons can be tried without confusing the team. The "customer"
+        # is the owner's own number (or &phone=), so tapping "I've got this" texts
+        # him the customer-side message too. Never escalates.
+        private = (get_setting("owner_private_chat") or "").strip()
+        if not private:
+            return {"ok": False, "reason": "owner private chat not linked yet"}
+        user = "".join(ch for ch in (phone or OWNER_WHATSAPP or "353858182839") if ch.isdigit())
+        ts = time.time()
+        body = ("\U0001F514 TEST — A customer needs you to follow up\n"
+                f"From: Sample Customer (12D12345) +{user}\n"
+                "What's wrong: brake light out, wants a day this week\n\n"
+                f"\U0001F4AC Reply in WhatsApp: https://wa.me/{user}")
+        handles = send_telegram_buttons(body, user, ts, chat_ids=[private])
+        with closing(db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
+                " headline, escalated_ts, owner_ts, closed_ts)"
+                " VALUES (?, ?, '', 0, ?, ?, ?, ?, ?, 0)"
+                " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts, claimed_by = '',"
+                " claimed_ts = 0, tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
+                " headline = excluded.headline, escalated_ts = excluded.escalated_ts,"
+                " owner_ts = excluded.owner_ts, closed_ts = 0",
+                (user, ts, ",".join(handles), body, "TEST alert", ts + 1, ts + 1))
+        return {"ok": bool(handles), "sent_to_private_chat": private, "sample_customer": user,
+                "hint": "Tap 'I've got this' on the Telegram message; the sample customer gets a text."}
     if action == "tgpending":
         # Who has messaged the Telegram bot (candidates for the private chat link).
         try:
             r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                           timeout=20)
-            found = {}
+            found = dict(tg_seen_chats())
             for upd in r.json().get("result", []):
                 chat = ((upd.get("message") or upd.get("channel_post") or {}).get("chat") or {})
                 cid = str(chat.get("id", ""))
@@ -5674,6 +6123,8 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                   "name": chat.get("first_name") or chat.get("title") or "",
                                   "username": chat.get("username", "")})
             uniq = {str(f["chat_id"]): f for f in found}
+            for cid, name in tg_seen_chats().items():  # seen by the button poller
+                uniq.setdefault(cid, {"chat_id": cid, "name": name, "username": ""})
             return {"bot_name": me.get("first_name", ""),
                     "bot_username": bot_user,
                     "open_this_link": f"https://t.me/{bot_user}" if bot_user else "",
