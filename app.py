@@ -1073,11 +1073,10 @@ def tg_api(method: str, **payload) -> dict:
         return {}
 
 def claim_keyboard(user: str, alert_ts: float, claimed: bool = False) -> dict:
-    """Inline buttons under a staff alert. Once claimed only 'Done' remains."""
+    """The one button under a staff alert. Owner's decision 2026-09-02: ONLY
+    'Done' — no separate 'I've got this' step ("we need only done")."""
     tag = f"{user}:{int(alert_ts)}"
-    row = [] if claimed else [{"text": "\U0001F64B I've got this", "callback_data": f"claim:{tag}"}]
-    row.append({"text": "✅ Done", "callback_data": f"done:{tag}"})
-    return {"inline_keyboard": [row]}
+    return {"inline_keyboard": [[{"text": "✅ Done", "callback_data": f"done:{tag}"}]]}
 
 def send_telegram_buttons(text: str, user: str, alert_ts: float,
                           chat_ids: list | None = None, claimed: bool = False) -> list:
@@ -4524,12 +4523,41 @@ def close_alert(user: str, who: str, auto: bool = False) -> tuple:
     log.info("Alert for %s closed (%s)", user, who)
     return "Closed — thanks.", after
 
+def claim_names() -> dict:
+    """Telegram user id -> the name customers should see (setting claim_names,
+    JSON). Telegram first names can be initials or nicknames ("T")."""
+    try:
+        d = dict(json.loads(get_setting("claim_names") or "{}"))
+    except Exception:
+        d = {}
+    d.setdefault("1001948448", "Tadas")  # owner
+    return d
+
+def _remember_tapper(frm: dict) -> None:
+    """Keep the Telegram id + profile name of everyone who taps, so the owner can
+    map ids to proper names with ?action=claimname."""
+    uid = str(frm.get("id") or "")
+    if not uid:
+        return
+    try:
+        seen = dict(json.loads(get_setting("claim_tappers") or "{}"))
+    except Exception:
+        seen = {}
+    seen[uid] = ((frm.get("first_name") or "") + " " + (frm.get("last_name") or "")).strip() \
+        + (f" @{frm['username']}" if frm.get("username") else "")
+    set_setting("claim_tappers", json.dumps(dict(list(seen.items())[-30:])))
+
 def handle_claim_callback(cq: dict) -> None:
     """A button tap from Telegram. Answer within seconds or the phone shows a
     spinner, so the database work happens first and the edits afterwards."""
     data = str(cq.get("data") or "")
     frm = cq.get("from") or {}
-    who = (frm.get("first_name") or frm.get("username") or "Staff").strip()[:30]
+    who = (claim_names().get(str(frm.get("id") or "")) or frm.get("first_name")
+           or frm.get("username") or "Staff").strip()[:30]
+    try:
+        _remember_tapper(frm)
+    except Exception:
+        log.exception("Could not remember tapper")
     toast, after = "Sorry, I didn't understand that button.", None
     try:
         kind, user, _tag = (data.split(":") + ["", ""])[:3]
@@ -4575,17 +4603,17 @@ def escalate_unclaimed_alerts() -> None:
             label = customer_label(user)
             if mins >= CLAIM_OWNER_MIN and (own_ts or 0) < ts:
                 send_telegram_private(
-                    f"\U0001F6A8 Nobody has claimed this customer for {mins} min\n"
-                    f"{headline}\n{label}\nReply: https://wa.me/{user}")
+                    f"\U0001F6A8 Nobody has replied to this customer or pressed Done "
+                    f"for {mins} min\n{headline}\n{label}\nReply: https://wa.me/{user}")
                 with closing(db()) as conn, conn:
                     conn.execute("UPDATE alerts SET owner_ts = ? WHERE wa_user = ?", (now, user))
                     conn.execute("UPDATE claim_log SET owner_ts = ? "
                                  "WHERE wa_user = ? AND alert_ts = ?", (now, user, ts))
             elif mins >= CLAIM_ESCALATE_MIN and (esc_ts or 0) < ts:
                 handles = send_telegram_buttons(
-                    f"⏰ Still unclaimed after {mins} min {CLAIM_MANAGER_MENTION}\n"
+                    f"⏰ Still not done after {mins} min {CLAIM_MANAGER_MENTION}\n"
                     f"{headline}\n{label}\n"
-                    f"Tap the button to take it, or reply: https://wa.me/{user}", user, ts)
+                    f"Reply: https://wa.me/{user} — then press Done", user, ts)
                 with closing(db()) as conn, conn:
                     conn.execute(
                         "UPDATE alerts SET escalated_ts = ?, tg_msgs = "
@@ -4603,47 +4631,39 @@ def claim_scoreboard_text(days: int = 7) -> str:
             "FROM claim_log WHERE alert_ts >= ? ORDER BY alert_ts", (now - days * 86400,)).fetchall()
     if not rows:
         return ""
+    auto_closers = {"replied in WhatsApp", "sorted (booked or replied)"}
     per: dict = {}
     quiet = untouched = to_owner = 0
     open_now = []
-    for user, ats, by, cts, clts, _clby, ots in rows:
+    for user, ats, _by, _cts, clts, clby, ots in rows:
         if ots:
             to_owner += 1
-        if (by or "").strip():
-            p = per.setdefault(by, {"claimed": 0, "claim_mins": [], "closed": 0, "close_mins": []})
-            p["claimed"] += 1
-            p["claim_mins"].append(max(0.0, ((cts or ats) - ats) / 60))
-            if clts:
-                p["closed"] += 1
-                p["close_mins"].append(max(0.0, (clts - ats) / 60))
-        elif clts:
-            quiet += 1  # answered from the app without tapping — fine
+        if clts:
+            if (clby or "").strip() and clby not in auto_closers:
+                p = per.setdefault(clby, {"done": 0, "mins": []})
+                p["done"] += 1
+                p["mins"].append(max(0.0, (clts - ats) / 60))
+            else:
+                quiet += 1  # a WhatsApp reply or a booking closed it by itself
         else:
             untouched += 1
-        if not clts:
-            open_now.append((user, ats, by))
+            open_now.append((user, ats))
 
     def fmt(m: float) -> str:
         return f"{int(round(m))} min" if m < 90 else f"{m / 60:.1f}h"
-    lines = [f"\U0001F3C1 Claim scoreboard — last {days} days: {len(rows)} customer(s) "
+    lines = [f"\U0001F3C1 Done scoreboard — last {days} days: {len(rows)} customer(s) "
              "needed a person"]
-    for by, p in sorted(per.items(), key=lambda kv: -kv[1]["claimed"]):
-        avg_claim = sum(p["claim_mins"]) / len(p["claim_mins"])
-        text = f"• {by}: claimed {p['claimed']}, picked up in {fmt(avg_claim)} on average"
-        if p["close_mins"]:
-            text += f", sorted in {fmt(sum(p['close_mins']) / len(p['close_mins']))}"
-        if p["claimed"] - p["closed"]:
-            text += f", still open {p['claimed'] - p['closed']}"
-        lines.append(text)
+    for who, p in sorted(per.items(), key=lambda kv: -kv[1]["done"]):
+        lines.append(f"• {who}: pressed Done on {p['done']}, on average "
+                     f"{fmt(sum(p['mins']) / len(p['mins']))} after the alert")
     if quiet:
-        lines.append(f"• Answered from the app without tapping: {quiet}")
-    lines.append(f"• Nobody touched at all: {untouched}"
+        lines.append(f"• Closed by itself after a WhatsApp reply or a booking: {quiet}")
+    lines.append(f"• Still open — no reply, nobody pressed Done: {untouched}"
                  + (f" ({to_owner} escalated to you)" if to_owner else ""))
     if open_now:
         oldest = min(open_now, key=lambda r: r[1])
         hrs = (now - oldest[1]) / 3600
-        lines.append(f"⚠️ Oldest still open: {customer_label(oldest[0])} — "
-                     f"{int(hrs)}h" + (f" (with {oldest[2]})" if oldest[2] else " (nobody)"))
+        lines.append(f"⚠️ Oldest still open: {customer_label(oldest[0])} — {int(hrs)}h")
     return "\n".join(lines)
 
 def send_weekly_claim_scoreboard(force: bool = False) -> None:
@@ -4735,8 +4755,8 @@ def send_unresolved_digest() -> None:
     for user, ts, by in waiting[:15]:
         hrs = (nowts - ts) / 3600
         waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)}d"
-        who = f"with {by}, no reply yet" if (by or "").strip() else "NOBODY claimed it"
-        lines.append(f"• {customer_label(user)} — waiting {waited} — {who} — wa.me/{user}")
+        lines.append(f"• {customer_label(user)} — waiting {waited} — no reply, "
+                     f"nobody pressed Done — wa.me/{user}")
     lines.append("The bot has alerted and chased each one; they need a human reply.")
     send_telegram_private("\n".join(lines))
     log.info("Sent unresolved digest: %d waiting", len(waiting))
@@ -4999,7 +5019,7 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
-                     "waiting", "claimboard", "claimtest", "claimstatus",
+                     "waiting", "claimboard", "claimtest", "claimstatus", "claimname",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
@@ -5420,7 +5440,26 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "reposted_30min": bool(ets and ets >= ts),
                         "sent_to_owner_2h": bool(ots and ots >= ts),
                         "telegram_copies": len([h for h in (tg_msgs or "").split(",") if ":" in h])})
-        return {"alerts_last_3_days": out}
+        try:
+            tappers = dict(json.loads(get_setting("claim_tappers") or "{}"))
+        except Exception:
+            tappers = {}
+        return {"alerts_last_3_days": out, "tappers_seen": tappers, "names_used": claim_names()}
+    if action == "claimname":
+        # ?phone=<telegram user id>&need=<Name customers should see>. Telegram
+        # profile names can be initials or nicknames; this is what goes on the
+        # alert and into the "X is looking after this" text.
+        uid = "".join(ch for ch in (phone or "") if ch.isdigit())
+        name = (need or "").strip()[:30]
+        if not uid or not name:
+            return {"ok": False, "reason": "need &phone=<telegram user id> and &need=<Name>"}
+        try:
+            names = dict(json.loads(get_setting("claim_names") or "{}"))
+        except Exception:
+            names = {}
+        names[uid] = name
+        set_setting("claim_names", json.dumps(names))
+        return {"ok": True, "names": claim_names()}
     if action == "claimtest":
         # A SAMPLE alert with the claim buttons, to the owner's private chat only,
         # so the buttons can be tried without confusing the team. The "customer"
@@ -5447,7 +5486,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 " owner_ts = excluded.owner_ts, closed_ts = 0",
                 (user, ts, ",".join(handles), body, "TEST alert", ts + 1, ts + 1))
         return {"ok": bool(handles), "sent_to_private_chat": private, "sample_customer": user,
-                "hint": "Tap 'I've got this' on the Telegram message; the sample customer gets a text."}
+                "hint": "Press Done on the Telegram message; it should change to 'Done by <name>'."}
     if action == "tgpending":
         # Who has messaged the Telegram bot (candidates for the private chat link).
         try:
