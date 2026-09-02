@@ -42,3 +42,10 @@
 
 0874405814  # owner asked to ignore (2026-08-25)
 0851034675  # owner asked to ignore (2026-08-25, re-blocked after review test 2026-08-26)
+
+# Parts suppliers / sales reps the TEAM messages from this number — not customers.
+# The bot was answering them as if they owned a car ("book your car in to have
+# the part fitted", invented order confirmations). Found in the 2 Sep 2026 audit.
+0876762558  # David — VW/Audi parts desk
+0863830854  # Wurth sales rep
+0868614566  # Paul — parts supplier (engine/gaskets)

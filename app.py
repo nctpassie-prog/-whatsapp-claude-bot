@@ -925,6 +925,8 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
                 pass
             action_bit = (f"move your {car or 'car'} to {nice}" if real_booking
                           else f"book your {car or 'car'} in for {nice}")
+            if (first or "").strip().lower() in _NOT_A_NAME:
+                first = ""  # never "Good news, Customer" (seen 2 Sep)
             msg = (f"Good news{', ' + first if first else ''} — a slot has just freed "
                    f"up on {nice}{real_booking}! Would you like me to {action_bit}? "
                    "Just reply YES and I'll sort it — drop-off between 9 and 11am "
@@ -1654,20 +1656,39 @@ def save_booking(fields: dict) -> bool:
     try:
         d = datetime.strptime(date_, "%Y-%m-%d").date()
         today = now_local().date()
-        while d < today - timedelta(days=1):
+        original = d
+        # ONE roll forward covers the real mistake (model wrote LAST year's date).
+        # 2026-09-02: the old unbounded loop rolled 2025-05-16 -> 2027-05-16 and
+        # 2025-01-11 -> 2027-01-11 - two phantom bookings a year and a half out.
+        if d < today - timedelta(days=1):
             d = d.replace(year=d.year + 1)
         # And the same mistake forwards: "13 August" once became 2027-08-13. Nobody
         # books a garage more than ~13 months out, so pull absurd years back too.
         while d > today + timedelta(days=396):
             d = d.replace(year=d.year - 1)
-        if d < today - timedelta(days=1):  # pulled back into the past -> next occurrence
-            d = d.replace(year=d.year + 1)
+        if d < today - timedelta(days=1):
+            # Still in the past after one roll = the date was off by MORE than a
+            # year. That's not a typo, it's a guess - never book it, tell the owner.
+            log.warning("Booking date %s is more than a year off — refusing to book it", original)
+            try:
+                send_telegram("⚠️ A booking came through with a date that can't be "
+                              f"right ({original}) for {fields.get('name') or fields.get('phone')} "
+                              f"— {fields.get('car','')} {fields.get('reg','')}, "
+                              f"{fields.get('need','')}. Not added to the diary; please "
+                              "check the chat and add it by hand if it's real.")
+            except Exception:
+                pass
+            return False
         if d.isoformat() != date_:
             log.warning("Booking date %s had a wrong year — corrected to %s", date_, d)
             date_ = d.isoformat()
             fields["date"] = date_
     except Exception:
         pass  # unparseable/blank date is handled elsewhere
+    # Placeholder text in the name field ("Unknown", "(no name)") is worse than
+    # blank - it leaked into a voice confirmation as "Hi unknown!" (2 Sep).
+    if (fields.get("name") or "").strip().lower() in _NOT_A_NAME:
+        fields["name"] = ""
     phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
     if date_:
         with closing(db()) as conn:
@@ -2316,9 +2337,21 @@ def watch_staff_booking(user: str) -> None:
         history = get_history(user)
         if not history:
             return
+        # 2026-09-02: this prompt had NO "today is" line, so a staff message like
+        # "drop Friday?" was resolved to a Friday in the WRONG YEAR (16 May 2025)
+        # and save_booking then rolled it forward into 2027 — two phantom 2027
+        # bookings (Olga, Ivo) came from exactly this. Anchor the calendar the
+        # same way the customer prompt does.
+        today = now_local().date()
+        today_line = (f"\n\nTODAY is {today.strftime('%A %d %B %Y')}. Next days: " +
+                      ", ".join((today + timedelta(days=i)).strftime('%a %d %b %Y')
+                                for i in range(1, 15)) +
+                      ". A bare day name like 'Friday' means the NEXT such day from "
+                      "today. If you cannot resolve the exact date, output SKIP.")
         raw = _call_claude(history + [{"role": "user", "content":
                                        "(Internal: apply your rules — the booking "
-                                       "line, or SKIP.)"}], WATCH_BOOKING_SYSTEM) or ""
+                                       "line, or SKIP.)"}],
+                           WATCH_BOOKING_SYSTEM + today_line) or ""
         m = BOOKING_RE.search(raw)
         if not m:
             return
@@ -2328,6 +2361,15 @@ def watch_staff_booking(user: str) -> None:
                 k, v = part.split("=", 1)
                 fields[k.strip().lower()] = v.strip()
         if not fields.get("date"):
+            return
+        # A row with no car, no reg AND no job is useless to the workshop (Olga's
+        # phantom was exactly that: blank everything, just a date). Tell the owner
+        # instead of writing an empty diary line.
+        if not (fields.get("car") or fields.get("reg") or fields.get("need")):
+            send_telegram("📌 Your colleague seems to have agreed a day in chat with "
+                          f"{customer_label(user)} ({fields.get('date')}), but I "
+                          "couldn't tell which car or job — please add it to the "
+                          f"diary by hand. https://wa.me/{user}")
             return
         fields.setdefault("phone", user)
         if not fields.get("phone"):
@@ -2618,6 +2660,10 @@ LENIENT_MARKER_RE = re.compile(r"<<<[A-Z]+\|.*?(?:>>>|>>|>|$)", re.DOTALL)
 
 def strip_marker_leftovers(text: str) -> str:
     out = LENIENT_MARKER_RE.sub("", text or "")
+    # An orphan closing '>>>' (model wrote '...>>>>>>' or put '>>>' on its own
+    # line) survives the pattern above and reached a customer on 1 Sep.
+    out = re.sub(r"^\s*>{2,}\s*$", "", out, flags=re.MULTILINE)
+    out = re.sub(r">{3,}", "", out)
     out = re.sub(r"\n\s*[.…]\s*$", "", out)  # stripped markers leave lone dots behind
     return out.strip()
 
@@ -2627,7 +2673,8 @@ def strip_marker_leftovers(text: str) -> str:
 # enough, so this is a hard backstop: strip the whole "...and I'll reach/call/
 # contact you on <number>" clause before anything goes out to a customer.
 _PHONE_CLAUSE_RE = re.compile(
-    r",?\s*(?:and\s+)?I['’]?ll (?:reach|call|contact) you on [\d][\d\s\-+()]{5,17}\d\.?",
+    r",?\s*(?:and\s+)?(?:I|we)['’]?ll (?:reach|call|contact|ring|text) you (?:on|at) "
+    r"[\d][\d\s\-+()]{5,17}\d\.?",
     re.IGNORECASE)
 
 def strip_phone_readback(text: str) -> str:
@@ -2647,6 +2694,29 @@ _MONTHS = ["January", "February", "March", "April", "May", "June", "July",
            "August", "September", "October", "November", "December"]
 _DATE_IN_TEXT_RE = re.compile(
     r"\b(" + "|".join(_WEEKDAYS) + r")\s+(\d{1,2})\s+(" + "|".join(_MONTHS) + r")\b")
+
+# The model's booking proposal, in its usual English shape:
+#   "Just to confirm: VW Golf (161D22222), clutch check, drop-off Friday 04 September
+#    between 9 and 11am. Shall I book you in?"
+# Captures the job text (for the hard-job quota) and the proposed date so the
+# capacity gate can run BEFORE the customer says yes (see _finish_reply).
+_PROPOSAL_RE = re.compile(
+    r"(?:\)\s*,\s*(?P<need>[^\n]{3,120}?)\s*,\s*)?drop-?off\s+(?:on\s+)?"
+    r"(?P<wd>" + "|".join(_WEEKDAYS) + r")\s+(?P<day>\d{1,2})\s+(?P<mon>" + "|".join(_MONTHS) + r")"
+    r"[^\n]{0,80}?\bShall I book you in\b",
+    re.IGNORECASE)
+
+def _guess_lang_code(text: str) -> str:
+    """Rough language pick for the honest 'day is full' message: Cyrillic -> ru,
+    Romanian diacritics/words -> ro, Lithuanian -> lt, else en."""
+    t = text or ""
+    if re.search(r"[Ѐ-ӿ]", t):
+        return "ru"
+    if re.search(r"[ăâîșț]|\b(?:sunt|pentru|mașina|programare)\b", t, re.I):
+        return "ro"
+    if re.search(r"[ąčęėįšųūž]", t, re.I):
+        return "lt"
+    return "en"
 
 def fix_weekday_mentions(text: str) -> str:
     if not text:
@@ -2741,6 +2811,33 @@ def _finish_reply(user: str, answer: str) -> str:
                 log.exception("Failed to alert owner about truncated marker")
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
+    # OFFER-THEN-RETRACT guard (2026-09-02, the #1 customer-facing defect that day:
+    # 8+ chats). The model writes "Just to confirm: <car> (<reg>), <job>, drop-off
+    # Friday 04 September ... Shall I book you in?" for a day the capacity gate
+    # will reject the moment the customer says yes — so they hear "yes" then
+    # "sorry, that day is full". Run the SAME gate at the proposal step and swap
+    # in the honest message before the false offer ever goes out.
+    if not booking and not is_owner:
+        try:
+            prop = _PROPOSAL_RE.search(answer or "")
+            if prop:
+                day_num = int(prop.group("day"))
+                month_name = prop.group("mon").capitalize()
+                today = now_local().date()
+                pd = date(today.year, _MONTHS.index(month_name) + 1, day_num)
+                if pd < today - timedelta(days=30):
+                    pd = pd.replace(year=pd.year + 1)
+                need = prop.group("need") or ""
+                reason = day_full_reason(pd.isoformat(), need)
+                if reason and pd >= today:
+                    alt = next_day_for_job(need)
+                    msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
+                    lang = _guess_lang_code(answer)
+                    answer = (msg.get(lang, msg["en"]).format(alt=alt)
+                              if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]))
+                    log.info("Proposal for %s on %s replaced: %s-full (job=%r)", user, pd, reason, need[:60])
+        except Exception:
+            log.exception("Proposal capacity guard failed (reply sent unchanged)")
     if booking and not is_owner:
         # The model once copied its own EXAMPLE phone number into a read-back.
         # A customer's booking always belongs to the number they message from —
@@ -3214,8 +3311,14 @@ def _reminder_name(name: str) -> str:
 def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> bool:
     """Send the appointment reminder in the customer's language, falling back to the default."""
     # Drop-off is 9-11am for everyone — a real window beats "your appointment time".
-    params = [_reminder_name(name), clean_car(car) or "car", clean_reg(reg) or "-",
-              when or "9 and 11am"]
+    # The template reads "drop the car in between {{4}}", so {{4}} must be a bare
+    # time window: a stored time_text like "Wednesday 02 September, 9-11am"
+    # produced "between Wednesday 02 September between 9 and 11am" (seen 2 Sep).
+    tidy_when = (when or "").strip()
+    if not re.fullmatch(r"[\d:.\s]+(?:am|pm)?\s*(?:-|to|and|–)\s*[\d:.\s]+(?:am|pm)?", tidy_when, re.I):
+        tidy_when = "9 and 11am"
+    params = [_reminder_name(name), clean_car(car) or "car",
+              clean_reg(reg) or "no reg on file", tidy_when]
     code = reminder_lang_code(lang)
     if _send_reminder_in(to, params, code):
         return True
@@ -3777,9 +3880,10 @@ ALERT_CHASE_HOURS = float(os.environ.get("ALERT_CHASE_HOURS", "3"))
 CHASE_SYSTEM = (
     "You are the NCTPass car garage's WhatsApp assistant. A customer asked something "
     "that had to be passed to a person, and nobody has replied to them yet. Write ONE "
-    "short, warm message apologising for the wait and letting them know we're still on "
-    "it, and asking whether they'd still like us to sort it. Keep it to one or two "
-    "lines, in the customer's own language. NEVER quote a price, never promise a date "
+    "short, warm message apologising that WE have kept them waiting and saying a "
+    "person will come back to them — the garage owes THEM the answer, so never ask "
+    "whether they 'still want it sorted' (that reads as if they were the slow one). "
+    "Keep it to one or two lines, in the customer's own language. NEVER quote a price, never promise a date "
     "or a specific answer, never invent anything, and never mention systems, alerts or "
     "colleagues being busy. If a follow-up would be inappropriate (they already said "
     "they're not interested, the matter is clearly closed, or it was a complaint that "
@@ -6573,8 +6677,9 @@ async def retell_function(request: Request):
                         date_label = datetime.strptime(fields["date"], "%Y-%m-%d").strftime("%A %d %B")
                     except Exception:
                         pass
+                    nice_name = fields['name'] if _reminder_name(fields['name']) != "there" else ""
                     confirm_text = (
-                        f"Hi{' ' + fields['name'] if fields['name'] else ''}! Confirming "
+                        f"Hi{' ' + nice_name if nice_name else ''}! Confirming "
                         f"your phone booking with NCTPass:\n\n"
                         f"Car: {fields['car'] or '(not given)'}\n"
                         f"Reg: {fields['reg'] or '(not given)'}\n"
