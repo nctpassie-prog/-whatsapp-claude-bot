@@ -5104,10 +5104,12 @@ def _fmt_ts(ts: float) -> str:
         return ""
 
 @app.get("/chats")
-def chats(token: str = Query(""), user: str = Query("")):
-    """Private web view of the bot's conversations with customers (token-guarded)."""
+def chats(token: str = Query(""), user: str = Query(""), limit: int = Query(100)):
+    """Private web view of the bot's conversations with customers (token-guarded).
+    &limit=N (max 400) lengthens the list — 100 rows no longer cover a 3-day audit."""
     if not can_review(token):
         return Response(status_code=403)
+    limit = max(1, min(int(limit or 100), 400))
     esc = __import__("html").escape
     if user:  # one conversation
         with closing(db()) as conn:
@@ -5133,7 +5135,7 @@ def chats(token: str = Query(""), user: str = Query("")):
         with closing(db()) as conn:
             convos = conn.execute(
                 "SELECT wa_user, MAX(ts) AS last_ts, COUNT(*) AS n FROM messages "
-                "GROUP BY wa_user ORDER BY last_ts DESC LIMIT 100").fetchall()
+                "GROUP BY wa_user ORDER BY last_ts DESC LIMIT ?", (limit,)).fetchall()
             names = dict((n, (nm, rg)) for n, nm, rg in conn.execute(
                 "SELECT wa_number, name, reg FROM customers").fetchall())
             lasts = {}
