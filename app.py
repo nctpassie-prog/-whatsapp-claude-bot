@@ -897,6 +897,8 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
         today = now_local().date().isoformat()
         if not freed_date or freed_date <= today:
             return  # same-day swaps are the team's call, not the bot's
+        if not (9 <= now_local().hour < 20):
+            return  # never text a waiting customer at night
         skip = "".join(ch for ch in str(skip_phone) if ch.isdigit())[-9:]
         with closing(db()) as conn:
             # One offer per customer per 20h — a burst of cancellations must
@@ -1377,6 +1379,17 @@ def db() -> sqlite3.Connection:
                  " headline TEXT, claimed_by TEXT DEFAULT '', claimed_ts REAL DEFAULT 0,"
                  " closed_ts REAL DEFAULT 0, closed_by TEXT DEFAULT '',"
                  " owner_ts REAL DEFAULT 0)")
+    # Tidy (2026-09-03): bookings stored with a phone like '0863891825',
+    # '085 811 9977' or '+353…' never received their reminder / review texts.
+    try:
+        for bid, ph in conn.execute(
+                "SELECT id, phone FROM bookings WHERE phone LIKE '0%' OR phone LIKE '+%'"
+                " OR phone LIKE '% %' OR phone LIKE '%-%'").fetchall():
+            fixed = normalize_phone(ph)
+            if fixed and fixed != ph:
+                conn.execute("UPDATE bookings SET phone = ? WHERE id = ?", (fixed, bid))
+    except sqlite3.OperationalError:
+        pass
     # What we actually charged for a job, logged by the owner after the work.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS charges ("
@@ -1700,6 +1713,41 @@ def booking_already_in_diary(fields: dict) -> bool:
             (date_, reg, phone, "%" + phone[-9:] if phone else "\x00")).fetchone()
     return bool(dupe)
 
+def clock_line() -> str:
+    """Tell the model what time it is and whether we are open — 3 Sep 2026 audit:
+    at 21:56 the bot told a breakdown customer 'the team is still looking into
+    whether we can squeeze you in today', and at 18:45 'call us right now'."""
+    now = now_local()
+    wd, hm = now.weekday(), now.hour + now.minute / 60
+    open_now = (wd < 5 and 9 <= hm < 18) or (wd == 5 and 9 <= hm < 14)
+    if open_now:
+        return f"It is now {now.strftime('%H:%M')} — the workshop is OPEN."
+    if wd == 6 or (wd == 5 and hm >= 14) or (wd == 4 and hm >= 18):
+        when = "on Monday morning at 9am"
+    elif hm >= 18:
+        when = "tomorrow morning at 9am"
+    else:
+        when = "this morning at 9am"
+    return (f"It is now {now.strftime('%H:%M')} — the workshop is CLOSED. Nobody is "
+            f"in the building; the team will see this chat {when}. So: never say the "
+            "team is 'looking into it now' or 'will call you shortly', never offer a "
+            "drop-off or an answer 'today', never tell the customer to ring now — say "
+            f"plainly that we are closed and the team will pick it up {when}. Bookings "
+            "for future days are still fine.")
+
+def normalize_phone(phone: str) -> str:
+    """Digits only, Irish numbers in international form: '086 389 1825',
+    '0863891825' and '+353 86 389 1825' all become 353863891825. Rows stored as
+    '0863891825' / '085 811 9977' (3 Sep 2026) never got reminders or reviews."""
+    d = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if d.startswith("00"):
+        d = d[2:]
+    if len(d) == 10 and d.startswith("0"):
+        d = "353" + d[1:]
+    elif len(d) == 9 and d[0] in "89":
+        d = "353" + d  # typed without the leading zero
+    return d
+
 def save_booking(fields: dict) -> bool:
     """Store a booking. Returns False if it was a duplicate and nothing was saved.
 
@@ -1748,7 +1796,9 @@ def save_booking(fields: dict) -> bool:
     # blank - it leaked into a voice confirmation as "Hi unknown!" (2 Sep).
     if (fields.get("name") or "").strip().lower() in _NOT_A_NAME:
         fields["name"] = ""
-    phone = "".join(ch for ch in str(fields.get("phone", "")) if ch.isdigit())
+    phone = normalize_phone(fields.get("phone", ""))
+    if phone:
+        fields["phone"] = phone
     if date_:
         with closing(db()) as conn:
             dupe = conn.execute(
@@ -2050,7 +2100,8 @@ def availability_block() -> str:
     today_line = (f"TODAY IS {today.strftime('%A %d %B %Y')}. Monday of THIS week is "
                   f"{(today - timedelta(days=today.weekday())).strftime('%d %B')}. "
                   "When you say a day name with a date, it MUST match this calendar and "
-                  "the availability list — never compute weekdays yourself.")
+                  "the availability list — never compute weekdays yourself. "
+                  + clock_line())
     opening_note = ""
     if opens and opens > today:
         opening_note = ("\n\nIMPORTANT: we are taking bookings from "
@@ -3625,11 +3676,18 @@ def send_due_reminders() -> None:
             # worse, the AI has no idea a reminder was sent when the customer
             # replies to it ("what time?" made no sense to the model before).
             try:
+                # Same values the template actually carried (3 Sep: the history
+                # showed "(-)" and "between Friday 4 September between" although
+                # the customer received the tidy version).
+                tidy = (tt or "").strip()
+                if not re.fullmatch(r"[\d:.\s]+(?:am|pm)?\s*(?:-|to|and|–)\s*[\d:.\s]+(?:am|pm)?",
+                                    tidy, re.I):
+                    tidy = "9 and 11am"
                 save_message(phone, "assistant",
                     f"Hi {_reminder_name(name)}, just a reminder that your "
-                    f"{clean_car(car) or 'car'} ({clean_reg(reg) or '-'}) is booked in "
+                    f"{clean_car(car) or 'car'} ({clean_reg(reg) or 'no reg on file'}) is booked in "
                     f"with NCTPass tomorrow. Please drop the car in between "
-                    f"{tt or '9 and 11am'} and we'll message you when it's ready. "
+                    f"{tidy} and we'll message you when it's ready. "
                     f"Reply here if you need to change anything.")
             except Exception:
                 log.exception("Failed to save reminder to history for %s", phone)
@@ -6390,8 +6448,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             return {"error": "Pass a phone number or reg, e.g. ?action=cancel&date=353874042032"}
         digits = "".join(c for c in who if c.isdigit())
         looks_like_phone = len(digits) >= 9 and digits == who.strip().lstrip("+")
-        res = cancel_booking(digits if looks_like_phone else "",
-                             {} if looks_like_phone else {"reg": who})
+        sel = {} if looks_like_phone else {"reg": who}
+        # &need=YYYY-MM-DD limits the cancellation to that one day (a ghost row
+        # left behind by a reschedule, without touching the customer's real booking).
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", (need or "").strip()):
+            sel["date"] = need.strip()
+        res = cancel_booking(digits if looks_like_phone else "", sel)
         return res
     if action == "caltidy":
         # List every event in the next 60 days, delete exact duplicates (same day +
@@ -6857,13 +6919,27 @@ TEXTBACK_PHONE_ID = os.environ.get("TEXTBACK_PHONE_ID", "335852741443330")
 # One invitation per caller per hour, and never while a colleague has the chat.
 _missed_call_replied: dict = {}
 _accepted_calls: set = set()
+_missed_calls: dict = {}          # digits -> timestamps of missed calls (24h)
+_missed_call_alerted: dict = {}   # digits -> when the team was last alerted
 
 def handle_missed_call(caller: str, arrived_on: str = "") -> None:
-    """A WhatsApp call rang out unanswered — invite the caller to chat instead."""
+    """A WhatsApp call rang out unanswered — invite the caller to chat instead.
+    A SECOND missed call inside 24h means the text-back did not work for this
+    person (3 Sep 2026: three numbers rang 2-4 times and only ever got the auto
+    text) — raise a needs-a-person alert so somebody rings them back."""
     digits = "".join(c for c in caller if c.isdigit())
     if not digits or is_blocked(digits):
         return
     now = time.time()
+    hist = [t for t in _missed_calls.get(digits, []) if now - t < 24 * 3600] + [now]
+    _missed_calls[digits] = hist
+    if len(hist) >= 2 and now - _missed_call_alerted.get(digits, 0) > 24 * 3600:
+        _missed_call_alerted[digits] = now
+        try:
+            alert_owner(digits, "📞 Missed WhatsApp call AGAIN — please ring them back",
+                        f"{len(hist)} missed calls in 24h and nothing typed in the chat")
+        except Exception:
+            log.exception("Missed-call alert failed for %s", digits)
     if now - _missed_call_replied.get(digits, 0) < 3600:
         return
     _missed_call_replied[digits] = now
