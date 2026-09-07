@@ -827,9 +827,14 @@ def cancel_booking(user: str, fields: dict) -> dict:
         where, args = ["date = ?"], [date_]
     if reg:
         where.append("UPPER(TRIM(COALESCE(reg,''))) = ?"); args.append(reg)
-    else:  # fall back to their phone number
+    elif len(digits) >= 7:  # fall back to their phone number
         where.append("REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?")
         args.append("%" + digits[-9:])
+    else:
+        # No reg and no usable phone would match EVERY future booking
+        # (LIKE '%') and wipe the diary — seen as a risk 7 Sep 2026.
+        log.warning("Cancellation with no reg and no phone refused (%r / %r)", user, fields)
+        return {"cancelled": 0, "error": "need a reg or a phone number"}
     with closing(db()) as conn:
         rows = conn.execute(
             f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
@@ -1796,9 +1801,24 @@ def save_booking(fields: dict) -> bool:
     # blank - it leaked into a voice confirmation as "Hi unknown!" (2 Sep).
     if (fields.get("name") or "").strip().lower() in _NOT_A_NAME:
         fields["name"] = ""
+    if (fields.get("car") or "").strip().lower() in _PLACEHOLDER_CAR:
+        fields["car"] = ""  # "Unknown" / "..." in the diary is worse than blank
     phone = normalize_phone(fields.get("phone", ""))
     if phone:
         fields["phone"] = phone
+    if len(phone) < 9 and not reg:
+        # Nothing identifies the customer — a row like name "...", phone "..."
+        # (7 Sep 2026) can never be reminded, found or cancelled. Refuse it and
+        # tell the owner so the chat gets a look.
+        log.warning("Booking with no usable phone and no reg refused: %r", fields)
+        try:
+            send_telegram("⚠️ A booking came through with no phone number and no reg "
+                          f"({fields.get('name') or 'no name'}, {fields.get('car') or 'no car'}, "
+                          f"{fields.get('need','')} on {date_ or '?'}). Not added to the diary — "
+                          "please check the chat and add it by hand if it's real.")
+        except Exception:
+            pass
+        return False
     if date_:
         with closing(db()) as conn:
             dupe = conn.execute(
@@ -2138,6 +2158,8 @@ def already_seen(msg_id: str) -> bool:
     return False
 
 def save_message(user: str, role: str, content: str) -> None:
+    if role == "assistant":
+        content = fix_mojibake(content)  # history must match what the customer got
     with closing(db()) as conn, conn:
         conn.execute(
             "INSERT INTO messages (wa_user, role, content, ts) VALUES (?, ?, ?, ?)",
@@ -2519,8 +2541,10 @@ def watch_staff_booking(user: str) -> None:
                           "couldn't tell which car or job — please add it to the "
                           f"diary by hand. https://wa.me/{user}")
             return
-        fields.setdefault("phone", user)
-        if not fields.get("phone"):
+        # The customer's own WhatsApp number always wins over whatever the model
+        # wrote in the marker — a marker with phone=... created a booking row
+        # whose name, car and phone were all "..." (7 Sep 2026).
+        if len(normalize_phone(fields.get("phone", ""))) < 9:
             fields["phone"] = user
         added = save_booking(fields)  # dedupe inside — safe to run repeatedly
         if not added:
@@ -3358,10 +3382,29 @@ def send_endpoint(phone_id: str = "") -> tuple:
 def graph_url_for(phone_id: str = "") -> str:
     return send_endpoint(phone_id)[0]
 
+_L1_RUN = re.compile(r"[-ÿ]{2,}")
+
+def fix_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was decoded as Latin-1 ('metÅ³' -> 'metų',
+    'Ã©' -> 'é'). A Lithuanian reply went out like that on 5 Sep 2026. Only runs
+    of two or more Latin-1-range characters are touched, and a run is only
+    replaced when it decodes cleanly as UTF-8 — emoji, '€' and single accented
+    letters are outside the pattern and stay as they are."""
+    if not text or not _L1_RUN.search(text):
+        return text
+    def repair(m):
+        run = m.group(0)
+        try:
+            return run.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return run
+    return _L1_RUN.sub(repair, text)
+
 def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
     if not (text and text.strip()):
         log.info("Skipping empty message to %s", to)
         return
+    text = fix_mojibake(text)
     # Never send the exact same text to the same customer twice in quick
     # succession — that is only ever a glitch (double webhook, two triggers
     # firing together), and customers got identical doubles from it.
@@ -3450,7 +3493,10 @@ def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
 # ("Unknown", "(no name)", "-"), and `or "there"` only catches the empty case —
 # a real customer genuinely received "Hi. Unknown. Just a reminder that your
 # rental traffic is booked in tomorrow" and had to ask what it meant.
-_NOT_A_NAME = {"unknown", "(no name)", "no name", "n/a", "na", "-", "?", "customer", "(none)"}
+_NOT_A_NAME = {"unknown", "(no name)", "no name", "n/a", "na", "-", "?", "customer", "(none)",
+               "...", "…", "tbc", "tba", "none", "null", "name", "unknown name"}
+_PLACEHOLDER_CAR = {"unknown", "(none)", "...", "…", "tbc", "tba", "none", "null", "car", "n/a", "-",
+                    "unknown make model", "unknown make", "unknown car", "?"}
 
 def _reminder_name(name: str) -> str:
     n = (name or "").strip()
@@ -4871,13 +4917,36 @@ def evening_reg_check() -> None:
             (now.date().isoformat(),)).fetchall()
         checked = {r[0] for r in conn.execute("SELECT booking_id FROM reg_checked").fetchall()}
     flagged = 0
+    with closing(db()) as conn, conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS reg_alerted (booking_id INTEGER PRIMARY KEY)")
+    with closing(db()) as conn:
+        alerted = {r[0] for r in conn.execute("SELECT booking_id FROM reg_alerted").fetchall()}
     for bid, name, phone, car, reg, date_ in rows:
-        if bid in checked:
-            continue
         car = (car or "").strip()
-        missing_car = not car or car.lower() in ("unknown", "(none)")
+        missing_car = not car or car.lower() in _PLACEHOLDER_CAR
         missing_reg = reg_looks_off(reg)
         digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+        if bid in checked:
+            # Already asked once and still missing, and the day is close: the
+            # customer never answered (Vernon, ID.4 with reg 212D12345, 3-7 Sep
+            # 2026) — tell the team once so somebody rings for it.
+            try:
+                soon = (datetime.strptime(date_, "%Y-%m-%d").date() - now.date()).days <= 2
+            except Exception:
+                soon = False
+            if (missing_car or missing_reg) and soon and bid not in alerted:
+                what = " and ".join(w for w, m in (("car make/model", missing_car),
+                                                    ("registration", missing_reg)) if m)
+                try:
+                    send_telegram(f"📋 Still no {what} for {name or 'a customer'}"
+                                  f"{' +' + digits if digits else ''} booked {date_}"
+                                  f" ({car or 'car?'} {reg or 'reg?'}). They were texted "
+                                  "for it and never answered — please ring them.")
+                except Exception:
+                    log.exception("Reg-still-missing alert failed for booking %s", bid)
+                with closing(db()) as conn, conn:
+                    conn.execute("INSERT OR IGNORE INTO reg_alerted (booking_id) VALUES (?)", (bid,))
+            continue
         if (missing_car or missing_reg) and digits and not is_blocked(digits) and not is_paused(digits):
             what = []
             if missing_car:
@@ -5995,11 +6064,30 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             target = now_local().date() + timedelta(days=1)
         with closing(db()) as conn:
             rows = conn.execute(
-                "SELECT name, phone, car, reg, need FROM bookings WHERE date = ? "
+                "SELECT name, phone, car, reg, need, id, COALESCE(created_ts, 0), "
+                "COALESCE(time_text, '') FROM bookings WHERE date = ? "
                 "ORDER BY id", (target.isoformat(),)).fetchall()
         return {"date": target.isoformat(),
                 "cars": [{"name": n or "(no name)", "car": c, "reg": rg,
-                          "job": nd, "phone": p} for n, p, c, rg, nd in rows]}
+                          "job": nd, "phone": p, "id": bid,
+                          "created": datetime.fromtimestamp(
+                              cts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
+                          if cts else "", "time": tt}
+                         for n, p, c, rg, nd, bid, cts, tt in rows]}
+    if action == "delbooking":
+        # Delete ONE booking row by id (ids come from ?action=day). For ghost
+        # rows the cancel action cannot address (no reg, garbage phone).
+        try:
+            bid = int((date or "").strip())
+        except ValueError:
+            return {"error": "Pass the booking id from ?action=day as date=<id>"}
+        with closing(db()) as conn, conn:
+            row = conn.execute("SELECT name, phone, car, reg, date FROM bookings WHERE id = ?",
+                               (bid,)).fetchone()
+            if not row:
+                return {"deleted": 0}
+            conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
+        return {"deleted": 1, "was": dict(zip(("name", "phone", "car", "reg", "date"), row))}
     if action == "regcheck":
         # Force the evening reg/make-model check to run right now, regardless
         # of the hour — for testing, or to run it on demand.
@@ -7417,7 +7505,23 @@ def _get_user_lock(user: str) -> threading.Lock:
 
 def _serialized(user: str, fn, *args, **kwargs) -> None:
     with _get_user_lock(user):
-        fn(*args, **kwargs)
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            # 7 Sep 2026: a handler that raised (model error, media fetch, a
+            # crash on an odd character) simply vanished — the customer's
+            # message was never saved and nobody was told. Leave a trace in
+            # the chat and wake a person so the customer is not left hanging.
+            log.exception("Inbound handler %s crashed for %s", getattr(fn, "__name__", fn), user)
+            try:
+                save_message(user, "user", "[A message arrived here that the bot could not "
+                                           "process — please read it in the WhatsApp app]")
+                if not is_blocked(user):
+                    alert_owner(user, "⚠️ The bot crashed on this customer's message — "
+                                      "please reply to them by hand",
+                                "Bot error while reading the message; nothing was sent back")
+            except Exception:
+                log.exception("Could not record the crashed inbound for %s", user)
 
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
