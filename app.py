@@ -5169,7 +5169,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "askbot", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -6469,6 +6469,26 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "body": exc.response.text[:600], "model": model}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400], "model": model}
+    if action == "askbot":
+        # Dry-run the bot: ?need=<customer message> (optional &date=<lang hint>).
+        # Runs the SAME model + knowledge base + availability the customers get,
+        # for a synthetic first-time customer, and returns the raw reply. Nothing
+        # is saved, nothing is sent, no marker is acted on, no alert fires —
+        # the rules-testing hook (8 Sep 2026).
+        q = (need or "").strip()
+        if not q:
+            return {"error": "need=<the customer's message> required"}
+        fake_user = "353000000000"
+        dynamic = availability_block() + WELCOME_HINT
+        try:
+            raw = _call_claude_visible([{"role": "user", "content": q}],
+                                       (load_system_prompt(), dynamic), fake_user)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:400]}
+        markers = re.findall(r"<<<([A-Z_]+)", raw or "")
+        visible = re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip()
+        return {"ok": True, "question": q, "reply": visible, "markers": markers,
+                "raw_length": len(raw or "")}
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
         # the fingerprint of an inbound that died unsaved (photo reader crash
