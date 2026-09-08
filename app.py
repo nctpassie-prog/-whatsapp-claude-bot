@@ -2980,6 +2980,34 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
         retry = system_prompt + RETRY_NUDGE
     return _call_claude(messages, retry, user)
 
+_AFTER_HOURS_SUBS = [
+    (re.compile(r"\bright back to you\b", re.I), "back to you {when}"),
+    (re.compile(r"\b(?:very )?shortly\b", re.I), "{when}"),
+    (re.compile(r"\bin a (?:few|couple of) minutes\b", re.I), "{when}"),
+    (re.compile(r"\bwithin the hour\b", re.I), "{when}"),
+    (re.compile(r"\bstraight ?away\b", re.I), "{when}"),
+    (re.compile(r"\bas soon as possible\b", re.I), "{when}"),
+]
+_CLOCK_WHEN_RE = re.compile(r"will see this chat (.+?)\. So:")
+
+def after_hours_wording(text: str) -> str:
+    """When the workshop is closed, swap the model's 'shortly' / 'right back to
+    you' / 'straight away' for the honest time ('tomorrow morning at 9am').
+    8 Sep 2026: a 23:50 handover still promised a colleague would 'come back to
+    them shortly' despite the clock_line rule — the model slips, the regex does
+    not. Only runs outside opening hours; open-hours text is never touched."""
+    try:
+        line = clock_line()
+        if "is CLOSED" not in line:
+            return text
+        m = _CLOCK_WHEN_RE.search(line)
+        when = m.group(1) if m else "when we open"
+    except Exception:
+        return text
+    for rx, rep in _AFTER_HOURS_SUBS:
+        text = rx.sub(rep.format(when=when), text)
+    return text
+
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
@@ -2999,6 +3027,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             "they asked.")
             except Exception:
                 log.exception("Failed to alert owner about truncated marker")
+    answer = after_hours_wording(answer)
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     # OFFER-THEN-RETRACT guard (2026-09-02, the #1 customer-facing defect that day:
