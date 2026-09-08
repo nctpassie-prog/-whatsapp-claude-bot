@@ -6515,9 +6515,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400]}
         markers = re.findall(r"<<<([A-Z_]+)", raw or "")
-        visible = re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip()
+        # Same after-hours wording guard the real send path applies.
+        visible = after_hours_wording(re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip())
         return {"ok": True, "question": q, "reply": visible, "markers": markers,
-                "raw_length": len(raw or "")}
+                "clock": clock_line()[:60], "raw_length": len(raw or "")}
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
         # the fingerprint of an inbound that died unsaved (photo reader crash
