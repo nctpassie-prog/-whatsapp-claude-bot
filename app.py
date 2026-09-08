@@ -1753,6 +1753,16 @@ def normalize_phone(phone: str) -> str:
         d = "353" + d  # typed without the leading zero
     return d
 
+def is_day_full(date_str: str) -> bool:
+    """Check the authoritative count from DB — never rely on cached availability."""
+    try:
+        with closing(db()) as conn:
+            booked = conn.execute(
+                "SELECT COUNT(*) FROM bookings WHERE date = ?", (date_str,)).fetchone()[0]
+        return booked >= 10
+    except Exception:
+        return False  # If we can't check, let the save attempt (safer than refusing)
+
 def save_booking(fields: dict) -> bool:
     """Store a booking. Returns False if it was a duplicate and nothing was saved.
 
@@ -1816,6 +1826,14 @@ def save_booking(fields: dict) -> bool:
                           f"({fields.get('name') or 'no name'}, {fields.get('car') or 'no car'}, "
                           f"{fields.get('need','')} on {date_ or '?'}). Not added to the diary — "
                           "please check the chat and add it by hand if it's real.")
+        except Exception:
+            pass
+        return False
+    if date_ and is_day_full(date_):
+        log.warning("Booking refused: %s is at 10/10 capacity (race condition guard)", date_)
+        try:
+            send_telegram(f"⚠️ Race condition: tried to book {date_} but it's now full. "
+                          f"Check diary and manually add if the customer confirmed a different day.")
         except Exception:
             pass
         return False
