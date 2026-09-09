@@ -7404,8 +7404,37 @@ async def retell_function(request: Request):
                   "date": (args.get("date") or "").strip(), "time": "", "lang": "",
                   # Earlier day the caller wanted but couldn't have -> waiting list.
                   "wanted": (args.get("wanted") or "").strip()}
-        if not fields["date"]:
-            return {"booked": False, "reason": "no date given"}
+        # Parse and validate the date BEFORE any other checks. Accept any format parse_day understands.
+        raw = str(fields.get("date") or "").strip()
+        iso = parse_day(raw) or (parse_day(raw[:10]) if re.match(r'^\d{4}-\d{2}-\d{2}', raw) else "")
+        if not iso:
+            return {"booked": False, "reason": "I need the date as YYYY-MM-DD from the available days list"}
+        today = now_local().date()
+        if iso < today.isoformat():
+            return {"booked": False, "reason": "that date has already passed — pick a future date from check_availability"}
+        fields["date"] = iso
+        # Parse wanted date too (for waitlist).
+        if fields["wanted"]:
+            wanted_iso = parse_day(fields["wanted"]) or (parse_day(fields["wanted"][:10]) if re.match(r'^\d{4}-\d{2}-\d{2}', fields["wanted"]) else "")
+            if wanted_iso and wanted_iso >= today.isoformat():
+                fields["wanted"] = wanted_iso
+            else:
+                fields["wanted"] = ""
+        # Server-side capacity gates (date is now parsed and validated).
+        try:
+            d = dt.date.fromisoformat(iso)
+        except Exception:
+            return {"booked": False, "reason": "date format error — use YYYY-MM-DD"}
+        if before_open_date(iso):
+            return {"booked": False, "reason": "we are not taking bookings for that date yet — pick from check_availability"}
+        if day_capacity(d) == 0:
+            return {"booked": False, "reason": "we are closed that day — pick from check_availability"}
+        need = fields["need"]
+        r = day_full_reason(iso, need)
+        if r == "hard":
+            return {"booked": False, "reason": "that day is full for hard jobs (Saturdays are services only) — pick another date from check_availability"}
+        if r:
+            return {"booked": False, "reason": "that day is fully booked — pick from check_availability"}
         # Owner's rule: NEVER finalize a booking without both the car make/model
         # AND the registration — ask the caller for whichever is still missing.
         if not clean_car(fields["car"]):
