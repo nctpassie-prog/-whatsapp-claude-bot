@@ -1264,6 +1264,18 @@ def process_handover(answer: str):
             fields[key.strip().lower()] = value.strip()
     return clean, fields
 
+# Phrases that TELL THE CUSTOMER a person has been told. If a reply contains one
+# but no HANDOVER marker came with it, nobody was actually told and the customer
+# waits for a callback that was never queued. Seen 9 Sep 2026: "I've passed this
+# straight to the team and they'll come back to you first thing tomorrow" with no
+# marker at all. The promise itself now raises the alert.
+_CLAIMS_A_PERSON_RE = re.compile(
+    r"passed (?:this|it|that|your|these)|flagged (?:this|it|that)|let the team know"
+    r"|told (?:the team|a colleague|Dima|Vlad)|the team will (?:come back|be in touch|reply|call|ring)"
+    r"|a colleague will (?:come back|be in touch|reply|call|ring)|someone will (?:come back|call|ring|be in touch)"
+    r"|they.ll (?:come back|be in touch|call you|ring you)|will (?:come|get) back to you",
+    re.IGNORECASE)
+
 def notify_owner_handover(number: str, fields: dict) -> None:
     """Ping the owner when the bot defers something to a human, so they can follow up."""
     number = "".join(ch for ch in str(number) if ch.isdigit())
@@ -3254,6 +3266,15 @@ def _finish_reply(user: str, answer: str) -> str:
             notify_owner_handover(user, handover)
         except Exception:
             log.exception("Failed to notify owner of handover")
+    # If the reply PROMISED a person but the model forgot the marker, raise the
+    # alert anyway — otherwise the bot lies and the customer is never called back.
+    if handover is None and not is_owner and _CLAIMS_A_PERSON_RE.search(answer or ""):
+        log.warning("Reply to %s promised a person with no HANDOVER marker — alerting anyway", user)
+        try:
+            notify_owner_handover(user, {"reason": "the bot told this customer that a "
+                                                   "person would come back to them"})
+        except Exception:
+            log.exception("Implied-handover alert failed")
     # Safety net: if the visible reply came out blank (e.g. Claude returned only a
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
