@@ -3704,6 +3704,8 @@ def send_parts_orders() -> None:
             if _SERVICE_PARTS_RE.search(n or "") and "TEST" not in (r or "").upper()]
     set_setting("parts_order_sent", today)  # once per day, even when nothing to order
     if not cars:
+        set_setting("parts_last", json.dumps({"ran": now.strftime("%Y-%m-%d %H:%M"),
+                                              "for": target, "cars": 0, "posted": "nothing to order"}))
         return
     day_label = datetime.strptime(target, "%Y-%m-%d").strftime("%A %d %B")
     when_word = "Monday" if wd == 5 else "tomorrow"
@@ -3745,6 +3747,17 @@ def send_parts_orders() -> None:
         send_telegram_private(note + "\n\n" + msg)
     except Exception:
         log.exception("Parts order Telegram send failed")
+    # Visible on ?action=status so "did the parts order go out?" is a one-call
+    # check instead of a Railway-log hunt (9 Sep 2026).
+    try:
+        set_setting("parts_last", json.dumps({
+            "ran": now.strftime("%Y-%m-%d %H:%M"), "for": target, "cars": len(cars),
+            "posted": ("supplier group" if in_group else
+                       "supplier number" if PARTS_ORDER_TO else
+                       "NOT posted - copy sent to owner's Telegram to forward"),
+            "message": msg[:1500]}))
+    except Exception:
+        log.exception("Could not record parts_last")
 
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
