@@ -6853,6 +6853,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         days.append({"date": iso, "day": d.strftime("%a"), "used": used, "capacity": day_capacity(d)})
     return {
         "bot_enabled": bot_enabled(),
+        "parts_last": json.loads(get_setting("parts_last") or "null"),
         "allowed_phone_ids": sorted(ALLOWED_PHONE_IDS) or "(not set - answering on ALL numbers)",
         "today": today.isoformat(),
         "total_bookings": total_bookings,
