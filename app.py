@@ -3795,7 +3795,7 @@ def send_parts_orders() -> None:
         try:
             send_whatsapp("".join(ch for ch in PARTS_ORDER_TO if ch.isdigit()), msg,
                           from_phone_id=PARTS_FROM_PHONE_ID)
-            log.info("Parts order sent to supplier for %s (%d cars)", tomorrow, len(cars))
+            log.info("Parts order sent to supplier for %s (%d cars)", target, len(cars))
         except Exception:
             log.exception("Parts order WhatsApp send failed")
     try:
@@ -7498,7 +7498,10 @@ async def retell_function(request: Request):
                 fields["wanted"] = ""
         # Server-side capacity gates (date is now parsed and validated).
         try:
-            d = dt.date.fromisoformat(iso)
+            # 9 Sep 2026: this said dt.date.fromisoformat, but 'dt' is not imported
+            # anywhere in this file - so EVERY phone booking fell into the except
+            # below and the caller was told 'date format error' whatever they said.
+            d = date.fromisoformat(iso)
         except Exception:
             return {"booked": False, "reason": "date format error — use YYYY-MM-DD"}
         if before_open_date(iso):
