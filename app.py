@@ -2014,18 +2014,25 @@ def is_hard_job(need: str) -> bool:
 # work happens on any quiet day while it sits here. So a long-stay drop-off is
 # outside the hard-job quota: it never counts towards the 4-a-day cap, and the cap
 # never refuses one. It still occupies a place in the diary so staff can see it.
-_LONG_STAY_RE = re.compile(
-    r"long ?stay"
-    r"|with us until"
-    r"|leav[a-z]* it with (?:us|you)"
-    r"|(?:keep|hold) it (?:for|until) (?:a |the )?(?:week(?!end)|fortnight|two weeks|2 weeks|couple of weeks|month)"
-    r"|away for (?:a |the )?(?:week(?!end)|fortnight|two weeks|2 weeks|couple of weeks|month)"
-    r"|until (?:we|they|i) (?:are |get |come )?back",
+# Two cues are required, never one: "leave it with you for the weekend" is NOT a
+# long stay, and treating it as one would quietly let real ramp work past the cap.
+_LONG_STAY_MARKER_RE = re.compile(r"long ?stay|with us until", re.IGNORECASE)
+_LEAVE_CUE_RE = re.compile(
+    r"leav[a-z]* it with (?:us|you)|leav[a-z]* the car with (?:us|you)"
+    r"|(?:keep|hold) it (?:for|until)|until (?:we|they|i) (?:are |get |come )?back"
+    r"|away for|while (?:we|they|i) (?:are |re )?away",
+    re.IGNORECASE)
+_LONG_DURATION_RE = re.compile(
+    r"week(?!end)|fortnight|month|holiday|abroad|until (?:we|they|i) (?:are |get |come )?back",
     re.IGNORECASE)
 
 def is_long_stay(need: str) -> bool:
-    """The customer is leaving the car with us for a week or more."""
-    return bool(_LONG_STAY_RE.search(need or ""))
+    """The customer is leaving the car with us for a week or more, so it uses no
+    ramp time on the day it arrives."""
+    n = need or ""
+    if _LONG_STAY_MARKER_RE.search(n):
+        return True
+    return bool(_LEAVE_CUE_RE.search(n) and _LONG_DURATION_RE.search(n))
 
 def _hard_count(date_str: str) -> int:
     with closing(db()) as conn:
@@ -3092,6 +3099,59 @@ def after_hours_wording(text: str) -> str:
         text = rx.sub(rep.format(when=when), text)
     return text
 
+# Words that make a sentence about BOOKING rather than just mentioning a date.
+# Listing every way the model can phrase an offer is hopeless — 9 Sep 2026 it used
+# "Monday 14 September is available for drop-off ... would you like me to book you
+# in?", which no phrase list of mine contained. So instead: any day named inside a
+# booking-ish sentence is treated as an offer and checked against the diary.
+_BOOKINGISH_RE = re.compile(
+    r"book|drop|bring|come in|call in|pop in|slot|appointment|available|free|suit|"
+    r"take you|see you|works for|we can do|fit you|leave it with|leave the car",
+    re.IGNORECASE)
+_SENTENCE_ENDS = ".!?" + chr(10)
+
+def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
+    """If a reply offers a day this job cannot actually have, swap in the honest
+    message instead. Shared by the live reply path and the ?action=askbot dry run,
+    so a dry run tests the real guard and not just the model (9 Sep 2026).
+    """
+    try:
+        text = answer or ""
+        prop = _PROPOSAL_RE.search(text)
+        conversational = False
+        if not prop:
+            for m in _DAY_MENTION_RE.finditer(text):
+                lo = max([text.rfind(c, 0, m.start()) for c in _SENTENCE_ENDS] + [-1])
+                hi = min([h for h in (text.find(c, m.end()) for c in _SENTENCE_ENDS)
+                          if h != -1] + [len(text)])
+                if _BOOKINGISH_RE.search(text[lo + 1:hi]):
+                    prop, conversational = m, True
+                    break
+        if not prop:
+            return answer
+        day_num = int(prop.group("day"))
+        month_name = prop.group("mon").capitalize()
+        today = now_local().date()
+        pd = date(today.year, _MONTHS.index(month_name) + 1, day_num)
+        if pd < today - timedelta(days=30):
+            pd = pd.replace(year=pd.year + 1)
+        need = "" if conversational else (prop.group("need") or "")
+        if not need:
+            need = need_hint or _recent_customer_words(user)
+        reason = day_full_reason(pd.isoformat(), need)
+        if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
+            alt = next_day_for_job(need)
+            msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
+            lang = _guess_lang_code(text)
+            answer = (msg.get(lang, msg["en"]).format(alt=alt)
+                      if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]))
+            log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
+                     user, pd, reason, need[:60],
+                     "conversational" if conversational else "confirm-format")
+    except Exception:
+        log.exception("Proposal capacity guard failed (reply sent unchanged)")
+    return answer
+
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
@@ -3121,34 +3181,7 @@ def _finish_reply(user: str, answer: str) -> str:
     # "sorry, that day is full". Run the SAME gate at the proposal step and swap
     # in the honest message before the false offer ever goes out.
     if not booking and not is_owner:
-        try:
-            prop = _PROPOSAL_RE.search(answer or "")
-            conversational = False
-            if not prop and _OFFER_HINT_RE.search(answer or ""):
-                prop = _DAY_MENTION_RE.search(answer or "")
-                conversational = bool(prop)
-            if prop:
-                day_num = int(prop.group("day"))
-                month_name = prop.group("mon").capitalize()
-                today = now_local().date()
-                pd = date(today.year, _MONTHS.index(month_name) + 1, day_num)
-                if pd < today - timedelta(days=30):
-                    pd = pd.replace(year=pd.year + 1)
-                need = "" if conversational else (prop.group("need") or "")
-                if not need:
-                    need = _recent_customer_words(user)
-                reason = day_full_reason(pd.isoformat(), need)
-                if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
-                    alt = next_day_for_job(need)
-                    msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
-                    lang = _guess_lang_code(answer)
-                    answer = (msg.get(lang, msg["en"]).format(alt=alt)
-                              if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]))
-                    log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
-                             user, pd, reason, need[:60],
-                             "conversational" if conversational else "confirm-format")
-        except Exception:
-            log.exception("Proposal capacity guard failed (reply sent unchanged)")
+        answer = guard_day_proposal(user, answer)
     if booking and not is_owner:
         # The model once copied its own EXAMPLE phone number into a read-back.
         # A customer's booking always belongs to the number they message from —
@@ -6631,6 +6664,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         markers = re.findall(r"<<<([A-Z_]+)", raw or "")
         # Same after-hours wording guard the real send path applies.
         visible = after_hours_wording(re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip())
+        # run the real capacity guard too, with the question standing in for the
+        # customer's recent words, so a dry run reflects what would actually be sent
+        visible = guard_day_proposal(fake_user, visible, need_hint=q)
         return {"ok": True, "question": q, "reply": visible, "markers": markers,
                 "clock": clock_line()[:60], "raw_length": len(raw or "")}
     if action == "ghosts":
