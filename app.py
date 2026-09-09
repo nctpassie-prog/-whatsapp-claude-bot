@@ -5239,6 +5239,77 @@ def evening_reg_check() -> None:
     if flagged:
         log.info("Evening reg check: flagged %d bookings", flagged)
 
+def outstanding_invoices(min_hours: float = 0.0):
+    """Invoice requests nobody has marked as sent. The delivery log for 26 Aug -
+    7 Sep 2026 shows every request reached the accountant's WhatsApp and was READ
+    within the hour, yet customers kept chasing - so the gap is after delivery.
+    Fire-and-forget is what let Des Monahan ask three times, so requests are now
+    tracked until somebody says they went out.
+    """
+    cutoff = time.time() - min_hours * 3600
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS invoice_requests ("
+                         " key TEXT PRIMARY KEY, n INTEGER, first_ts REAL, last_ts REAL)")
+            try:
+                conn.execute("ALTER TABLE invoice_requests ADD COLUMN done_ts REAL")
+            except Exception:
+                pass  # column already there
+            try:
+                conn.execute("ALTER TABLE invoice_requests ADD COLUMN chased_ts REAL")
+            except Exception:
+                pass
+            return conn.execute(
+                "SELECT key, n, first_ts, last_ts, COALESCE(chased_ts, 0) FROM invoice_requests"
+                " WHERE done_ts IS NULL AND last_ts <= ? ORDER BY first_ts", (cutoff,)).fetchall()
+    except Exception:
+        log.exception("Could not read outstanding invoice requests")
+        return []
+
+def mark_invoice_done(key_fragment: str) -> int:
+    """Mark matching invoice request(s) as sent. Fragment = phone or reg."""
+    frag = (key_fragment or "").upper().replace(" ", "")
+    if not frag:
+        return 0
+    try:
+        with closing(db()) as conn, conn:
+            cur = conn.execute("UPDATE invoice_requests SET done_ts = ? WHERE done_ts IS NULL"
+                               " AND UPPER(key) LIKE ?", (time.time(), "%" + frag + "%"))
+            return cur.rowcount
+    except Exception:
+        log.exception("Could not mark invoice done")
+        return 0
+
+def chase_outstanding_invoices() -> None:
+    """Once a request is a working day old and still not marked sent, remind the
+    accountant and tell the owner. Once only, in daytime.
+    """
+    now = now_local()
+    if not (9 <= now.hour < 19) or now.weekday() == 6:
+        return
+    wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
+    for key, n, first_ts, last_ts, chased in outstanding_invoices(min_hours=20):
+        if chased:
+            continue
+        phone, _, reg = key.partition("|")
+        days = max(1, int((time.time() - first_ts) / 86400))
+        note = ("🧾 Invoice still not sent" + chr(10)
+                + f"Reg {reg or '?'} - customer +{phone}" + chr(10)
+                + f"Asked {n} time(s), first {days} day(s) ago." + chr(10)
+                + f"Details: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}&user={phone}")
+        try:
+            if wa:
+                send_whatsapp(wa, note)
+            send_telegram_private(note)
+        except Exception:
+            log.exception("Invoice chase failed for %s", key)
+        try:
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE invoice_requests SET chased_ts = ? WHERE key = ?",
+                             (time.time(), key))
+        except Exception:
+            log.exception("Could not record invoice chase")
+
 def send_daily_briefing(force: bool = False) -> None:
     """Every morning: who's in today, and who is still waiting on a person.
 
@@ -5287,6 +5358,15 @@ def send_daily_briefing(force: bool = False) -> None:
     else:
         parts.append("")
         parts.append("✅ Nobody waiting on a reply — all clear.")
+    inv = outstanding_invoices()
+    if inv:
+        parts.append("")
+        parts.append(f"🧾 INVOICES NOT MARKED SENT ({len(inv)}):")
+        for key, cnt, first_ts, _last, _chased in inv[:10]:
+            ph, _, rg = key.partition("|")
+            days = int((time.time() - first_ts) / 86400)
+            parts.append(f"  • {rg or '(no reg)'} +{ph} — asked {cnt}x, {days}d old")
+        parts.append("  (mark one sent: ?action=invoicedone&phone=<reg or number>)")
     body = "\n".join(parts)
     try:
         send_telegram(body)
@@ -5317,6 +5397,10 @@ def reminder_loop() -> None:
             send_parts_orders()
         except Exception:
             log.exception("Parts order error")
+        try:
+            chase_outstanding_invoices()
+        except Exception:
+            log.exception("Invoice chase loop error")
         try:
             send_due_reviews()
         except Exception:
@@ -5421,7 +5505,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "askbot", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
