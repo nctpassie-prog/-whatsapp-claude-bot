@@ -1960,8 +1960,17 @@ def day_capacity(d) -> int:
 DIAG_SLOTS_PER_DAY = 2
 _DIAG_RE = re.compile(
     r"diagnos|warning light|engine light|dash(board)? (light|fault)|noise|rattl|knock"
-    r"|leak|misfire|\bp0\d|fault code|smoke|vibrat|cutting out|cuts out"
-    r"|loss of power|won'?t start|wont start|not starting|juddering|check (it|the car) over",
+    r"|leak|misfire|\bp0\d|fault code|smoke|vibrat|\bcut(?:s|ting)? out"
+    r"|loss of power|won'?t start|wont start|not starting|juddering|check (it|the car) over"
+    # 9 Sep 2026 (Tom Shields, Renault Clio): the customer wrote "spluttering ... would
+    # cut out" and this list matched NOTHING, so the day looked bookable and the bot
+    # offered Monday 14th. 41 minutes later the model's own booking marker called the
+    # same job a "diagnostic", the hard-job gate refused the day, and the customer was
+    # told sorry-that-day-is-full AFTER saying yes. Both paths must judge one job the
+    # same way, so the plain-English symptoms customers actually type belong here too.
+    r"|splutter|sputter|\bstall|hesitat|limp mode|rough idle|idl\w* rough"
+    r"|running rough|jerk|overheat|hard to start|slow to start|struggl\w* to start"
+    r"|losing power|power loss",
     re.IGNORECASE)
 
 def is_diagnostic_job(need: str) -> bool:
@@ -2896,6 +2905,51 @@ _PROPOSAL_RE = re.compile(
     r"[^\n]{0,80}?\bShall I book you in\b",
     re.IGNORECASE)
 
+_DAY_MENTION_RE = re.compile(
+    r"\b(?:" + "|".join(_WEEKDAYS) + r")\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+"
+    r"(?P<mon>" + "|".join(_MONTHS) + r")\b", re.IGNORECASE)
+# Wording that means the bot is OFFERING a day rather than confirming one that is
+# already in the diary. 9 Sep 2026, Tom Shields: "Could you bring it in on Monday
+# 14 September between 9 and 11am" sailed past the strict proposal guard (which
+# needs "drop-off <day> ... Shall I book you in"), the customer replied with his
+# reg, and only THEN did the capacity gate refuse the day — offer-then-retract,
+# the owner's number one complaint, 41 minutes apart.
+_OFFER_HINT_RE = re.compile(
+    r"could you (?:bring|drop|get|make)|can you (?:bring|drop|get)|"
+    r"would you (?:like to )?(?:bring|drop)|bring (?:it|the car|them) in on|"
+    r"bring it up on|drop (?:it|the car) (?:in|up|off) on|"
+    r"would that (?:suit|work)|does that (?:suit|work)|would .{0,25} suit you|"
+    r"we (?:have|do have) (?:space|room|a slot|availability)|we could take|"
+    r"i can offer|i could offer|shall i (?:book|put)|how about|what about",
+    re.IGNORECASE)
+
+def _recent_customer_words(user: str, limit: int = 4) -> str:
+    """The customer's own last few messages — the best description of the job when
+    the bot proposes a day in ordinary words and there is no booking marker yet."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
+                " ORDER BY id DESC LIMIT ?", (user, limit)).fetchall()
+        return " ".join((r[0] or "") for r in rows)
+    except Exception:
+        return ""
+
+def _has_booking_on(user: str, iso: str) -> bool:
+    """True if this customer already has a booking that day — a re-confirmation
+    must never be rewritten into 'that day is full'."""
+    digits = "".join(c for c in str(user) if c.isdigit())
+    if len(digits) < 7:
+        return False
+    try:
+        with closing(db()) as conn:
+            return bool(conn.execute(
+                "SELECT 1 FROM bookings WHERE date = ? AND"
+                " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? LIMIT 1",
+                (iso, "%" + digits[-9:])).fetchone())
+    except Exception:
+        return False
+
 def _guess_lang_code(text: str) -> str:
     """Rough language pick for the honest 'day is full' message: Cyrillic -> ru,
     Romanian diacritics/words -> ro, Lithuanian -> lt, else en."""
@@ -3039,6 +3093,10 @@ def _finish_reply(user: str, answer: str) -> str:
     if not booking and not is_owner:
         try:
             prop = _PROPOSAL_RE.search(answer or "")
+            conversational = False
+            if not prop and _OFFER_HINT_RE.search(answer or ""):
+                prop = _DAY_MENTION_RE.search(answer or "")
+                conversational = bool(prop)
             if prop:
                 day_num = int(prop.group("day"))
                 month_name = prop.group("mon").capitalize()
@@ -3046,15 +3104,19 @@ def _finish_reply(user: str, answer: str) -> str:
                 pd = date(today.year, _MONTHS.index(month_name) + 1, day_num)
                 if pd < today - timedelta(days=30):
                     pd = pd.replace(year=pd.year + 1)
-                need = prop.group("need") or ""
+                need = "" if conversational else (prop.group("need") or "")
+                if not need:
+                    need = _recent_customer_words(user)
                 reason = day_full_reason(pd.isoformat(), need)
-                if reason and pd >= today:
+                if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
                     alt = next_day_for_job(need)
                     msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
                     lang = _guess_lang_code(answer)
                     answer = (msg.get(lang, msg["en"]).format(alt=alt)
                               if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]))
-                    log.info("Proposal for %s on %s replaced: %s-full (job=%r)", user, pd, reason, need[:60])
+                    log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
+                             user, pd, reason, need[:60],
+                             "conversational" if conversational else "confirm-format")
         except Exception:
             log.exception("Proposal capacity guard failed (reply sent unchanged)")
     if booking and not is_owner:
