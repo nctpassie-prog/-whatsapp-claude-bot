@@ -2009,11 +2009,29 @@ def is_hard_job(need: str) -> bool:
     n = need or ""
     return bool(_DIAG_RE.search(n) or _HARD_RE.search(n))
 
+# Owner's decision 9 Sep 2026 (Tom Shields' Clio): a car LEFT WITH US for a week
+# or more does not eat a ramp on its drop-off day - nobody touches it that day, the
+# work happens on any quiet day while it sits here. So a long-stay drop-off is
+# outside the hard-job quota: it never counts towards the 4-a-day cap, and the cap
+# never refuses one. It still occupies a place in the diary so staff can see it.
+_LONG_STAY_RE = re.compile(
+    r"long ?stay"
+    r"|with us until"
+    r"|leav[a-z]* it with (?:us|you)"
+    r"|(?:keep|hold) it (?:for|until) (?:a |the )?(?:week(?!end)|fortnight|two weeks|2 weeks|couple of weeks|month)"
+    r"|away for (?:a |the )?(?:week(?!end)|fortnight|two weeks|2 weeks|couple of weeks|month)"
+    r"|until (?:we|they|i) (?:are |get |come )?back",
+    re.IGNORECASE)
+
+def is_long_stay(need: str) -> bool:
+    """The customer is leaving the car with us for a week or more."""
+    return bool(_LONG_STAY_RE.search(need or ""))
+
 def _hard_count(date_str: str) -> int:
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?",
                             (date_str,)).fetchall()
-    return sum(1 for (n,) in rows if is_hard_job(n or ""))
+    return sum(1 for (n,) in rows if is_hard_job(n or "") and not is_long_stay(n or ""))
 
 def day_full_reason(date_str: str, need: str = "") -> str:
     """'' = bookable; 'capacity' = day genuinely full; 'hard' = this KIND of job
@@ -2028,7 +2046,7 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     cap = day_capacity(d)
     if n >= cap:
         return "capacity"
-    if need and is_hard_job(need):
+    if need and is_hard_job(need) and not is_long_stay(need):
         if d.weekday() == 5:
             return "hard"  # Saturday is general services only
         if _hard_count(date_str) >= HARD_JOBS_PER_DAY:
@@ -2129,7 +2147,7 @@ def availability_block() -> str:
     taken, hard = {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
-        if is_hard_job(need or ""):
+        if is_hard_job(need or "") and not is_long_stay(need or ""):
             hard[d] = hard.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
@@ -7439,7 +7457,7 @@ def _voice_availability() -> str:
     taken, hard = {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
-        if is_hard_job(need or ""):
+        if is_hard_job(need or "") and not is_long_stay(need or ""):
             hard[d] = hard.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
