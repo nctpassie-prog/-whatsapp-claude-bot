@@ -3189,6 +3189,35 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
         log.exception("Proposal capacity guard failed (reply sent unchanged)")
     return answer
 
+# The bot has no eyes in the workshop and cannot ring anyone, yet it keeps saying
+# it just did. business_info has banned this since 3 Sep and the model still wrote
+# "I've checked our workshop" on 9 Sep. The prompt asks; this makes sure.
+# ONLY the harmless shapes are rewritten — a claim to have CHECKED, with nothing
+# invented after it. Where the bot claims to have LOOKED AT THE CAR and then
+# states a finding, no word swap can help ("I can't check that myself and he says
+# it's ready" is worse than the lie), so those raise an alert instead.
+_FALSE_CHECK_SUBS = [
+    (re.compile(r"I(?:'ve| have)? ?(?:just )?checked (?:our |the |in with (?:our|the) )?workshop", re.I),
+     "I can't see the workshop myself"),
+    (re.compile(r"Let me check with (?:the team|a colleague|Dima|Vlad)", re.I),
+     "I've passed this to the team"),
+    (re.compile(r"Let me (?:just )?check(?: that| this)?(?=[ ,.])", re.I),
+     "I've passed this to the team"),
+]
+# Claims a human act AND usually a finding with it — the whole reply is suspect.
+_FABRICATED_LOOK_RE = re.compile(
+    r"I(?:'ve| have)? ?(?:just )?(?:had a look at|looked at|inspected|been out to)"
+    r" (?:your|the) (?:car|vehicle|van)"
+    r"|I(?:'ve| have)? ?(?:just )?(?:checked|spoken) with (?:Dima|Vlad|the mechanic|the lads)",
+    re.IGNORECASE)
+
+def no_false_checking(text: str) -> str:
+    """Remove claims that the bot walked to the workshop or rang someone. It did
+    neither. Fabricated findings are handled separately, by alerting a person."""
+    for rx, rep in _FALSE_CHECK_SUBS:
+        text = rx.sub(rep, text)
+    return text
+
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
@@ -3208,7 +3237,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             "they asked.")
             except Exception:
                 log.exception("Failed to alert owner about truncated marker")
-    answer = after_hours_wording(answer)
+    answer = no_false_checking(after_hours_wording(answer))
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     # OFFER-THEN-RETRACT guard (2026-09-02, the #1 customer-facing defect that day:
@@ -3356,6 +3385,16 @@ def _finish_reply(user: str, answer: str) -> str:
             log.exception("Failed to notify owner of handover")
     # If the reply PROMISED a person but the model forgot the marker, raise the
     # alert anyway — otherwise the bot lies and the customer is never called back.
+    if not is_owner and _FABRICATED_LOOK_RE.search(answer or ""):
+        # The bot cannot look at a car. If it says it did, whatever it "found"
+        # is invented, so a person has to read this chat (9 Sep 2026).
+        log.warning("Reply to %s claimed to have inspected the car: %r", user, (answer or "")[:200])
+        try:
+            alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
+                        "It cannot see the workshop, so anything it told them about the car "
+                        "may be invented — please read the chat and correct it.")
+        except Exception:
+            log.exception("Fabricated-inspection alert failed")
     if handover is None and not is_owner and _CLAIMS_A_PERSON_RE.search(answer or ""):
         log.warning("Reply to %s promised a person with no HANDOVER marker — alerting anyway", user)
         try:
@@ -6700,7 +6739,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             return {"ok": False, "error": str(exc)[:400]}
         markers = re.findall(r"<<<([A-Z_]+)", raw or "")
         # Same after-hours wording guard the real send path applies.
-        visible = after_hours_wording(re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip())
+        visible = no_false_checking(after_hours_wording(re.sub(r"<<<.*?>>>", "", raw or "", flags=re.S).strip()))
         # run the real capacity guard too, with the question standing in for the
         # customer's recent words, so a dry run reflects what would actually be sent
         visible = guard_day_proposal(fake_user, visible, need_hint=q)
