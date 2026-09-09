@@ -760,6 +760,30 @@ def send_invoice_template(to: str, fields: dict, user: str) -> bool:
         log.exception("Invoice template send failed")
         return False
 
+def _invoice_request_count(user: str, reg: str) -> int:
+    """How many times this customer has already asked for this invoice. A repeat
+    means the first request was never actioned, so it must escalate to the owner
+    instead of quietly landing in the same inbox again (Des Monahan asked three
+    times between 31 Aug and 7 Sep 2026 and got nothing).
+    """
+    digits = "".join(ch for ch in str(user) if ch.isdigit())
+    key = digits + "|" + (reg or "").upper().replace(" ", "")
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS invoice_requests ("
+                         " key TEXT PRIMARY KEY, n INTEGER, first_ts REAL, last_ts REAL)")
+            row = conn.execute("SELECT n, first_ts FROM invoice_requests WHERE key = ?",
+                               (key,)).fetchone()
+            n = (row[0] if row else 0) + 1
+            conn.execute("INSERT INTO invoice_requests (key, n, first_ts, last_ts)"
+                         " VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET"
+                         " n = ?, last_ts = ?",
+                         (key, n, (row[1] if row else time.time()), time.time(), n, time.time()))
+        return n
+    except Exception:
+        log.exception("Could not count invoice requests")
+        return 1
+
 def send_invoice_request(user: str, fields: dict) -> None:
     """Send a customer's invoice request to the accountant's PHONE, note on Telegram.
 
@@ -797,6 +821,19 @@ def send_invoice_request(user: str, fields: dict) -> None:
         if not ok:
             log.warning("Invoice email not sent (%s) — falling back to owner email", err)
             send_email(f"Invoice request — {fields.get('reg', '')}", body)
+    # A repeat request means the last one was never sent — put it in front of the
+    # owner personally rather than the same inbox that already missed it.
+    asked = _invoice_request_count(user, fields.get("reg", ""))
+    if asked > 1:
+        try:
+            send_telegram_private(
+                f"🧾❗ Invoice asked for the {asked}{'nd' if asked == 2 else 'rd' if asked == 3 else 'th'} time — nobody has sent it" + chr(10)
+                + f"{fields.get('name', '?')} — {fields.get('reg', '?')} — +{user}" + chr(10)
+                + f"Email: {fields.get('email', '?')}" + chr(10)
+                + f"Job: {fields.get('job', '?')}" + chr(10)
+                + "Please check with Lenka that this actually goes out today.")
+        except Exception:
+            log.exception("Repeat-invoice escalation failed")
     send_telegram("🧾 Invoice request\n"
                   f"{fields.get('name', '?')} — {fields.get('reg', '?')}\n"
                   f"Email: {fields.get('email', '?')}\n"
