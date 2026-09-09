@@ -6358,6 +6358,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             "email": "test@example.com", "job": "Front brake pads, 18 Aug"})
         return {"sent": True, "to_email": get_setting("invoice_email", "") or "(owner inbox fallback)",
                 "to_whatsapp": get_setting("invoice_whatsapp", "") or "(not set)"}
+    if action == "invoicesout":
+        # Invoice requests nobody has confirmed as sent yet.
+        out = []
+        for key, cnt, first_ts, _last, chased in outstanding_invoices():
+            ph, _, rg = key.partition("|")
+            out.append({"customer": "+" + ph, "reg": rg or "(none)", "times_asked": cnt,
+                        "first_asked": datetime.fromtimestamp(
+                            first_ts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M"),
+                        "days_open": round((time.time() - first_ts) / 86400, 1),
+                        "reminded": bool(chased)})
+        return {"outstanding": out, "count": len(out)}
+    if action == "invoicedone":
+        # Mark an invoice as actually sent so it stops being chased and drops off
+        # the morning briefing. ?phone=<customer number> or ?reg=<reg>
+        n = mark_invoice_done(phone or reg or need)
+        return {"marked_sent": n, "still_outstanding": len(outstanding_invoices())}
     if action == "invoicemail":
         # Set where invoice requests go: ?action=invoicemail&date=accountant@x.ie
         want = (date or "").strip()
