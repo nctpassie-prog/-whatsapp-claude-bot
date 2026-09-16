@@ -2580,6 +2580,14 @@ ASSIST_WHILE_STAFF = (
     "times or callbacks — the colleague owns those."
 )
 
+# An assist reply must never announce a booking: this path strips the booking
+# marker before sending, so the words would be true for the customer and false
+# for the diary.
+_ASSIST_CLAIMS_BOOKED_RE = re.compile(
+    r"(you(?:'|’)?re booked|booked you in|i(?:'|’)?ve booked|"
+    r"you are booked|got you booked|booked in for)", re.IGNORECASE)
+
+
 def _maybe_courtesy_close(user: str) -> None:
     """While a colleague owns the chat, still handle the easy things.
 
@@ -2620,6 +2628,36 @@ def _maybe_courtesy_close(user: str) -> None:
             log.warning("Assist reply for %s suppressed as internal deliberation: %r",
                         user, reply[:200])
         return
+    # Everything above only suppresses the model's internal deliberation. The
+    # reply itself used to go straight out from here, which meant that while a
+    # colleague owned the chat NONE of the outgoing guards ran on it: not the
+    # capacity guard, not the after-hours wording, not the did-not-really-check
+    # rewrite, not the promised-a-person alert. Aaron (+353857475102) on 15 Sep
+    # asked "When can I bring it in" mid-way through a staff conversation and
+    # was offered - then confirmed - Wednesday 23 September for a broken coil
+    # spring, a hard job, on a day that already held its four. That is the exact
+    # offer-then-retract failure the 9 Sep guard exists to prevent; the guard
+    # simply was not on this path.
+    # Deliberately NOT _finish_reply: it saves the message itself, and its
+    # blank-answer branch would turn a deliberate silent SKIP into the fallback
+    # message plus an owner alert.
+    reply = guard_day_proposal(user, no_false_checking(after_hours_wording(reply)))
+    # This path strips the booking marker and never calls process_booking, so an
+    # assist reply that says "you're booked in" puts NOTHING in the diary. The
+    # colleague owns bookings while they have the chat; the assist bot must
+    # never be the one to say the word.
+    if "<<<BOOKING" in (raw or "") or _ASSIST_CLAIMS_BOOKED_RE.search(reply):
+        log.warning("Assist reply for %s suppressed - it tried to confirm a booking: %r",
+                    user, reply[:200])
+        alert_owner(user, "🙋 The bot nearly confirmed a booking while you had this chat",
+                    "It was stopped before sending. Please confirm the day with them yourself.")
+        return
+    if _FABRICATED_LOOK_RE.search(reply):
+        alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
+                    "Sent while a colleague was handling the chat - please correct it.")
+    if _CLAIMS_A_PERSON_RE.search(reply):
+        notify_owner_handover(user, {"reason": "the bot told this customer that a "
+                                               "person would come back to them"})
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
     log.info("Assisted while staff handling: %s", user)
