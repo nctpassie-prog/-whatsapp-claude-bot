@@ -1433,7 +1433,14 @@ def db() -> sqlite3.Connection:
                      # endpoint answered 200", which is not the same as the
                      # customer receiving anything.
                      ("reminded_ts", "reminded_ts REAL DEFAULT 0"),
-                     ("reminder_tries", "reminder_tries INTEGER DEFAULT 0")):
+                     ("reminder_tries", "reminder_tries INTEGER DEFAULT 0"),
+                     # The wamid of the reminder we sent. A delivery failure is
+                     # matched to a booking by THIS, never by the phone number:
+                     # the reminder is what prompts the customer to reply, and
+                     # the bot's free-form answer is exactly the sort of message
+                     # WhatsApp then refuses - which would otherwise un-stamp a
+                     # reminder they had already received and re-send it.
+                     ("reminder_wamid", "reminder_wamid TEXT DEFAULT ''")):
         try:
             conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -3878,7 +3885,8 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
         log.exception("Failed to send WhatsApp message to %s", to)
 
 # ---------------------------------------------------------------- reminders
-def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
+def _send_reminder_in(to: str, params: list, lang_code: str) -> str:
+    """The WhatsApp message id on success, "" when the send was refused."""
     try:
         # Send from the number this customer actually messages — reminders run in a
         # background thread with no webhook context.
@@ -3903,18 +3911,24 @@ def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
         )
         if r.status_code != 200:
             log.warning("Reminder (%s) to %s failed: %s %s", lang_code, to, r.status_code, r.text[:300])
-            return False
+            return ""
         # Chakra answers 200 even when WhatsApp refuses the message, so the body
         # has to be read too. Without this a refusal counted as a success and the
         # booking was marked reminded on the strength of it.
         if '"error"' in (r.text or ""):
             log.warning("Reminder (%s) to %s refused in a 200 body: %s",
                         lang_code, to, r.text[:300])
-            return False
-        return True
+            return ""
+        # Return the message id so the delivery receipt can be tied back to THIS
+        # message. "" means refused; a non-empty string means accepted.
+        try:
+            wamid = ((r.json().get("messages") or [{}])[0].get("id") or "sent")
+        except Exception:
+            wamid = "sent"
+        return wamid
     except Exception:
         log.exception("Failed to send reminder template to %s", to)
-        return False
+        return ""
 
 # Diary rows sometimes hold literal placeholder TEXT rather than an empty field
 # ("Unknown", "(no name)", "-"), and `or "there"` only catches the empty case —
@@ -3948,7 +3962,7 @@ def bad_customer_name(name: str) -> bool:
 def _reminder_name(name: str) -> str:
     return "there" if bad_customer_name(name) else (name or "").strip()
 
-def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> bool:
+def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> str:
     """Send the appointment reminder in the customer's language, falling back to the default."""
     # Drop-off is 9-11am for everyone — a real window beats "your appointment time".
     # The template reads "drop the car in between {{4}}", so {{4}} must be a bare
@@ -3960,11 +3974,12 @@ def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, la
     params = [_reminder_name(name), clean_car(car) or "car",
               clean_reg(reg) or "no reg on file", tidy_when]
     code = reminder_lang_code(lang)
-    if _send_reminder_in(to, params, code):
-        return True
+    wamid = _send_reminder_in(to, params, code)
+    if wamid:
+        return wamid
     if code != REMINDER_LANG:  # customer-language version may not be approved yet
         return _send_reminder_in(to, params, REMINDER_LANG)
-    return False
+    return ""
 
 # ------------------------------------------------------------------ parts orders
 # Owner (2026-08-25): every day after lunch, order the filters for tomorrow's
@@ -4238,12 +4253,39 @@ def send_due_reminders() -> None:
             except Exception:
                 log.exception("Could not report the double booking for %s", phone)
             continue
-        if phone and send_reminder_template(phone, name, car, reg, tt, lang):
-            with closing(db()) as conn, conn:
-                conn.execute(
-                    "UPDATE bookings SET reminded = 1, reminded_ts = ?,"
-                    " reminder_tries = COALESCE(reminder_tries, 0) + 1 WHERE id = ?",
-                    (time.time(), bid))
+        wamid = send_reminder_template(phone, name, car, reg, tt, lang) if phone else ""
+        if not wamid:
+            # The send itself was refused, so no delivery receipt will ever
+            # arrive and the webhook's cap can never be reached. Count the
+            # attempt HERE or this row stays reminded=0 and is re-sent on every
+            # pass - up to eleven template sends a day with nobody told.
+            if phone:
+                with closing(db()) as conn, conn:
+                    conn.execute(
+                        "UPDATE bookings SET reminder_tries = COALESCE(reminder_tries, 0) + 1"
+                        " WHERE id = ?", (bid,))
+                    tries = conn.execute(
+                        "SELECT COALESCE(reminder_tries, 0) FROM bookings WHERE id = ?",
+                        (bid,)).fetchone()[0]
+                if tries >= REMINDER_MAX_TRIES:
+                    with closing(db()) as conn, conn:
+                        conn.execute("UPDATE bookings SET reminded = 1, reminded_ts = ?"
+                                     " WHERE id = ?", (time.time(), bid))
+                    try:
+                        send_telegram(
+                            "⚠️ COULD NOT REMIND THIS CUSTOMER — please ring them\n"
+                            f"{name or 'no name'} +{phone} is booked in TOMORROW "
+                            f"({tomorrow}).\nWhatsApp would not accept the reminder "
+                            f"after {tries} attempts. They have not been told.")
+                    except Exception:
+                        log.exception("Could not report the unsendable reminder for %s", phone)
+            continue
+        with closing(db()) as conn, conn:
+            conn.execute(
+                "UPDATE bookings SET reminded = 1, reminded_ts = ?,"
+                " reminder_tries = COALESCE(reminder_tries, 0) + 1,"
+                " reminder_wamid = ? WHERE id = ?",
+                (time.time(), wamid, bid))
             # Save the reminder to chat history (English rendering, same pattern
             # as come_back_nudge) — otherwise the /chats page shows nothing and,
             # worse, the AI has no idea a reminder was sent when the customer
@@ -8516,8 +8558,12 @@ def _is_internal_number(digits: str) -> bool:
     ours += list(ALERT_NUMBERS)
     return want in {normalize_phone(o) for o in ours if o}
 
-def report_failed_delivery(recipient: str, errs: list) -> None:
-    """Mark the message the customer never got, and tell a person to ring them."""
+def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
+    """Mark the message the customer never got, and tell a person to ring them.
+
+    wamid is the id of the message that failed, from the statuses webhook. It is
+    the only reliable way to know WHICH message was refused.
+    """
     digits = "".join(ch for ch in (recipient or "") if ch.isdigit())
     if not digits or is_blocked(digits) or _is_internal_number(digits):
         return
@@ -8551,13 +8597,22 @@ def report_failed_delivery(recipient: str, errs: list) -> None:
     try:
         tomorrow_iso = (now_local().date() + timedelta(days=1)).isoformat()
         exhausted = None
+        # Matched on the message id alone. Matching on the phone number plus a
+        # time window looked equivalent and is not: the reminder is precisely
+        # what makes the customer reply, the bot's free-form answer is exactly
+        # what WhatsApp refuses, and that refusal would un-stamp a reminder they
+        # had already read - re-sending it an hour later. It also picked an
+        # arbitrary row when one number held two bookings for the same day.
+        row = None
+        if wamid:
+            with closing(db()) as conn, conn:
+                row = conn.execute(
+                    "SELECT id, name, COALESCE(reminder_tries, 0) FROM bookings"
+                    " WHERE date = ? AND COALESCE(reminded, 0) = 1"
+                    " AND COALESCE(reminder_wamid, '') = ?",
+                    (tomorrow_iso, wamid)).fetchone()
         with closing(db()) as conn, conn:
-            row = conn.execute(
-                "SELECT id, name, COALESCE(reminder_tries, 0) FROM bookings"
-                " WHERE date = ? AND COALESCE(reminded, 0) = 1"
-                " AND COALESCE(reminded_ts, 0) > ?"
-                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
-                (tomorrow_iso, time.time() - 900, "%" + digits[-9:])).fetchone()
+            pass
             if row:
                 bid, bname, tries = row
                 # send_due_reminders only runs between 09:00 and 19:59, so after
@@ -8699,7 +8754,8 @@ async def receive(request: Request, background: BackgroundTasks):
                         log.warning("Delivery FAILED to %s: %s",
                                     st.get("recipient_id", ""), json.dumps(errs)[:400])
                         background.add_task(report_failed_delivery,
-                                            st.get("recipient_id", ""), errs)
+                                            st.get("recipient_id", ""), errs,
+                                            st.get("id", ""))
                     else:
                         log.info("Delivery %s to %s", state, st.get("recipient_id", ""))
                 continue
