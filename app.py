@@ -5570,7 +5570,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "editbooking", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -6509,6 +6509,44 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                               cts, ZoneInfo("Europe/Dublin")).strftime("%d %b %H:%M")
                           if cts else "", "time": tt}
                          for n, p, c, rg, nd, bid, cts, tt in rows]}
+    if action == "editbooking":
+        # Correct fields on ONE existing booking (ids come from ?action=day).
+        # Phone transcription mangles names, makes and regs - "Otelmariva" for
+        # Opel Meriva, "131D4365O" for 131D43650 (both 2026) - and until now the
+        # only repair was delete-and-re-add, which changes the id, loses the
+        # created time and re-fires the calendar event and the booking email.
+        # Pass date=<id> plus any of name, car, reg, need; whatever is omitted
+        # is left alone. The booking's DATE deliberately cannot be changed here:
+        # moving a day has to pass the capacity gates, so use cancel + addbooking.
+        try:
+            bid = int((date or "").strip())
+        except ValueError:
+            return {"error": "Pass the booking id from ?action=day as date=<id>"}
+        changes = {}
+        if name:
+            changes["name"] = "" if bad_customer_name(name) else name.strip()
+        if car:
+            changes["car"] = clean_car(car)
+        if reg:
+            changes["reg"] = clean_reg(reg)
+        if need:
+            changes["need"] = need.strip()
+        if not changes:
+            return {"error": "Give at least one of name, car, reg, need"}
+        # Column names come from this fixed set, never from the request.
+        with closing(db()) as conn, conn:
+            row = conn.execute(
+                "SELECT name, car, reg, need, date FROM bookings WHERE id = ?",
+                (bid,)).fetchone()
+            if not row:
+                return {"edited": 0, "error": f"no booking with id {bid}"}
+            before = dict(zip(("name", "car", "reg", "need", "date"), row))
+            conn.execute("UPDATE bookings SET "
+                         + ", ".join(f"{k} = ?" for k in changes)
+                         + " WHERE id = ?", (*changes.values(), bid))
+        after = dict(before, **changes)
+        log.info("Booking %s edited: %s -> %s", bid, before, after)
+        return {"edited": 1, "before": before, "after": after}
     if action == "delbooking":
         # Delete ONE booking row by id (ids come from ?action=day). For ghost
         # rows the cancel action cannot address (no reg, garbage phone).
