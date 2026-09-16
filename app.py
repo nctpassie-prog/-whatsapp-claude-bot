@@ -4232,15 +4232,102 @@ def send_due_reviews() -> None:
 
 # Rating replies: the link goes out ONLY on a clearly happy answer; a clearly
 # unhappy one gets an apology and lands on the owner's Telegram instead.
-_REVIEW_POSITIVE_RE = re.compile(
-    r"\b(?:[45]|5\s*/\s*5|good|great|perfect|excellent|brilliant|grand|happy|"
-    r"lovely|delighted|thanks|thank you|отлично|хорошо|супер|спасибо|доволен|"
-    r"довольна|класс|bine|foarte|multumesc|mulțumesc|perfect|super|gerai|"
-    r"puikiai|ačiū|aciu|tobula)\b", re.IGNORECASE)
-_REVIEW_NEGATIVE_RE = re.compile(
-    r"\b(?:[123]|bad|poor|terrible|awful|not (?:good|great|happy)|unhappy|problem|"
-    r"issue|complaint|disappoint\w*|плохо|ужас\w*|проблем\w*|недоволен|недовольна|"
-    r"rau|prost|problema|nemultumit|nemulțumit|blogai|problemos?)\b", re.IGNORECASE)
+# 16 Sep 2026 — this classifier decided "happy or unhappy" by looking for words
+# ANYWHERE in the message, and the happy list contained "thanks". Irish customers
+# end nearly every message with thanks, so for the seven days after a review ask
+# almost anything a customer wrote scored as five stars. Worse, this runs before
+# every other rule and returns True, so their real message was swallowed: never
+# answered, never handed over, never put on the waiting list.
+#
+# A customer wrote "Still facing fuel smell and fuel leakage and this time
+# seriously worst, can't breath inside the cabin. Please let me know when i can
+# visit. Thank you" and was answered "Brilliant, delighted to hear it! 🎉" with a
+# Google review link. He had to send it again. A bare 4 or 5 anywhere did the
+# same: "I'll be there at 5", "4 tyres please", "I need it back by 4".
+#
+# The other half never ran at all: not one customer has ever received the apology
+# and no "unhappy after visit" alert has ever fired from this route, because a
+# complaint almost always contains a courtesy word that scored it positive first.
+#
+# So this layer now only handles a message that unambiguously IS a rating.
+# Everything else falls through to the model, which carries the same rate-first
+# rule in business_info.md ("a bare number on its own is NOT automatically a
+# rating") and raises the FEEDBACK marker for an unhappy customer — a far better
+# judge of an English sentence than a word list can ever be.
+
+_RATING_PRAISE = {
+    "good", "great", "perfect", "excellent", "brilliant", "grand", "happy",
+    "lovely", "delighted", "fantastic", "spot", "sound", "class", "magic", "fine",
+    "отлично", "хорошо", "супер", "доволен", "довольна", "класс",
+    "bine", "foarte", "super", "gerai", "puikiai", "tobula",
+}
+_RATING_COMPLAINT = {
+    "bad", "poor", "terrible", "awful", "unhappy", "disappointed", "disappointing",
+    "rubbish", "useless", "shocking",
+    "плохо", "ужасно", "недоволен", "недовольна",
+    "rau", "prost", "nemultumit", "nemulțumit", "blogai",
+}
+# Filler that says nothing either way. A rating may contain these and stay a
+# rating; on their own they are NOT a verdict — "thanks" is the word that broke
+# this in the first place.
+_RATING_FILLER = {
+    "", "a", "an", "the", "is", "was", "it", "all", "very", "so", "and", "as",
+    "always", "i", "im", "m", "we", "you", "yes", "out", "of", "star", "stars",
+    "rating", "rate", "would", "say", "give", "service", "job", "work", "guys",
+    "lads", "ye", "everything", "really", "thanks", "thank", "cheers", "much",
+    "спасибо", "multumesc", "mulțumesc", "ačiū", "aciu", "merci",
+}
+# Anything that makes the message a REQUEST or a FAULT REPORT rather than a
+# verdict on a finished visit. Any one of these and it is not a rating at all.
+_NOT_A_RATING_RE = re.compile(
+    r"\?|\b(when|what time|can i|could i|can you|could you|will you|do you|"
+    r"book|booking|booked|appointment|slot|collect|collecting|pick up|ready|"
+    r"price|quote|cost|how much|update|repair|fix|fixed|fixing|leak\w*|smell\w*|"
+    r"noise|noisy|still|again|broken|wrong|problem|issue|complaint|"
+    r"tomorrow|today|tonight|morning|afternoon|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday|o'?clock|tyre|tyres|nct|call|ring|phone|send|"
+    r"please let me know)\b", re.IGNORECASE)
+# "Rating 5", "5 out of 5", "5/5" — an explicit cue means they are rating us even
+# when the sentence runs on.
+_RATING_CUE_RE = re.compile(
+    r"^\s*(?:rating|rate)\s*[:\-]?\s*([1-5])\b|^\s*([1-5])\s*(?:/\s*5|\s*out\s*of\s*5)",
+    re.IGNORECASE)
+_BARE_NUMBER_RE = re.compile(r"^[1-5]$")
+_WORD_RE = re.compile(r"[0-9a-zA-ZÀ-ÿА-Яа-яĀ-ž']+")
+
+def rating_from_reply(text: str):
+    """Return 1-5 when this message unambiguously IS a rating, else None.
+
+    Conservative on purpose: a None here does not lose the customer, it hands
+    them to the model, which reads the sentence properly.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    cue = _RATING_CUE_RE.search(t)
+    if cue:
+        return int(cue.group(1) or cue.group(2))
+    if _NOT_A_RATING_RE.search(t):
+        return None
+    words = [w.lower() for w in _WORD_RE.findall(t)]
+    if not words or len(words) > 8:
+        return None
+    digits = [w for w in words if _BARE_NUMBER_RE.match(w)]
+    others = [w for w in words if not _BARE_NUMBER_RE.match(w)]
+    known = _RATING_PRAISE | _RATING_COMPLAINT | _RATING_FILLER
+    if len(digits) == 1:
+        # A number counts only when everything around it is praise or filler -
+        # that is what separates "5 brilliant as always" from "4 tyres please".
+        if all(w in known for w in others):
+            return int(digits[0])
+        return None
+    if digits:
+        return None  # two numbers is a time or a quantity, not a score
+    if any(w in _RATING_COMPLAINT for w in others):
+        return 1
+    if any(w in _RATING_PRAISE for w in others) and all(w in known for w in others):
+        return 5
+    return None
 
 _REVIEW_HAPPY_REPLY = {
     "en": ("Brilliant, delighted to hear it! 🎉 If you have 30 seconds, a quick "
@@ -4277,34 +4364,37 @@ def handle_review_reply(sender: str, text: str) -> bool:
     if not row:
         return False
     ts, lang = row
-    # However it goes, one reply settles it — never nag the same customer again.
+    if time.time() - (ts or 0) > 7 * 86400:
+        with closing(db()) as conn, conn:
+            conn.execute("DELETE FROM review_pending WHERE wa_user = ?", (digits,))
+        return False  # stale ask — treat as a normal message
+    score = rating_from_reply(text)
+    if score is None:
+        # Not a rating. Leave the ask OPEN and hand the customer to the model.
+        # The old code deleted the row on the first inbound message whatever it
+        # said, which burned 7 of 56 asks on things like "Is it ready?" and
+        # "Can you book me for Tuesday" - the customer was never asked again.
+        return False
+    # Only a real rating settles it.
     with closing(db()) as conn, conn:
         conn.execute("DELETE FROM review_pending WHERE wa_user = ?", (digits,))
-    if time.time() - (ts or 0) > 7 * 86400:
-        return False  # stale ask — treat as a normal message
     code = reminder_lang_code(lang)
-    negative = bool(_REVIEW_NEGATIVE_RE.search(text))
-    positive = bool(_REVIEW_POSITIVE_RE.search(text)) and not negative
-    if positive or negative:
-        time.sleep(max(0.0, REPLY_DELAY_SECONDS))  # don't answer inhumanly fast
-    if positive:
-        save_message(sender, "user", text)
+    time.sleep(max(0.0, REPLY_DELAY_SECONDS))  # don't answer inhumanly fast
+    save_message(sender, "user", text)
+    if score >= 4:
         reply = _REVIEW_HAPPY_REPLY.get(code, _REVIEW_HAPPY_REPLY["en"])
         send_whatsapp(sender, reply)
         save_message(sender, "assistant", reply)
         return True
-    if negative:
-        save_message(sender, "user", text)
-        reply = _REVIEW_SORRY_REPLY.get(code, _REVIEW_SORRY_REPLY["en"])
-        send_whatsapp(sender, reply)
-        save_message(sender, "assistant", reply)
-        try:
-            alert_owner(sender, "⭐ Unhappy after visit (review ask)",
-                        reason=text.strip()[:300])
-        except Exception:
-            log.exception("Could not alert owner about unhappy review reply")
-        return True
-    return False  # unclear — let the normal assistant handle it
+    reply = _REVIEW_SORRY_REPLY.get(code, _REVIEW_SORRY_REPLY["en"])
+    send_whatsapp(sender, reply)
+    save_message(sender, "assistant", reply)
+    try:
+        alert_owner(sender, f"⭐ Unhappy after visit — rated {score}/5",
+                    reason=text.strip()[:300])
+    except Exception:
+        log.exception("Could not alert owner about unhappy review reply")
+    return True
 
 MECHANIC_REPORT_HOUR = int(os.environ.get("MECHANIC_REPORT_HOUR", "19"))
 # Dima's shorthand codes vary a little — fold the obvious variants together.
@@ -5722,6 +5812,15 @@ NEEDS_MASTER_TOKEN = {
     "clearwaiting",
     # sends as the business, to customers or the accountant
     "sendmsg", "sendwaiting", "invoicereq", "recoveryreq",
+    # reviewtest sends the real review template to whatever number is in the
+    # query string - it sends every bit as much as sendmsg does, and the first
+    # lockdown missed it because its name reads like a dry run.
+    "reviewtest",
+    # fixdates rewrites the date on many bookings at once, with no capacity,
+    # Saturday or closed-day check, and deletes a row outright when the new date
+    # collides with an existing one. It belongs with clearwaiting, not with the
+    # single-row diary tools.
+    "fixdates",
     # changes where alerts, invoices, calls or parts orders go
     "retelltoken", "tgadd", "tgremove", "tgcleanup", "tgprivate",
     "setprivatechat", "invoicemail", "invoicewhatsapp", "recoverynumber",
