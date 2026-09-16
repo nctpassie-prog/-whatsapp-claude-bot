@@ -8023,12 +8023,35 @@ async def retell_function(request: Request):
                 "reason": "duplicate - this car already has a booking that day"}
 
     if fn == "take_message":
+        # Everything that tracks a customer waiting on a person reads the alerts
+        # table: ?action=waiting, the Done button, the escalation ladder and the
+        # 3-hourly chase. This branch used to call send_telegram and nothing
+        # else, so a message left on the phone - a complaint, an invoice, "where
+        # is my car" - was one line scrolling past in a busy Telegram feed, in
+        # no list, on no clock, chased by nobody. That is exactly the
+        # fire-and-forget failure the invoice rework closed on 9 Sep, still wide
+        # open on the phone line.
+        # The `if caller` guard matters: caller is empty for a withheld number,
+        # and alert_owner would then INSERT a row with wa_user = "" which, being
+        # ON CONFLICT(wa_user) DO UPDATE, every later withheld call would reuse -
+        # one nameless ghost sitting in the waiting list forever.
         label = customer_label(caller) if caller else f"+{args.get('phone', '?')}"
         to_num = str(call.get("to_number") or "").strip()
-        send_telegram("📞 PHONE MESSAGE (voice agent)\n"
-                      f"From: {args.get('name', '?')} — {label}\n"
-                      + (f"📱 They rang: {to_num}\n" if to_num else "")
-                      + f"{args.get('message', '')}")
+        note = (args.get("message") or "").strip()
+        who = (args.get("name") or "").strip()
+        if caller:
+            if who and not bad_customer_name(who):
+                record_customer(caller, who)
+            # Before alert_owner, which builds its excerpt from the chat: the
+            # caller's own words only reach the alert if they are saved first.
+            save_message(caller, "user", f"[phone message via the voice agent] {note}")
+            alert_owner(caller, "📞 Phone message — please ring them back",
+                        note[:300] + (f" (they rang {to_num})" if to_num else ""))
+        else:
+            send_telegram("📞 PHONE MESSAGE (voice agent, number withheld)\n"
+                          f"From: {who or '?'} — {label}\n"
+                          + (f"📱 They rang: {to_num}\n" if to_num else "")
+                          + note)
         return {"ok": True, "confirm": "Message passed to the team."}
 
     return JSONResponse({"error": f"unknown function {fn!r}"}, status_code=400)
@@ -8126,6 +8149,75 @@ def _serialized(user: str, fn, *args, **kwargs) -> None:
             except Exception:
                 log.exception("Could not record the crashed inbound for %s", user)
 
+# A message WhatsApp refused is the most dangerous kind of failure this bot has:
+# send_whatsapp gets its HTTP 200, the reply is already written to the message
+# history, and /chats shows a normal bot bubble for something the customer never
+# saw. The real verdict only ever arrives here, on the statuses webhook, a minute
+# or so later. Seen live on 16 Sep 2026: a reply to 353876349766 refused 131026
+# while the chat showed it delivered, and all three phone-booking confirmations
+# that week (Kate, Nikolai, Stanley) refused 131047 because a caller who has only
+# ever rung has no open 24-hour window - so Kate never saw the reg we asked her
+# to check, and the diary, the job sheet and the parts order all carried a reg
+# that does not exist.
+UNDELIVERED_PREFIX = "[NOT DELIVERED - the customer never received this] "
+_delivery_alerted: dict = {}
+
+def _is_internal_number(digits: str) -> bool:
+    """Our own numbers and the trades we deal with. A failed send to these is
+    usually BY DESIGN - send_recovery_request deliberately fires a plain-text
+    copy at the tow company after the template and is refused by the 24-hour
+    rule every single time - so alerting on them would put Dublin Brothers
+    Recovery in the waiting list and have the chase job text them for days."""
+    want = normalize_phone(digits)
+    if not want:
+        return False
+    ours = [OWNER_WHATSAPP, MANAGER_WHATSAPP,
+            get_setting("invoice_whatsapp", ""), get_setting("recovery_whatsapp", "")]
+    ours += list(ALERT_NUMBERS)
+    return want in {normalize_phone(o) for o in ours if o}
+
+def report_failed_delivery(recipient: str, errs: list) -> None:
+    """Mark the message the customer never got, and tell a person to ring them."""
+    digits = "".join(ch for ch in (recipient or "") if ch.isdigit())
+    if not digits or is_blocked(digits) or _is_internal_number(digits):
+        return
+    try:
+        first = (errs or [{}])[0]
+        detail = (first.get("title") or first.get("message") or "refused")
+        detail = f"{detail} ({first.get('code', '?')})"
+    except Exception:
+        detail = "refused"
+    # Mark the bot line so the chat viewer stops claiming it was sent, and so
+    # the model stops reading it back as something the customer already knows.
+    try:
+        with closing(db()) as conn, conn:
+            row = conn.execute(
+                "SELECT id, content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                " AND ts > ? ORDER BY id DESC LIMIT 1",
+                (digits, time.time() - 900)).fetchone()
+            if row and not str(row[1] or "").startswith(UNDELIVERED_PREFIX):
+                conn.execute("UPDATE messages SET content = ? WHERE id = ?",
+                             (UNDELIVERED_PREFIX + str(row[1] or ""), row[0]))
+    except Exception:
+        log.exception("Could not mark the undelivered message for %s", digits)
+    # Once per number per day. 131026 is often permanent, so a tighter window
+    # would re-alert on every retry until somebody muted the whole thing.
+    now = time.time()
+    if now - _delivery_alerted.get(digits, 0) < 86400:
+        return
+    _delivery_alerted[digits] = now
+    # Telegram on purpose, not alert_owner: WhatsApp is the channel that just
+    # failed, and this has to reach a person by some other route.
+    try:
+        send_telegram(f"\u26a0\ufe0f NOT DELIVERED \u2014 {customer_label(digits)}\n"
+                      f"WhatsApp refused our last message: {detail}\n"
+                      f"They never saw it \u2014 please ring them.\n"
+                      f"\U0001f4dc {PUBLIC_URL}/chats?token="
+                      f"{REVIEW_TOKEN or VERIFY_TOKEN}&user={digits}")
+    except Exception:
+        log.exception("Could not report the failed delivery for %s", digits)
+
+
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
@@ -8220,6 +8312,8 @@ async def receive(request: Request, background: BackgroundTasks):
                     if state == "failed" or errs:
                         log.warning("Delivery FAILED to %s: %s",
                                     st.get("recipient_id", ""), json.dumps(errs)[:400])
+                        background.add_task(report_failed_delivery,
+                                            st.get("recipient_id", ""), errs)
                     else:
                         log.info("Delivery %s to %s", state, st.get("recipient_id", ""))
                 continue
