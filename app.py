@@ -423,6 +423,25 @@ def reg_looks_off(reg: str) -> bool:
         return True
     return not _PLAUSIBLE_REG_RE.match(r)
 
+# A structurally valid Irish plate is year digits, county letters, then digits
+# only: 131D4365, 07MH15565, 161D30144. Phone transcription breaks that shape in
+# ways the loose check above cannot see - "131D4365O" (letter O for a zero) has
+# letters, digits and a sensible length, so it passed and the caller was never
+# asked to confirm it (Kate, 14 Sep 2026, booked for 30 Sep on a reg that does
+# not exist).
+_IRISH_REG_RE = re.compile(r"^\d{2,3}[A-Z]{1,2}\d{1,6}$")
+
+def reg_needs_confirming(reg: str) -> bool:
+    """Stricter than reg_looks_off, and ONLY for regs captured over the phone.
+    Anything that is not a clean Irish plate - a foreign import as much as a
+    garbled capture - earns one "is this right?" text, which is cheap and
+    correct in both cases. Deliberately not used by the chase-the-missing-reg
+    jobs, where a foreign plate is not missing and must not be chased."""
+    r = clean_reg(reg)
+    if not r:
+        return True
+    return not _IRISH_REG_RE.match(r)
+
 _REGISTER_MAKES = ["volkswagen", "audi", "bmw", "ford", "hyundai", "mercedes",
                     "skoda", "renault", "peugeot", "opel", "nissan", "kia",
                     "seat", "volvo", "land rover", "range rover", "mitsubishi",
@@ -489,9 +508,36 @@ def car_conflicts_with_register(stored_car: str, reg: str) -> str | None:
         return None
     stored_make = _register_make(stored_car)
     real_make = _register_make(info["make_model"])
-    if not stored_make or not real_make or stored_make == real_make:
-        return None
-    return f"{info['make_model']}, {info['year']}"
+    if stored_make and real_make and stored_make != real_make:
+        return f"{info['make_model']}, {info['year']}"
+    # An unrecognised make on OUR side is not automatically innocent: phone
+    # transcription can mangle it into a word that matches no make at all
+    # ("Otelmariva" for Opel Meriva, 10 Sep 2026), and because this bailed out
+    # on a blank stored_make, that went into the diary, the booking
+    # confirmation and the reminder unchallenged. Flag it only when none of our
+    # words appear in the register's own description, so a model-only answer
+    # ("Transit Connect" against "Ford Transit Connect") still passes quietly.
+    if real_make and not stored_make:
+        theirs = (info["make_model"] or "").lower()
+        ours = [w for w in re.findall(r"[a-z]+", (stored_car or "").lower()) if len(w) >= 3]
+        if ours and not any(w in theirs for w in ours):
+            return f"{info['make_model']}, {info['year']}"
+    return None
+
+
+def is_mobile(phone: str) -> bool:
+    """True for an Irish mobile (353 8x), or any non-Irish number, which we
+    cannot judge from here. A Dublin landline such as 35316285933 can never
+    receive WhatsApp, so a phone booking taken on one gets no written
+    confirmation and no reminder - Joan, 15 Sep 2026, was booked for 25 Sep and
+    heard nothing at all."""
+    d = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not d:
+        return False
+    if d.startswith("353"):
+        return d[3:4] == "8"
+    return len(d) >= 9
+
 
 def _register_check_followup(fields: dict, source: str):
     """Owner's rule 2026-08-29: after EVERY new booking, check the reg against
@@ -1858,7 +1904,7 @@ def save_booking(fields: dict) -> bool:
         pass  # unparseable/blank date is handled elsewhere
     # Placeholder text in the name field ("Unknown", "(no name)") is worse than
     # blank - it leaked into a voice confirmation as "Hi unknown!" (2 Sep).
-    if (fields.get("name") or "").strip().lower() in _NOT_A_NAME:
+    if bad_customer_name(fields.get("name")):
         fields["name"] = ""
     if (fields.get("car") or "").strip().lower() in _PLACEHOLDER_CAR:
         fields["car"] = ""  # "Unknown" / "..." in the diary is worse than blank
@@ -3755,9 +3801,28 @@ _NOT_A_NAME = {"unknown", "(no name)", "no name", "n/a", "na", "-", "?", "custom
 _PLACEHOLDER_CAR = {"unknown", "(none)", "...", "…", "tbc", "tba", "none", "null", "car", "n/a", "-",
                     "unknown make model", "unknown make", "unknown car", "?"}
 
-def _reminder_name(name: str) -> str:
+# A fixed word list can only catch the placeholders somebody thought of in
+# advance. The voice agent wrote "(caller has not given name yet)" into the name
+# field, it was not in the set, and a real customer was texted "Hi (caller has
+# not given name yet)!" (12 Sep 2026). Judge the SHAPE instead: a person's name
+# is one to three words of letters - no brackets, no digits, no sentence.
+_NOT_A_NAME_RE = re.compile(
+    r"\b(caller|customer|not given|notgiven|no name|unnamed|unknown|pending|"
+    r"withheld|anonymous|declined|provided|refused|n/?a|tbc|tba|null|none)\b", re.I)
+
+def bad_customer_name(name: str) -> bool:
+    """True when this is placeholder text rather than somebody's actual name."""
     n = (name or "").strip()
-    return "there" if not n or n.lower() in _NOT_A_NAME else n
+    if not n or n.lower() in _NOT_A_NAME:
+        return True
+    if any(ch in n for ch in "()[]{}<>/\\|") or any(ch.isdigit() for ch in n):
+        return True
+    if len(n.split()) > 3:
+        return True
+    return bool(_NOT_A_NAME_RE.search(n))
+
+def _reminder_name(name: str) -> str:
+    return "there" if bad_customer_name(name) else (name or "").strip()
 
 def send_reminder_template(to: str, name: str, car: str, reg: str, when: str, lang: str = "") -> bool:
     """Send the appointment reminder in the customer's language, falling back to the default."""
@@ -7785,7 +7850,20 @@ async def retell_function(request: Request):
             # Owner's rule: voice transcription can mishear a reg, name or date —
             # always text the customer a written confirmation so they can catch
             # and correct any mistake before their actual drop-off day.
-            if fields["phone"]:
+            if fields["phone"] and not is_mobile(fields["phone"]):
+                # A landline can never receive the written confirmation or the
+                # reminder, so the ONLY way this customer hears from us again is
+                # if a person rings them. Say so loudly instead of sending into
+                # a void (Joan, 15 Sep 2026, booked for 25 Sep, told nothing).
+                try:
+                    send_telegram(
+                        "☎️ PHONE BOOKING ON A LANDLINE - no WhatsApp possible\n"
+                        f"{fields['name'] or 'no name'} - {fields['car']} {fields['reg']}\n"
+                        f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
+                        f"Please RING THEM BACK to confirm: +{fields['phone']}")
+                except Exception:
+                    log.exception("Landline phone-booking alert failed")
+            elif fields["phone"]:
                 try:
                     date_label = fields["date"]
                     try:
@@ -7816,7 +7894,7 @@ async def retell_function(request: Request):
                     # transcription, and if so send a SEPARATE follow-up asking
                     # the customer to confirm/correct it — not folded into the
                     # main confirmation, so it stands out as needing a reply.
-                    if reg_looks_off(fields["reg"]):
+                    if reg_needs_confirming(fields["reg"]):
                         reg_check_text = (
                             "One more check — I have your registration down as "
                             f"\"{fields['reg'] or '(nothing captured)'}\", but phone "
@@ -7834,7 +7912,7 @@ async def retell_function(request: Request):
                           f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
                           f"Caller: +{fields['phone']}"
                           + ("\n⚠️ Reg looks unusual — asked the customer to confirm it"
-                             if reg_looks_off(fields["reg"]) else "")
+                             if reg_needs_confirming(fields["reg"]) else "")
                           + (f"\n📋 Waiting for earlier ({fields['wanted']})"
                              if fields["wanted"] else ""))
             confirm = "Booked. Drop-off between 9 and 11am."
