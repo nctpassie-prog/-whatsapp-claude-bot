@@ -32,7 +32,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -5625,11 +5625,48 @@ VOICE_SIP_TWIML = (
     '</Dial></Response>'
 )
 
+# Every time Twilio asks us what to do with an incoming call, record it. Nothing
+# used to, and on 16 Sep 2026 that left a dead voice line undiagnosable: callers
+# to the headlights number 01 265 9315 got a ring and then silence, while Retell's
+# own call history showed NOTHING on that agent since 27 August - so calls were
+# dying somewhere before Retell, and the one fact that separates "Twilio never
+# asked us" from "we answered and the SIP leg failed" was written down nowhere.
+# The Twilio console was unreachable (no phone for the two-factor code), so the
+# answer had to come from our own side.
+RECENT_TWIML: "collections.deque" = collections.deque(maxlen=40)
+
+async def _log_twiml_fetch(request) -> None:
+    """Never let the diagnostic break the call it is diagnosing."""
+    form = {}
+    try:
+        if request.method == "POST":
+            body = (await request.body()).decode("utf-8", "replace")
+            # Twilio posts x-www-form-urlencoded. Parsed by hand on purpose:
+            # request.form() needs python-multipart, which is not installed.
+            form = {k: v[0] for k, v in parse_qs(body).items()}
+    except Exception:
+        log.exception("Could not read the TwiML request body")
+    try:
+        RECENT_TWIML.append(
+            f"{_fmt_ts(time.time())} {request.method} "
+            f"from={form.get('From') or '?'} to={form.get('To') or '?'} "
+            f"status={form.get('CallStatus') or '?'} "
+            f"sid={str(form.get('CallSid') or '')[:18]} "
+            f"ip={(request.client.host if request.client else '?')}")
+        log.info("TwiML fetched: %s", RECENT_TWIML[-1])
+    except Exception:
+        log.exception("Could not record the TwiML fetch")
+
+
 @app.get("/twiml/retell")
 @app.post("/twiml/retell")
-def twiml_retell():
+async def twiml_retell(request: Request):
     # Twilio fetches this when a call hits the garage's 01 265 9310 number;
-    # the TwiML hands the call to Retell's SIP endpoint (Willa answers).
+    # the TwiML hands the call to Retell's SIP endpoint (Mick answers).
+    # This line WORKS, so its log is the control: a ring recorded here and no
+    # ring recorded on the headlights line means the fault is that number's
+    # Twilio configuration and nothing to do with either bot.
+    await _log_twiml_fetch(request)
     return Response(content=VOICE_SIP_TWIML, media_type="text/xml")
 
 CHAT_CSS = """
@@ -5660,7 +5697,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "editbooking", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "editbooking", "voicelog", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -6668,6 +6705,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         after = dict(before, **changes)
         log.info("Booking %s edited: %s -> %s", bid, before, after)
         return {"edited": 1, "before": before, "after": after}
+    if action == "voicelog":
+        # Did Twilio actually ask us what to do with the call? Ring the number,
+        # then read this. An empty list after a real ring means Twilio never
+        # reached us - the number's Voice webhook is wrong, blank, or pointing at
+        # the other business's app - and no amount of bot code will fix that.
+        # Entries here with no matching call in Retell mean the opposite: we
+        # answered correctly and the SIP leg on to Retell is what is failing.
+        return {"sip_number": globals().get("VOICE_SIP_NUMBER") or "(fixed in the TwiML below)",
+                "twiml_served": VOICE_SIP_TWIML,
+                "fetches": list(RECENT_TWIML)[::-1],
+                "note": "newest first; empty means Twilio has not fetched this "
+                        "endpoint since the last deploy"}
     if action == "delbooking":
         # Delete ONE booking row by id (ids come from ?action=day). For ghost
         # rows the cancel action cannot address (no reg, garbage phone).
