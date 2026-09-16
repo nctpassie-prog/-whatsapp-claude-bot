@@ -5579,6 +5579,37 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # than sendmsg, which is already allowed above.
                      "botresume"}
 
+# 16 Sep 2026: an automated review of these bots called ?action=clearwaiting
+# with the key described here as read-only, and wiped the entire headlights
+# waiting list in one request - ten customers waiting on a person, plus the
+# twenty already handled. The key lives in plain text in CLAUDE.md and has been
+# pasted into chats, browser URLs and tool output for months, so it has to be
+# treated as public. Anything that DELETES data, SENDS a message as the
+# business, or CHANGES where alerts, invoices or calls are routed now needs the
+# master VERIFY_TOKEN, which exists only in Railway. Single-row diary edits
+# (addbooking, editbooking, cancel, delbooking, closeday) deliberately stay
+# reachable: they are the owner's daily tools, each one is scoped to one row
+# and logged, and none of them can empty a table.
+NEEDS_MASTER_TOKEN = {
+    # deletes or empties
+    "clearwaiting",
+    # sends as the business, to customers or the accountant
+    "sendmsg", "sendwaiting", "invoicereq", "recoveryreq",
+    # changes where alerts, invoices, calls or parts orders go
+    "retelltoken", "tgadd", "tgremove", "tgcleanup", "tgprivate",
+    "setprivatechat", "invoicemail", "invoicewhatsapp", "recoverynumber",
+    "partsgroup",
+    # changes which model answers every customer
+    "gemini",
+    # creates Meta templates against the business account
+    "mktemplate", "mkinvoicetemplate", "mkreviewtemplate",
+    "mkrecoverytemplate", "mknextdaytemplate",
+}
+READ_ONLY_ACTIONS -= NEEDS_MASTER_TOKEN
+# Repairing a wiped waiting list must not itself need the master key.
+READ_ONLY_ACTIONS.add("restorealert")
+
+
 def can_review(token: str) -> bool:
     """True for the master key or the read-only review key."""
     if VERIFY_TOKEN and token == VERIFY_TOKEN:
@@ -6646,11 +6677,40 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                     "9 and 11am", "en")
         return {"sent": bool(ok), "to": to,
                 "note": "sample reminder - name Tadas, car VW Golf TEST, reg 161D22222"}
+    if action == "restorealert":
+        # Put one waiting-list row back after the table was wiped. The alerts
+        # table is the ONLY record that a customer is waiting on a person, and
+        # nothing else in the bot can recreate it. Pass date=<number> and
+        # need=<unix seconds of the original alert>, so the row keeps its true
+        # age rather than looking like a fresh alert. chased_ts is set to the
+        # same value on purpose: these customers were already chased, and a
+        # restored row must not send them a second apology out of nowhere.
+        digits = "".join(ch for ch in (date or "") if ch.isdigit())
+        if not digits:
+            return {"error": "Pass the customer's number as date=<digits>"}
+        try:
+            ts = float((need or "").strip())
+        except ValueError:
+            return {"error": "Pass the original alert time as need=<unix seconds>"}
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO alerts (wa_user, ts, chased_ts) VALUES (?, ?, ?) "
+                         "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts, "
+                         "chased_ts = excluded.chased_ts", (digits, ts, ts))
+        return {"restored": digits, "waiting_since": _fmt_ts(ts),
+                "customer": customer_label(digits)}
     if action == "clearwaiting":
         # Wipe the waiting list so tomorrow starts fresh (owner declared the backlog
         # handled). New alerts build the list again from scratch.
-        with closing(db()) as conn, conn:
+        # The confirm step exists because this took one careless request to fire
+        # and there is no undo: every record of who is waiting on a person is in
+        # this one table (16 Sep 2026).
+        with closing(db()) as conn:
             n = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        if (need or "").strip().lower() != "yes":
+            return {"cleared": 0, "would_clear": n,
+                    "error": "This deletes the whole waiting list and cannot be "
+                             "undone. Add &need=yes if you really mean it."}
+        with closing(db()) as conn, conn:
             conn.execute("DELETE FROM alerts")
         return {"cleared": n, "note": "Waiting list is empty - starting fresh."}
     if action == "sendwaiting":
