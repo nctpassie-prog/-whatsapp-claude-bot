@@ -922,6 +922,31 @@ def cancel_booking(user: str, fields: dict) -> dict:
         rows = conn.execute(
             f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
             f"WHERE {' AND '.join(where)}", args).fetchall()
+    date_mismatch = False
+    if not rows and date_:
+        # The customer named a date that is not the one in the diary. Seen live on
+        # the headlights bot 15 Sep 2026: booked for Tuesday the 15th, wrote "I'm
+        # booked in for Thursday 17th... I need to cancel", and the date = clause
+        # meant the real row was never found - while the bot said "cancelled".
+        # The reg alone identified it perfectly well, so retry without the date.
+        retry = [w for w in where if not w.startswith("date = ")] + ["date >= ?"]
+        retry_args = [a for w, a in zip(where, args) if not w.startswith("date = ")]
+        retry_args.append(today_iso)
+        with closing(db()) as conn:
+            rows = conn.execute(
+                f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
+                f"WHERE {' AND '.join(retry)}", retry_args).fetchall()
+        if len(rows) > 1:
+            # Never guess between two of someone's bookings: this deletes every
+            # row the SELECT returns, so a blind retry would wipe both.
+            log.warning("Cancellation for %s matched %d future bookings - refusing",
+                        user, len(rows))
+            return {"cancelled": 0, "ambiguous": [
+                {"name": r[1], "car": r[2], "reg": r[3], "date": r[4]} for r in rows]}
+        date_mismatch = bool(rows)
+        if date_mismatch:
+            log.info("Cancellation for %s: customer said %s, diary says %s",
+                     user, date_, rows[0][4])
     if not rows:
         log.info("Cancellation requested by %s but no matching booking found", user)
         return {"cancelled": 0}
@@ -929,7 +954,8 @@ def cancel_booking(user: str, fields: dict) -> dict:
     for bid, name, car, breg, bdate, ev_id in rows:
         with closing(db()) as conn, conn:
             conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
-        removed.append({"name": name, "car": car, "reg": breg, "date": bdate})
+        removed.append({"name": name, "car": car, "reg": breg, "date": bdate,
+                        "date_mismatch": date_mismatch})
         if ev_id and calendar_enabled():
             try:
                 tok = _google_access_token("calendar")
@@ -3428,15 +3454,41 @@ def _finish_reply(user: str, answer: str) -> str:
             log.exception("Failed to process recovery request for %s", user)
     answer, cancel = process_cancel(answer)
     if cancel and not is_owner:
+        # Explicit flag, set only on a real cancellation: the call sits in a bare
+        # try/except that just logs, so an exception used to leave the model's
+        # "your booking is cancelled" sentence in place too.
+        cancelled_something = False
+        result = {}
         try:
             result = cancel_booking(user, cancel)
             for b in result.get("bookings", []):
+                cancelled_something = True
                 alert_owner(user, "❌ Booking cancelled",
                             f"{b.get('name','')} {b.get('car','')} {b.get('reg','')} "
-                            f"on {b.get('date','')} — the slot is free again.",
+                            f"on {b.get('date','')} — the slot is free again."
+                            + (f"\n⚠️ They said {cancel.get('date','')}, the diary "
+                               f"said {b.get('date','')} — cancelled the real one."
+                               if b.get("date_mismatch") else ""),
                             needs_reply=False)
         except Exception:
             log.exception("Failed to cancel booking for %s", user)
+        if not cancelled_something:
+            # Telling a customer their booking is cancelled when nothing was
+            # cancelled is the worst of both worlds: they stop turning up and the
+            # slot stays blocked for everybody else.
+            log.warning("Cancellation for %s cancelled nothing - holding the reply", user)
+            answer = ("Let me just double-check that with the diary and come straight "
+                      "back to you 🙏")
+            try:
+                alert_owner(user, "❌ A cancellation did NOT go through — please check",
+                            "The customer was asking to cancel"
+                            + (f" ({cancel.get('date','')})" if cancel.get("date") else "")
+                            + ", but nothing matched in the diary"
+                            + (" — they may have more than one booking."
+                               if result.get("ambiguous") else ".")
+                            + " They have been told we are checking.")
+            except Exception:
+                log.exception("Could not alert on the failed cancellation for %s", user)
     answer, customer = process_customer(answer)
     if customer and not is_owner:
         try:
