@@ -3439,6 +3439,27 @@ def _finish_reply(user: str, answer: str) -> str:
             bf["phone"] = bf.get("phone") or user
             threading.Thread(target=_register_check_followup,
                               args=(bf, "chat booking"), daemon=True).start()
+            # A second future booking for the same car usually means the customer
+            # asked to move and the old row was never cancelled. Deliberately NOT
+            # auto-cancelled: a customer CAN legitimately hold two bookings (one
+            # did on 16 Sep - a comeback that day and a diagnosis the next week),
+            # and cancel_booking matched on reg alone would delete both. Name both
+            # rows and let a person decide.
+            try:
+                other = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""),
+                                             "1900-01-01")
+                if other and other[1] != bf.get("date"):
+                    send_telegram(
+                        "⚠️ THIS CAR NOW HAS TWO BOOKINGS\n"
+                        f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
+                        f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
+                        f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
+                        "If they moved, cancel the one they are not coming to:\n"
+                        f"{PUBLIC_URL}/admin?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+                        f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
+                        f"&need={other[1]}")
+            except Exception:
+                log.exception("Double-booking check failed for %s", bf.get("phone"))
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -4124,6 +4145,43 @@ def send_parts_orders() -> None:
     except Exception:
         log.exception("Could not record parts_last")
 
+# When a customer asks to move a booking, the bot creates the new row but does
+# not always remove the old one, so the same car sits in the diary twice. Live on
+# 16 Sep 2026: Don (11D9863) wrote "could I change this booking to another date",
+# was moved from the 23rd to the 28th, and the 23rd stayed. Alice (10SO8034)
+# asked for "the 6th of October instead of 21st September" and the 21st stayed.
+# Both would have been texted "your car is booked in tomorrow" for a day they had
+# cancelled, while their old slot stayed blocked against everyone else.
+def later_booking_exists(bid: int, phone: str, reg: str, date_: str):
+    """The row after this one for the SAME car: (id, date) or None.
+
+    Matched on reg when there is one, otherwise on the phone's last 9 digits.
+    A later date AND a later id, so a genuine second visit booked EARLIER (a
+    customer who has two jobs in the diary) is not mistaken for a stale row.
+    """
+    r = clean_reg(reg or "")
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if not r and len(digits) < 9:
+        return None
+    try:
+        with closing(db()) as conn:
+            if r:
+                row = conn.execute(
+                    "SELECT id, date FROM bookings WHERE UPPER(TRIM(COALESCE(reg,''))) = ?"
+                    " AND date > ? AND id > ? ORDER BY date LIMIT 1",
+                    (r, date_ or "", bid)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id, date FROM bookings WHERE"
+                    " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+                    " AND date > ? AND id > ? ORDER BY date LIMIT 1",
+                    ("%" + digits[-9:], date_ or "", bid)).fetchone()
+        return (row[0], row[1]) if row else None
+    except Exception:
+        log.exception("Could not check for a later booking on %s", reg or phone)
+        return None
+
+
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
     if not REMINDER_ENABLED:
@@ -4139,6 +4197,29 @@ def send_due_reminders() -> None:
             (tomorrow,),
         ).fetchall()
     for bid, name, phone, car, reg, tt, lang in rows:
+        # Never remind somebody about a day they have already moved off. If the
+        # same car holds a LATER booking made AFTER this one, this row is almost
+        # certainly the leftover of a reschedule - say so rather than texting the
+        # customer a date they cancelled.
+        later = later_booking_exists(bid, phone, reg, tomorrow)
+        if later:
+            log.warning("Reminder for booking %s skipped - %s also holds %s (id %s)",
+                        bid, clean_reg(reg) or phone, later[1], later[0])
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            try:
+                send_telegram(
+                    "⚠️ TWO BOOKINGS FOR ONE CAR — no reminder sent\n"
+                    f"{name or 'no name'} {clean_car(car) or ''} "
+                    f"({clean_reg(reg) or 'no reg'}) +{phone}\n"
+                    f"Tomorrow {tomorrow} (id {bid}) AND {later[1]} (id {later[0]}).\n"
+                    "Almost certainly a move where the old day was never cancelled. "
+                    f"If so, cancel the old one:\n"
+                    f"{PUBLIC_URL}/admin?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+                    f"&action=cancel&date={clean_reg(reg) or phone}&need={tomorrow}")
+            except Exception:
+                log.exception("Could not report the double booking for %s", phone)
+            continue
         if phone and send_reminder_template(phone, name, car, reg, tt, lang):
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
