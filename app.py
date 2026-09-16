@@ -1427,7 +1427,13 @@ def db() -> sqlite3.Connection:
     for col, ddl in (("reminded", "reminded INTEGER DEFAULT 0"), ("lang", "lang TEXT DEFAULT ''"),
                      ("review_sent", "review_sent INTEGER DEFAULT 0"),
                      # Remembered so a cancellation can remove the right calendar entry.
-                     ("cal_event_id", "cal_event_id TEXT DEFAULT ''")):
+                     ("cal_event_id", "cal_event_id TEXT DEFAULT ''"),
+                     # When the reminder went out and how many times we have
+                     # tried. `reminded` alone could only ever mean "the send
+                     # endpoint answered 200", which is not the same as the
+                     # customer receiving anything.
+                     ("reminded_ts", "reminded_ts REAL DEFAULT 0"),
+                     ("reminder_tries", "reminder_tries INTEGER DEFAULT 0")):
         try:
             conn.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -3898,6 +3904,13 @@ def _send_reminder_in(to: str, params: list, lang_code: str) -> bool:
         if r.status_code != 200:
             log.warning("Reminder (%s) to %s failed: %s %s", lang_code, to, r.status_code, r.text[:300])
             return False
+        # Chakra answers 200 even when WhatsApp refuses the message, so the body
+        # has to be read too. Without this a refusal counted as a success and the
+        # booking was marked reminded on the strength of it.
+        if '"error"' in (r.text or ""):
+            log.warning("Reminder (%s) to %s refused in a 200 body: %s",
+                        lang_code, to, r.text[:300])
+            return False
         return True
     except Exception:
         log.exception("Failed to send reminder template to %s", to)
@@ -4182,6 +4195,11 @@ def later_booking_exists(bid: int, phone: str, reg: str, date_: str):
         return None
 
 
+# A reminder refused by WhatsApp is retried on the next hourly pass, but only so
+# many times: a number that is permanently undeliverable (131026) would otherwise
+# be re-sent every hour, at template cost, until the appointment came and went.
+REMINDER_MAX_TRIES = int(os.environ.get("REMINDER_MAX_TRIES", "3"))
+
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
     if not REMINDER_ENABLED:
@@ -4222,7 +4240,10 @@ def send_due_reminders() -> None:
             continue
         if phone and send_reminder_template(phone, name, car, reg, tt, lang):
             with closing(db()) as conn, conn:
-                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+                conn.execute(
+                    "UPDATE bookings SET reminded = 1, reminded_ts = ?,"
+                    " reminder_tries = COALESCE(reminder_tries, 0) + 1 WHERE id = ?",
+                    (time.time(), bid))
             # Save the reminder to chat history (English rendering, same pattern
             # as come_back_nudge) — otherwise the /chats page shows nothing and,
             # worse, the AI has no idea a reminder was sent when the customer
@@ -8519,6 +8540,52 @@ def report_failed_delivery(recipient: str, errs: list) -> None:
                              (UNDELIVERED_PREFIX + str(row[1] or ""), row[0]))
     except Exception:
         log.exception("Could not mark the undelivered message for %s", digits)
+    # If what just failed was the day-before reminder, un-stamp it so the next
+    # hourly pass tries again. Until now `reminded` was set the moment the send
+    # endpoint answered 200 and nothing ever cleared it, so a refused reminder
+    # was never retried and the diary permanently claimed the customer had been
+    # told. Matched on a booking for TOMORROW stamped within the last 15 minutes,
+    # so an unrelated failed chat reply to the same customer cannot trigger a
+    # re-send. Capped, because a number that is permanently undeliverable would
+    # otherwise re-send every hour until the appointment passed.
+    try:
+        tomorrow_iso = (now_local().date() + timedelta(days=1)).isoformat()
+        exhausted = None
+        with closing(db()) as conn, conn:
+            row = conn.execute(
+                "SELECT id, name, COALESCE(reminder_tries, 0) FROM bookings"
+                " WHERE date = ? AND COALESCE(reminded, 0) = 1"
+                " AND COALESCE(reminded_ts, 0) > ?"
+                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+                (tomorrow_iso, time.time() - 900, "%" + digits[-9:])).fetchone()
+            if row:
+                bid, bname, tries = row
+                # send_due_reminders only runs between 09:00 and 19:59, so after
+                # 19:00 there is no pass left today - and tomorrow's 9am pass
+                # looks for bookings dated TOMORROW, by which time this one is
+                # TODAY and can never match. Un-stamping then would lose the
+                # reminder silently, which is the failure this whole change
+                # exists to end. Treat it as out of road and tell a person.
+                no_window_left = now_local().hour >= 19
+                if tries < REMINDER_MAX_TRIES and not no_window_left:
+                    conn.execute("UPDATE bookings SET reminded = 0 WHERE id = ?", (bid,))
+                    log.warning("Reminder for booking %s was refused (%s) - "
+                                "un-stamped for retry %s of %s",
+                                bid, detail, tries + 1, REMINDER_MAX_TRIES)
+                else:
+                    exhausted = (bid, bname, tries, no_window_left)
+        if exhausted:
+            bid, bname, tries, no_window_left = exhausted
+            why = ("and there is no time left today to try again"
+                   if no_window_left else
+                   f"{tries} times, which is as many times as we try")
+            send_telegram(
+                "⚠️ COULD NOT REMIND THIS CUSTOMER — please ring them\n"
+                f"{bname or 'no name'} +{digits} is booked in TOMORROW ({tomorrow_iso}).\n"
+                f"WhatsApp refused the reminder {why}: {detail}\n"
+                "They have not been told, and nothing else will try again.")
+    except Exception:
+        log.exception("Could not handle the reminder retry for %s", digits)
     # Once per number per day. 131026 is often permanent, so a tighter window
     # would re-alert on every retry until somebody muted the whole thing.
     now = time.time()
