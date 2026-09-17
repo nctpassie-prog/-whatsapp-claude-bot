@@ -1887,17 +1887,27 @@ def normalize_phone(phone: str) -> str:
         d = "353" + d  # typed without the leading zero
     return d
 
-def is_day_full(date_str: str) -> bool:
-    """Check the authoritative count from DB — never rely on cached availability."""
-    try:
-        with closing(db()) as conn:
-            booked = conn.execute(
-                "SELECT COUNT(*) FROM bookings WHERE date = ?", (date_str,)).fetchone()[0]
-        return booked >= 10
-    except Exception:
-        return False  # If we can't check, let the save attempt (safer than refusing)
+def is_day_full(date_str: str, need: str = "") -> bool:
+    """The last gate before a row is written: has this day a slot left for THIS
+    KIND of job?
 
-def save_booking(fields: dict) -> bool:
+    It used to compare the day's total count against one hardcoded number - 10 on
+    the garage, 6 on headlights - which got two things wrong at once. A Saturday
+    that was full read as under capacity and took another car, and a day the
+    owner had closed was not full at all. Live on 16 Sep 2026: headlights
+    Saturday 19 September had held its 2 of 2 since the 11th and a customer was
+    still offered it, then told it was full.
+
+    A total count is the wrong question anyway, because the kinds do not mix.
+    Owner, 17 Sep 2026: "4 cars with headlight repair, 2 cars for headlight
+    alignment or polish" - so a day with its 4 repair slots gone is full for
+    repairs while the total still reads 4 of 6. The garage has the same shape in
+    its hard-job quota. day_is_full already encodes all of it, including the
+    Saturday rules and the owner-closed dates, so ask it rather than counting.
+    """
+    return day_is_full(date_str, need or "")
+
+def save_booking(fields: dict, override_capacity: bool = False) -> bool:
     """Store a booking. Returns False if it was a duplicate and nothing was saved.
 
     The same car was being written twice for one day (the booking marker can be
@@ -1963,14 +1973,6 @@ def save_booking(fields: dict) -> bool:
         except Exception:
             pass
         return False
-    if date_ and is_day_full(date_):
-        log.warning("Booking refused: %s is at 10/10 capacity (race condition guard)", date_)
-        try:
-            send_telegram(f"⚠️ Race condition: tried to book {date_} but it's now full. "
-                          f"Check diary and manually add if the customer confirmed a different day.")
-        except Exception:
-            pass
-        return False
     if date_:
         with closing(db()) as conn:
             dupe = conn.execute(
@@ -2008,6 +2010,35 @@ def save_booking(fields: dict) -> bool:
                 log.exception("Failed to backfill existing booking id=%s", dupe[0])
             record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
             return False
+    # Capacity is checked AFTER the duplicate check above: a booking already in
+    # the diary is not asking for a new slot, so a re-confirmation on a day that
+    # has since filled must not be refused - nor should it raise a race-condition
+    # alert about a booking that was never at risk.
+    # override_capacity is for bookings a PERSON has already promised - the
+    # owner's own manual add, and a colleague agreeing a day in the WhatsApp app.
+    # This gate exists to stop the BOT over-booking; refusing a human after the
+    # customer has been told yes loses the car instead of protecting the day.
+    if date_ and not override_capacity and is_day_full(date_, fields.get("need", "")):
+        log.warning("Booking refused: %s has no slot left for %r",
+                    date_, (fields.get("need", "") or "")[:60])
+        try:
+            # Name the customer. The old alert said only which date was refused,
+            # so the owner could not tell whose car it was or which chat to open -
+            # and this branch is reachable far more often now that the gate knows
+            # the real per-kind capacity.
+            send_telegram(
+                "⚠️ BOOKING REFUSED — that day has no slot left for this job\n"
+                f"{fields.get('name') or 'no name'} — "
+                f"{clean_car(fields.get('car', '')) or 'no car'} "
+                f"({reg or 'no reg'})\n"
+                f"{(fields.get('need', '') or 'no job given')[:80]}\n"
+                f"Date asked for: {date_}\n"
+                + (f"💬 https://wa.me/{phone}\n" if phone else "")
+                + "If they were promised this day, add it by hand — that overrides "
+                  "the capacity check.")
+        except Exception:
+            pass
+        return False
     try:
         with closing(db()) as conn, conn:
             conn.execute(
@@ -2627,6 +2658,13 @@ _ASSIST_CLAIMS_BOOKED_RE = re.compile(
     r"you are booked|got you booked|booked in for)", re.IGNORECASE)
 
 
+# A message that asks for nothing must not wake anybody up. Five of the 33
+# "needs you to follow up" alerts in three days fired on one of these, and each
+# still got reposted at 30 minutes and pushed to the owner's private chat at two
+# hours. The customer had said "Okay thanks", "Thanks", "Yes", "It's 1pm hahaha",
+# and — the clearest of them — "ok thanks send me soon" followed by "and may god
+# give then blessing to day amen", which the bot answered "The team will be in
+# touch with you here shortly" and so raised a person for a blessing.
 def _maybe_courtesy_close(user: str) -> None:
     """While a colleague owns the chat, still handle the easy things.
 
@@ -2770,9 +2808,12 @@ def watch_staff_booking(user: str) -> None:
         # whose name, car and phone were all "..." (7 Sep 2026).
         if len(normalize_phone(fields.get("phone", ""))) < 9:
             fields["phone"] = user
-        added = save_booking(fields)  # dedupe inside — safe to run repeatedly
+        # A colleague has already told the customer yes, so this overrides
+        # capacity: the alternative is dropping the booking silently and letting
+        # them arrive to a day nobody has a record of.
+        added = save_booking(fields, override_capacity=True)
         if not added:
-            return
+            return  # a duplicate - the booking is already in the diary
         create_calendar_event(fields)
         send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
                       f"{fields.get('name','')} — {fields.get('car','')} "
@@ -6888,10 +6929,15 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             return {"error": "Need at least date and a reg or phone."}
         fields = {"name": name, "phone": phone, "car": car, "reg": reg,
                   "need": need, "date": date.strip(), "time": "", "lang": ""}
-        added = save_booking(fields)
+        # The owner adding a booking by hand IS the override: this endpoint sits
+        # behind the admin token, and it is the second half of the documented way
+        # to move a booking (cancel, then re-add). Refusing here on a full or
+        # closed day would lose a car whose original row has already been deleted.
+        added = save_booking(fields, override_capacity=True)
         cal = create_calendar_event(fields) if added else False
         return {"added": bool(added), "calendar": bool(cal),
-                "note": "duplicate - already in the diary" if not added else "booked"}
+                # Only a duplicate can refuse now, so the note is finally true.
+                "note": "already in the diary — nothing added" if not added else "booked"}
     if action == "day":
         # Full job list for a date: ?action=day&date=YYYY-MM-DD (default tomorrow).
         try:
