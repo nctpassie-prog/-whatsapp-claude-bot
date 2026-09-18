@@ -1534,6 +1534,15 @@ def db() -> sqlite3.Connection:
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " wa_user TEXT, role TEXT, content TEXT, ts REAL)"
     )
+    # Which kind of assistant message this is. Blank for an ordinary reply;
+    # 'reminder' for a bot-initiated one. The model and the /chats page treat
+    # them all the same - deliberately - but the three places that ask "has
+    # anyone actually dealt with this customer?" must not count a reminder as an
+    # answer, or somebody waiting on a person is marked handled and never chased.
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
     # Gentle follow-up to customers who went quiet after our last reply.
@@ -2509,13 +2518,19 @@ def already_seen(msg_id: str) -> bool:
         conn.execute("DELETE FROM seen WHERE ts < ?", (time.time() - 7 * 86400,))
     return False
 
-def save_message(user: str, role: str, content: str) -> None:
+def save_message(user: str, role: str, content: str, kind: str = "") -> None:
+    """kind='reminder' marks a message the BOT started, not a reply to anything.
+
+    It still shows in the chat and still reaches the model. It is only excluded
+    where the question is "has this customer been dealt with?" - see the comment
+    on the messages.kind column."""
     if role == "assistant":
         content = fix_mojibake(content)  # history must match what the customer got
     with closing(db()) as conn, conn:
         conn.execute(
-            "INSERT INTO messages (wa_user, role, content, ts) VALUES (?, ?, ?, ?)",
-            (user, role, content, time.time()),
+            "INSERT INTO messages (wa_user, role, content, ts, kind)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user, role, content, time.time(), kind),
         )
 
 def get_history(user: str) -> list[dict]:
@@ -4772,27 +4787,31 @@ def send_due_reminders() -> None:
                 " reminder_tries = COALESCE(reminder_tries, 0) + 1,"
                 " reminder_wamid = ? WHERE id = ?",
                 (time.time(), wamid, bid))
-            # Save the reminder to chat history (English rendering, same pattern
-            # as come_back_nudge) — otherwise the /chats page shows nothing and,
-            # worse, the AI has no idea a reminder was sent when the customer
-            # replies to it ("what time?" made no sense to the model before).
-            try:
-                # Same values the template actually carried (3 Sep: the history
-                # showed "(-)" and "between Friday 4 September between" although
-                # the customer received the tidy version).
-                tidy = (tt or "").strip()
-                if not re.fullmatch(r"[\d:.\s]+(?:am|pm)?\s*(?:-|to|and|–)\s*[\d:.\s]+(?:am|pm)?",
-                                    tidy, re.I):
-                    tidy = "9 and 11am"
-                save_message(phone, "assistant",
-                    f"Hi {_reminder_name(name)}, just a reminder that your "
-                    f"{clean_car(car) or 'car'} ({clean_reg(reg) or 'no reg on file'}) is booked in "
-                    f"with NCTPass tomorrow. Please drop the car in between "
-                    f"{tidy} and we'll message you when it's ready. "
-                    f"Reply here if you need to change anything.")
-            except Exception:
-                log.exception("Failed to save reminder to history for %s", phone)
-            log.info("Sent appointment reminder for booking %s to %s", bid, phone)
+        # Everything below is OUTSIDE that transaction, deliberately. save_message
+        # opens its own connection, and db() sets no busy timeout, so calling it
+        # while the UPDATE above still held the write lock waited five seconds and
+        # then raised "database is locked" - straight into the except clause and
+        # the log. No reminder had reached the chat history since 16 Sep because
+        # of it, so a customer replying "what time again?" was answered by a model
+        # reading a conversation with no reminder in it.
+        # The history has to match what the customer actually received (3 Sep:
+        # it showed "(-)" and "between Friday 4 September between" while the
+        # customer got the tidy version).
+        try:
+            tidy = (tt or "").strip()
+            if not re.fullmatch(r"[\d:.\s]+(?:am|pm)?\s*(?:-|to|and|–)\s*[\d:.\s]+(?:am|pm)?",
+                                tidy, re.I):
+                tidy = "9 and 11am"
+            save_message(phone, "assistant",
+                f"Hi {_reminder_name(name)}, just a reminder that your "
+                f"{clean_car(car) or 'car'} ({clean_reg(reg) or 'no reg on file'}) is booked in "
+                f"with NCTPass tomorrow. Please drop the car in between "
+                f"{tidy} and we'll message you when it's ready. "
+                f"Reply here if you need to change anything.",
+                kind="reminder")
+        except Exception:
+            log.exception("Failed to save reminder to history for %s", phone)
+        log.info("Sent appointment reminder for booking %s to %s", bid, phone)
 
 def _send_review_in(to: str, params: list, lang_code: str) -> bool:
     try:
@@ -5271,8 +5290,12 @@ def sweep_stalled_staff_chats() -> None:
             (nowts - AUTO_RESUME_HOURS * 3600,)).fetchall()
         stalled = []
         for user, staff_ts in rows:
+            # Skipping reminders: one landing on a chat a colleague has gone
+            # quiet on would make the newest row an assistant one, and the
+            # customer's question would never be swept back to the bot.
             last = conn.execute(
                 "SELECT role, content, ts FROM messages WHERE wa_user = ? "
+                "AND COALESCE(kind,'') <> 'reminder' "
                 "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
             if not last or last[0] != "user":
                 continue  # nothing pending from the customer
@@ -5342,8 +5365,13 @@ def chase_unresolved_alerts() -> None:
             # customer message answered with a real (non-fallback) reply since
             # the alert was raised, treat it as already handled by the bot itself.
             with closing(db()) as conn:
+                # COALESCE(kind,'') <> 'reminder': a day-before reminder is the
+                # bot starting a conversation, not answering one. Counting it
+                # marked a customer waiting on a PERSON as handled, and this
+                # chase only ever runs once, so they were never chased again.
                 since_alert = conn.execute(
                     "SELECT role, content FROM messages WHERE wa_user = ? AND ts > ? "
+                    "AND COALESCE(kind,'') <> 'reminder' "
                     "ORDER BY id ASC", (user, alert_ts)).fetchall()
             bot_moved_on = (
                 any(role == "user" for role, _ in since_alert)
@@ -9249,6 +9277,7 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
         with closing(db()) as conn, conn:
             row = conn.execute(
                 "SELECT id, content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                " AND COALESCE(kind,'') <> 'reminder'"
                 " AND ts > ? ORDER BY id DESC LIMIT 1",
                 (digits, time.time() - 900)).fetchone()
             if row and not str(row[1] or "").startswith(UNDELIVERED_PREFIX):
