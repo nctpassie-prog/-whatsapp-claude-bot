@@ -1465,6 +1465,22 @@ def save_charge(fields: dict) -> None:
         )
     log.info("Charge logged for %s: %s", fields.get("reg", ""), fields.get("amount", ""))
 
+_ASKING_FOR_WORK_RE = re.compile(
+    # Never bare "job" or "work": this garage says both about cars all day, and
+    # CV BOOT and CV JOINT are parts on the price list. Checked against 1,220
+    # real customer messages from both bots - one match, the real enquiry.
+    r"\b(?:hiring|recruiting|vacanc\w+)\b"
+    r"|\blooking for (?:a )?(?:job|work|position)\b"
+    r"|\b(?:any|got any) (?:jobs?|vacanc\w+|positions?) (?:going|available|for me)\b"
+    r"|\bwork(?:ing)? for (?:you|yous|ye|the garage)\b"
+    r"|\bjoin (?:your|the) team\b"
+    r"|\b(?:apply|application) for (?:a )?(?:job|position|work)\b"
+    r"|\bmy (?:cv|c\.v\.|resum[e\u00e9]|curriculum)\b"
+    r"|\b(?:send|sending|sent|attach\w*|email\w*) (?:you )?(?:my|a|the) (?:cv|resum[e\u00e9])\b"
+    r"|\b(?:mechanic|apprentice|valet\w*|panel beater|technician)'?s? (?:assistant|job|position)\b"
+    r"|\bneed (?:a )?(?:job|work)\b",
+    re.IGNORECASE)
+
 JOB_RE = re.compile(r"<<<JOB\|(.*?)>>>", re.DOTALL)
 
 def process_job(answer: str):
@@ -4122,6 +4138,18 @@ def _finish_reply(user: str, answer: str) -> str:
         except Exception:
             log.exception("Failed to save charge")
     answer, job = process_job(answer)
+    # The model emits the JOB line only SOMETIMES - the same question asked twice
+    # against the live bot produced it once. So fall back to what the customer
+    # actually wrote: if they were plainly asking about work, the owner hears
+    # about it whether or not the hidden line arrived.
+    if job is None and not is_owner:
+        try:
+            if _ASKING_FOR_WORK_RE.search(_recent_customer_words(user, 1) or ""):
+                log.info("Job enquiry from %s with no JOB marker - telling the owner anyway",
+                         user)
+                job = {"_empty": True}
+        except Exception:
+            log.exception("Job-enquiry backstop failed for %s", user)
     if job and not is_owner:
         try:
             notify_owner_job(user, job)
