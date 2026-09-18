@@ -897,10 +897,70 @@ def process_cancel(answer: str):
         if "=" in part:
             k, v = part.split("=", 1)
             fields[k.strip().lower()] = v.strip()
-    return clean, fields
+    # A marker with no key=value pairs at all — <<<CANCEL|>>>, or one written
+    # positionally — parsed to {}, which is falsy, so the caller skipped the whole
+    # cancellation and the model's "I've cancelled that for you" went out with
+    # nothing cancelled and nobody told. An empty marker is still a cancellation
+    # request: hand back something truthy and let the phone number find them.
+    return clean, (fields or {"_empty": True})
 
-def cancel_booking(user: str, fields: dict) -> dict:
-    """Cancel a customer's booking: free the slot and remove the calendar entry."""
+BOOKED_LINE_MSG = {
+    "en": "You're booked in for {day} \U0001F44D",
+    "ru": "Записали вас на {day} \U0001F44D",
+    "lt": "Užregistravome jus {day} \U0001F44D",
+    "ro": "V-am programat pentru {day} \U0001F44D",
+}
+
+WHICH_BOOKING_MSG = {
+    "en": "Of course \U0001F64f you have more than one booking with us — which "
+          "would you like to cancel?\n{list}\nJust tell me the car or the day and "
+          "I'll sort it.",
+    "ru": "Конечно \U0001F64f у вас больше одной записи — какую отменить?\n{list}\n"
+          "Напишите марку машины или день, и я всё сделаю.",
+    "lt": "Žinoma \U0001F64f turite daugiau nei vieną registraciją — kurią atšaukti?"
+          "\n{list}\nParašykite automobilį arba dieną, ir viską sutvarkysiu.",
+    "ro": "Desigur \U0001F64f aveți mai multe programări — pe care să o anulez?\n"
+          "{list}\nSpuneți-mi mașina sau ziua și mă ocup.",
+}
+
+def which_booking_question(rows: list) -> str:
+    """Ask the customer WHICH booking to cancel, naming each one.
+
+    A trade customer can easily have two cars with us — JJ Carpets had a Transit
+    on the Monday and a Toyota IQ on the Tuesday — so "cancel my booking" is a
+    question, not an instruction. Asking costs one message; guessing costs them
+    a van they still needed booked in."""
+    lines = []
+    for b in rows:
+        car = clean_car(b.get("car", "")) or "your car"
+        reg = clean_reg(b.get("reg", ""))
+        try:
+            when = date.fromisoformat(b.get("date", "")).strftime("%A %d %B")
+        except ValueError:
+            when = b.get("date", "") or "date not set"
+        lines.append(f"• {car}" + (f" ({reg})" if reg else "") + f" — {when}")
+    # Their own language, taken from whichever booking recorded one.
+    lang = reminder_lang_code(
+        next((b.get("lang", "") for b in rows if b.get("lang")), ""))
+    return WHICH_BOOKING_MSG.get(lang, WHICH_BOOKING_MSG["en"]).format(
+        list="\n".join(lines))
+
+def cancel_booking(user: str, fields: dict, allow_multiple: bool = False,
+                   date_strict: bool = False, exclude_date: str = "") -> dict:
+    """Cancel a booking: free the slot and remove the calendar entry.
+
+    The chat path hands this function a SEARCH, not an instruction — the model is
+    told in business_info.md to "leave blank if unsure" about the date — so by
+    default it cancels ONE booking or none at all, and hands back what it found so
+    the customer can be asked which car they meant. Deleting is irreversible here:
+    the row goes, and so does the Google Calendar event.
+
+    allow_multiple=True is for the owner's own tools, where "clear this reg out of
+    the diary" is the point and he is shown the list afterwards.
+    date_strict=True never widens the search when the date it was given misses —
+    for callers that know the exact date and must not wander onto another one.
+    exclude_date keeps a booking made in this same reply out of the search: a
+    reschedule is one reply that books the new day and cancels the old."""
     digits = "".join(ch for ch in str(user) if ch.isdigit())
     reg = clean_reg(fields.get("reg", ""))
     date_ = (fields.get("date") or "").strip()
@@ -910,6 +970,16 @@ def cancel_booking(user: str, fields: dict) -> dict:
         where, args = ["date = ?"], [date_]
     if reg:
         where.append("UPPER(TRIM(COALESCE(reg,''))) = ?"); args.append(reg)
+        if len(digits) >= 7:
+            # A reg on its own is NOT proof the booking belongs to whoever is
+            # asking. The model lifts regs out of the conversation, and a customer
+            # can type one that is not theirs — without this, a cancellation
+            # naming "151D1234" from any number deletes whoever really owns that
+            # booking. Rows with no phone saved on them stay reachable, because
+            # staff-entered bookings often have none.
+            where.append("(TRIM(COALESCE(phone,'')) = ''"
+                         " OR REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?)")
+            args.append("%" + digits[-9:])
     elif len(digits) >= 7:  # fall back to their phone number
         where.append("REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?")
         args.append("%" + digits[-9:])
@@ -918,12 +988,36 @@ def cancel_booking(user: str, fields: dict) -> dict:
         # (LIKE '%') and wipe the diary — seen as a risk 7 Sep 2026.
         log.warning("Cancellation with no reg and no phone refused (%r / %r)", user, fields)
         return {"cancelled": 0, "error": "need a reg or a phone number"}
-    with closing(db()) as conn:
-        rows = conn.execute(
-            f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
-            f"WHERE {' AND '.join(where)}", args).fetchall()
+    if exclude_date:
+        # Part of the QUERY, deliberately, not a filter afterwards. A move is one
+        # reply that books the new day and cancels the old, and the model
+        # sometimes writes the NEW date into the CANCEL. Filtering after the fact
+        # meant that row counted as "found", the widen-retry never ran, and the
+        # old booking stayed in the diary. As a clause, the first query comes back
+        # empty and the retry goes and finds the real one.
+        where.append("date <> ?"); args.append(exclude_date)
+    lookup_failed = False
+
+    def _find(clauses, params):
+        # A database wobble must not throw halfway through working out what to
+        # delete — but it must not quietly read as "the diary is empty" either,
+        # or the owner is told "I couldn't find a booking" when the truth is "I
+        # could not look". ORDER BY date so any list we show reads oldest first.
+        nonlocal lookup_failed
+        try:
+            with closing(db()) as conn:
+                return conn.execute(
+                    "SELECT id, name, car, reg, date, COALESCE(cal_event_id,''),"
+                    " COALESCE(lang,'') FROM bookings"
+                    f" WHERE {' AND '.join(clauses)} ORDER BY date", params).fetchall()
+        except Exception:
+            log.exception("Cancellation lookup failed for %s", user)
+            lookup_failed = True
+            return []
+
+    rows = _find(where, args)
     date_mismatch = False
-    if not rows and date_:
+    if not rows and date_ and not date_strict:
         # The customer named a date that is not the one in the diary. Seen live on
         # the headlights bot 15 Sep 2026: booked for Tuesday the 15th, wrote "I'm
         # booked in for Thursday 17th... I need to cancel", and the date = clause
@@ -932,26 +1026,33 @@ def cancel_booking(user: str, fields: dict) -> dict:
         retry = [w for w in where if not w.startswith("date = ")] + ["date >= ?"]
         retry_args = [a for w, a in zip(where, args) if not w.startswith("date = ")]
         retry_args.append(today_iso)
-        with closing(db()) as conn:
-            rows = conn.execute(
-                f"SELECT id, name, car, reg, date, COALESCE(cal_event_id,'') FROM bookings "
-                f"WHERE {' AND '.join(retry)}", retry_args).fetchall()
-        if len(rows) > 1:
-            # Never guess between two of someone's bookings: this deletes every
-            # row the SELECT returns, so a blind retry would wipe both.
-            log.warning("Cancellation for %s matched %d future bookings - refusing",
-                        user, len(rows))
-            return {"cancelled": 0, "ambiguous": [
-                {"name": r[1], "car": r[2], "reg": r[3], "date": r[4]} for r in rows]}
+        lookup_failed = False  # the retry gets to speak for itself
+        rows = _find(retry, retry_args)
         date_mismatch = bool(rows)
         if date_mismatch:
             log.info("Cancellation for %s: customer said %s, diary says %s",
                      user, date_, rows[0][4])
+    if lookup_failed:
+        return {"cancelled": 0, "error": "could not read the diary"}
+    # Never guess between two of someone's bookings. This check used to live
+    # INSIDE the retry branch above, so it only ever ran when a date had been
+    # given and missed. A CANCEL marker with no date — which business_info.md
+    # explicitly tells the model to send when it is unsure — went straight to
+    # "date >= today AND reg/phone = X" and the loop below deleted every future
+    # booking the customer had, with every calendar event. JJ Carpets
+    # (086 040 1806) hold two today: a Ford Transit on the Monday and a Toyota IQ
+    # on the Tuesday, on one phone number and no shared reg.
+    if len(rows) > 1 and not allow_multiple:
+        log.warning("Cancellation for %s matched %d future bookings - asking which",
+                    user, len(rows))
+        return {"cancelled": 0, "ambiguous": [
+            {"id": r[0], "name": r[1], "car": r[2], "reg": r[3], "date": r[4],
+             "lang": r[6]} for r in rows]}
     if not rows:
         log.info("Cancellation requested by %s but no matching booking found", user)
         return {"cancelled": 0}
     removed = []
-    for bid, name, car, breg, bdate, ev_id in rows:
+    for bid, name, car, breg, bdate, ev_id, _lang in rows:
         with closing(db()) as conn, conn:
             conn.execute("DELETE FROM bookings WHERE id = ?", (bid,))
         removed.append({"name": name, "car": car, "reg": breg, "date": bdate,
@@ -1087,11 +1188,27 @@ def settle_waitlist_after_booking(fields: dict) -> None:
             return
         with closing(db()) as conn, conn:
             conn.execute("UPDATE waitlist SET status='done' WHERE id = ?", (wid,))
+        # date_strict: this knows the exact date. Without it a near miss (a reg
+        # saved on one row and not the other, a date out by a day) fell into the
+        # retry branch, which DROPS the date and cancels whatever future booking
+        # for that car it finds — possibly the new one. Reachable from the voice
+        # line too, where nobody typed anything.
         result = cancel_booking(phone, {"date": old_date,
-                                        "reg": wreg or fields.get("reg", "")})
+                                        "reg": wreg or fields.get("reg", "")},
+                                date_strict=True)
         if result.get("cancelled"):
             send_telegram(f"📋 Waiting list: {customer_label(phone)} moved "
                           f"{old_date} → {new_date}; the {old_date} slot is free again.")
+        else:
+            # Refusing to wander is right, but it must not fail in silence — the
+            # old row would sit in the diary blocking a slot with nobody told.
+            # Carefully hedged: we did not find the old row, so we do not know
+            # it was ever there. Saying "they moved" as a fact would send the
+            # owner looking for something that may never have existed.
+            send_telegram(f"📋 Waiting list: {customer_label(phone)} is now "
+                          f"booked for {new_date}. I could not find a {old_date} "
+                          f"booking to cancel — if one is still in the diary, "
+                          f"please free it up.")
     except Exception:
         log.exception("Waitlist settle failed for %s", phone)
 
@@ -3756,8 +3873,14 @@ def _finish_reply(user: str, answer: str) -> str:
             # and cancel_booking matched on reg alone would delete both. Name both
             # rows and let a person decide.
             try:
-                other = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""),
-                                             "1900-01-01")
+                # Floored at yesterday, so this means "date >= today". It used
+                # to pass 1900-01-01, which made a function called
+                # later_booking_exists return the EARLIEST row of all time —
+                # every past visit included — so the alert fired on history and
+                # missed a genuine second future booking.
+                other = later_booking_exists(
+                    0, bf.get("phone", ""), bf.get("reg", ""),
+                    (now_local().date() - timedelta(days=1)).isoformat())
                 if other and other[1] != bf.get("date"):
                     send_telegram(
                         "⚠️ THIS CAR NOW HAS TWO BOOKINGS\n"
@@ -3783,6 +3906,9 @@ def _finish_reply(user: str, answer: str) -> str:
             send_recovery_request(user, recovery)
         except Exception:
             log.exception("Failed to process recovery request for %s", user)
+    # Set here, not inside the branch below: it is read unconditionally further
+    # down, and most replies carry no cancellation at all.
+    which_car = ""
     answer, cancel = process_cancel(answer)
     if cancel and not is_owner:
         # Explicit flag, set only on a real cancellation: the call sits in a bare
@@ -3791,7 +3917,8 @@ def _finish_reply(user: str, answer: str) -> str:
         cancelled_something = False
         result = {}
         try:
-            result = cancel_booking(user, cancel)
+            result = cancel_booking(user, cancel,
+                                    exclude_date=(booking or {}).get("date", ""))
             for b in result.get("bookings", []):
                 cancelled_something = True
                 alert_owner(user, "❌ Booking cancelled",
@@ -3803,20 +3930,49 @@ def _finish_reply(user: str, answer: str) -> str:
                             needs_reply=False)
         except Exception:
             log.exception("Failed to cancel booking for %s", user)
-        if not cancelled_something:
+        if not cancelled_something and result.get("ambiguous"):
+            # They hold more than one booking, so ask which car — do not guess and
+            # do not put it on a person. Before this, cancel_booking deleted EVERY
+            # one of them and the customer was told it was done. One question here
+            # frees the right slot in the next message, and raises no alert at all.
+            log.info("Cancellation for %s matched %d bookings - asking which car",
+                     user, len(result.get("ambiguous") or []))
+            # Held aside, not assigned: `answer` still carries this turn's other
+            # hidden markers (a HANDOVER, FEEDBACK, CUSTOMER or CHARGE), and they
+            # are only stripped and acted on further down. Overwriting it here
+            # would delete them unread, so a customer who cancelled AND asked for
+            # a callback would get no alert. Swapped in once those have run.
+            which_car = which_booking_question(result["ambiguous"])
+        elif not cancelled_something and result.get("error"):
+            # "I could not look" is not "there is nothing there". Told as the
+            # latter, the owner goes hunting for a booking that is sitting in the
+            # diary and ends up mistrusting the bot rather than the disk.
+            log.error("Cancellation for %s could not be looked up: %s",
+                      user, result.get("error"))
+            which_car = ("Let me just double-check that with the diary and come "
+                         "straight back to you \U0001F64f")
+            try:
+                alert_owner(user, "\u274c Could not check the diary to cancel — please look",
+                            "The customer asked to cancel"
+                            + (f" ({cancel.get('date','')})" if cancel.get("date") else "")
+                            + f", but the diary could not be read ({result['error']}). "
+                              "NOTHING was cancelled and the booking is probably still "
+                              "there. They have been told we are checking.")
+            except Exception:
+                log.exception("Could not alert on the failed cancellation for %s", user)
+        elif not cancelled_something:
             # Telling a customer their booking is cancelled when nothing was
             # cancelled is the worst of both worlds: they stop turning up and the
             # slot stays blocked for everybody else.
             log.warning("Cancellation for %s cancelled nothing - holding the reply", user)
-            answer = ("Let me just double-check that with the diary and come straight "
-                      "back to you 🙏")
+            which_car = ("Let me just double-check that with the diary and come "
+                         "straight back to you 🙏")
             try:
                 alert_owner(user, "❌ A cancellation did NOT go through — please check",
                             "The customer was asking to cancel"
                             + (f" ({cancel.get('date','')})" if cancel.get("date") else "")
-                            + ", but nothing matched in the diary"
-                            + (" — they may have more than one booking."
-                               if result.get("ambiguous") else ".")
+                            + ", but I could not match that to a booking on their "
+                              "number. It may be saved under a different phone or reg."
                             + " They have been told we are checking.")
             except Exception:
                 log.exception("Could not alert on the failed cancellation for %s", user)
@@ -3872,6 +4028,21 @@ def _finish_reply(user: str, answer: str) -> str:
     # Safety net: if the visible reply came out blank (e.g. Claude returned only a
     # hidden marker), never leave the customer in silence. Send a neutral holding
     # line and tell the owner so a human can pick it up.
+    if which_car:
+        # Everything this turn's markers needed has now been done, so the model's
+        # false "I've cancelled that for you" can safely be replaced. But if this
+        # same reply also BOOKED something, that part was true and must survive —
+        # a customer moving a booking would otherwise be asked "which one?" and
+        # never told the new day was confirmed.
+        if booking and booking.get("date"):
+            try:
+                which_car = BOOKED_LINE_MSG.get(
+                    reminder_lang_code(booking.get("lang", "")), BOOKED_LINE_MSG["en"]
+                ).format(day=date.fromisoformat(
+                    booking["date"]).strftime("%A %d %B")) + "\n\n" + which_car
+            except ValueError:
+                pass
+        answer = which_car
     answer = strip_marker_leftovers(answer)
     answer = strip_phone_readback(answer)
     answer = fix_weekday_mentions(answer)
@@ -7784,7 +7955,24 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # left behind by a reschedule, without touching the customer's real booking).
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", (need or "").strip()):
             sel["date"] = need.strip()
-        res = cancel_booking(digits if looks_like_phone else "", sel)
+        # With no &need this used to delete EVERY future booking for that car, on
+        # a token the code itself says must be treated as public. It now lists
+        # them instead — unless you ask for the sweep with &need=all. A car with
+        # only one booking is unaffected either way.
+        # The sweep needs the master key. `cancel` is in READ_ONLY_ACTIONS, so the
+        # review token reaches this endpoint — and that token has been pasted into
+        # chats and tool output for months; it is what wiped the whole waiting
+        # list on 16 Sep. Listing is harmless, deleting a car's whole future is not.
+        sweep = (need or "").strip().lower() == "all" and is_master
+        if (need or "").strip().lower() == "all" and not is_master:
+            return {"error": "&need=all needs the master token"}
+        # date_strict: when a date was named, never widen to another day. The
+        # double-booking alert builds this link with the OLD date, so a second tap
+        # after that row has gone would otherwise retry without the date and
+        # delete the live booking the alert was telling you to keep.
+        res = cancel_booking(digits if looks_like_phone else "", sel,
+                             allow_multiple=sweep,
+                             date_strict=bool(sel.get("date")))
         return res
     if action == "caltidy":
         # List every event in the next 60 days, delete exact duplicates (same day +
@@ -8152,15 +8340,45 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
     # calendar, so the owner never has to go hunting for an admin page.
     if is_owner and lowered.lstrip("#/ ").startswith("cancel "):
         who = text.strip().lstrip("#/ ")[7:].strip()
+        # "cancel <x> all" clears the car out; "cancel <x> 2026-09-28" takes one
+        # day. Without either, a customer holding two bookings gets listed back
+        # rather than swept: "cancel 0860401806" meant for JJ Carpets' Transit
+        # would otherwise take their Toyota IQ the next day with it, calendar
+        # entries and all, and there is no undo.
+        sweep, only_date = False, ""
+        m = re.search(r"\s+(all|\d{4}-\d{2}-\d{2})$", who, re.IGNORECASE)
+        if m:
+            who = who[:m.start()].strip()
+            if m.group(1).lower() == "all":
+                sweep = True
+            else:
+                only_date = m.group(1)
         digits = "".join(c for c in who if c.isdigit())
         is_phone = len(digits) >= 9 and not any(c.isalpha() for c in who)
-        res = cancel_booking(digits if is_phone else "",
-                             {} if is_phone else {"reg": who})
+        sel = {} if is_phone else {"reg": who}
+        if only_date:
+            sel["date"] = only_date
+        res = cancel_booking(digits if is_phone else "", sel, allow_multiple=sweep,
+                             date_strict=bool(only_date))
         if res.get("cancelled"):
             lines = [f"• {b.get('name','')} {b.get('car','')} {b.get('reg','')} "
                      f"on {b.get('date','')}".strip() for b in res.get("bookings", [])]
             send_whatsapp(sender, "✅ Cancelled and the slot is free again:\n"
                           + "\n".join(lines))
+        elif res.get("ambiguous"):
+            lines = [f"• {b.get('car','')} {b.get('reg','')} on {b.get('date','')}".strip()
+                     for b in res["ambiguous"]]
+            send_whatsapp(sender,
+                          f"'{who}' has {len(res['ambiguous'])} bookings coming up:\n"
+                          + "\n".join(lines)
+                          + f"\n\nSend  cancel {who} {res['ambiguous'][0]['date']}  "
+                            f"for one day, or  cancel {who} all  for both.")
+        elif res.get("error"):
+            send_whatsapp(sender, f"I couldn't do that: {res['error']}.")
+        elif only_date:
+            send_whatsapp(sender, f"Nothing in the diary for '{who}' on {only_date}. "
+                                  f"Send  cancel {who}  on its own to see what they "
+                                  f"do have booked.")
         else:
             send_whatsapp(sender, f"I couldn't find a booking for '{who}'. "
                                   "Try the car reg, or the customer's phone number.")
