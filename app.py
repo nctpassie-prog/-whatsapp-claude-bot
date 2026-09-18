@@ -1465,6 +1465,93 @@ def save_charge(fields: dict) -> None:
         )
     log.info("Charge logged for %s: %s", fields.get("reg", ""), fields.get("amount", ""))
 
+JOB_RE = re.compile(r"<<<JOB\|(.*?)>>>", re.DOTALL)
+
+def process_job(answer: str):
+    """Pull the hidden job-enquiry marker out of the reply."""
+    m = JOB_RE.search(answer)
+    if not m:
+        return answer, None
+    clean = JOB_RE.sub("", answer).strip()
+    fields = {}
+    for part in m.group(1).split("|"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip().lower()] = value.strip()
+    # A marker with no fields is still somebody asking for work — the phone
+    # number alone is worth sending on, so never let an empty one fall through.
+    return clean, (fields or {"_empty": True})
+
+_JOB_FIELDS = ("name", "role", "experience", "area", "note")
+
+def job_enquiry_recent(user: str, days: int = 14) -> bool:
+    """Is this conversation already known to be about somebody wanting work?
+
+    The double-alert guard used to be turn-scoped: it only knew about a JOB
+    marker on the SAME reply, so the next message in the same chat - "grand,
+    I'll email it tonight" - could trip the promised-a-person backstop and put
+    the applicant on the waiting list to be chased."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts FROM job_enquiries WHERE wa_user = ?",
+                               (user,)).fetchone()
+        return bool(row) and (time.time() - (row[0] or 0)) < days * 86400
+    except Exception:
+        return False
+
+def notify_owner_job(number: str, fields: dict) -> None:
+    """Tell the OWNER about somebody looking for work, once, plus once more if
+    they later supply something new.
+
+    Private chat, not the shared staff channel: a CV and someone's work history
+    is the owner's business, the same reasoning that keeps wages and the mechanic
+    report private. Plain message, not alert_owner(): nobody has to act within
+    two hours, so it must never join the waiting list with a Done button, a
+    30-minute repost and an escalation. Any CV they sent is a file living in that
+    conversation and nowhere else, hence the chat link."""
+    have = {k: (fields.get(k) or "").strip() for k in _JOB_FIELDS}
+    known = {}
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT seen FROM job_enquiries WHERE wa_user = ?",
+                               (number,)).fetchone()
+        if row and row[0]:
+            known = json.loads(row[0])
+    except Exception:
+        log.exception("Could not read the job enquiry record for %s", number)
+    merged = {k: (have.get(k) or known.get(k) or "") for k in _JOB_FIELDS}
+    # Only worth another message if they have told us something we did not have.
+    fresh = any(merged[k] and not (known.get(k) or "") for k in _JOB_FIELDS)
+    first = not known
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO job_enquiries (wa_user, ts, seen) VALUES (?, ?, ?)"
+                " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
+                " seen = excluded.seen",
+                (number, time.time(), json.dumps(merged)))
+    except Exception:
+        log.exception("Could not record the job enquiry for %s", number)
+    if not (first or fresh):
+        log.info("Job enquiry from %s repeated with nothing new - not telling again",
+                 number)
+        return
+    order = (("Name", "name"), ("Looking for", "role"),
+             ("Experience", "experience"), ("Area", "area"), ("Note", "note"))
+    lines = [f"{label}: {merged[key]}" for label, key in order if merged[key]]
+    text = ("\U0001F527 SOMEONE LOOKING FOR WORK\n"
+            + ("\n".join(lines) + "\n" if lines else "")
+            + f"Phone: +{number}\n"
+            f"\U0001F4AC Message them: https://wa.me/{number}\n"
+            f"\U0001F4C4 Their chat (any CV they sent is in here): "
+            f"{PUBLIC_URL}/chats?token={review_link_token()}&user={number}")
+    if (get_setting("owner_private_chat") or "").strip():
+        send_telegram_private(text)
+    else:
+        # Never lose an applicant just because the private chat was never linked.
+        log.warning("Owner private chat not linked - job enquiry to the shared channel")
+        send_telegram(text)
+
 FEEDBACK_RE = re.compile(r"<<<FEEDBACK\|(.*?)>>>", re.DOTALL)
 
 def process_feedback(answer: str):
@@ -1545,6 +1632,11 @@ def db() -> sqlite3.Connection:
         pass  # column already exists
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
+    # Somebody asking about work, not about their car. Remembered so the owner is
+    # told once rather than on every turn, and so the rest of the conversation
+    # cannot raise a chased "needs you to follow up" alert.
+    conn.execute("CREATE TABLE IF NOT EXISTS job_enquiries ("
+                 " wa_user TEXT PRIMARY KEY, ts REAL, seen TEXT DEFAULT '')")
     # Gentle follow-up to customers who went quiet after our last reply.
     conn.execute("CREATE TABLE IF NOT EXISTS followups ("
                  " wa_user TEXT PRIMARY KEY, inbound_ts REAL)")
@@ -3258,12 +3350,14 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
         )
 
 ALL_MARKERS_RE = re.compile(
-    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE)\|.*?>>>", re.DOTALL)
+    r"<<<(?:BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE|JOB)\|.*?>>>",
+    re.DOTALL)
 # The same markers but WITHOUT a closing '>>>' — i.e. the reply ran out of tokens
 # part-way through writing one. Anchored to the end so it can only ever match a
 # genuine tail fragment, never a complete marker earlier in the text.
 TRUNCATED_MARKER_RE = re.compile(
-    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE)\|(?:(?!>>>).)*$", re.DOTALL)
+    r"<<<(BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE|JOB)\|(?:(?!>>>).)*$",
+    re.DOTALL)
 
 def visible_text(answer: str) -> str:
     """What the customer would actually see once the hidden markers are removed."""
@@ -4027,6 +4121,12 @@ def _finish_reply(user: str, answer: str) -> str:
             save_charge(charge)
         except Exception:
             log.exception("Failed to save charge")
+    answer, job = process_job(answer)
+    if job and not is_owner:
+        try:
+            notify_owner_job(user, job)
+        except Exception:
+            log.exception("Failed to pass on the job enquiry for %s", user)
     answer, feedback = process_feedback(answer)
     if feedback:
         try:
@@ -4051,7 +4151,15 @@ def _finish_reply(user: str, answer: str) -> str:
                         "may be invented — please read the chat and correct it.")
         except Exception:
             log.exception("Fabricated-inspection alert failed")
-    if handover is None and not is_owner and _CLAIMS_A_PERSON_RE.search(answer or ""):
+    # A job enquiry is already on its way to the owner with the applicant's
+    # details, so the backstop must not ALSO put them on the waiting list to be
+    # chased - that double-alert is exactly what happened on 18 Sep. The check
+    # covers the whole hiring CONVERSATION, not just the turn carrying the
+    # marker, because the slip usually comes a message later ("someone will be
+    # in touch") when the model is no longer emitting one.
+    if (handover is None and job is None and not is_owner
+            and not job_enquiry_recent(user)
+            and _CLAIMS_A_PERSON_RE.search(answer or "")):
         log.warning("Reply to %s promised a person with no HANDOVER marker — alerting anyway", user)
         try:
             notify_owner_handover(user, {"reason": "the bot told this customer that a "
@@ -4090,7 +4198,9 @@ def _finish_reply(user: str, answer: str) -> str:
         log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
                     user, (raw_answer or "")[:300])
         answer = BLANK_REPLY_FALLBACK
-        if not is_owner:
+        # Not for a hiring chat: the owner already has their details, and this
+        # alert is the chased kind with a Done button and a 2-hour escalation.
+        if not is_owner and job is None and not job_enquiry_recent(user):
             try:
                 alert_owner(user, "A customer message needs a human reply",
                             "The bot could not produce an answer and sent a holding message.")
