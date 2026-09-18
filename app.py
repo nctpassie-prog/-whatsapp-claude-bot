@@ -2654,8 +2654,8 @@ ASSIST_WHILE_STAFF = (
 # marker before sending, so the words would be true for the customer and false
 # for the diary.
 _ASSIST_CLAIMS_BOOKED_RE = re.compile(
-    r"(you(?:'|’)?re booked|booked you in|i(?:'|’)?ve booked|"
-    r"you are booked|got you booked|booked in for)", re.IGNORECASE)
+    r"\b(you(?:'|’)?re booked|booked you in|i(?:'|’)?ve booked|"
+    r"you are booked|got you booked|booked in for)\b", re.IGNORECASE)
 
 
 # A message that asks for nothing must not wake anybody up. Five of the 33
@@ -2760,7 +2760,7 @@ WATCH_BOOKING_SYSTEM = (
     "history of existing work. Only a NEW future appointment counts."
 )
 
-def watch_staff_booking(user: str) -> None:
+def watch_staff_booking(user: str, by_customer: bool = False) -> None:
     """Silently log a booking that staff agreed in chat, so nothing is lost.
 
     The bot stays out of staff conversations, but staying silent must not mean the
@@ -2780,6 +2780,9 @@ def watch_staff_booking(user: str) -> None:
                                 for i in range(1, 15)) +
                       ". A bare day name like 'Friday' means the NEXT such day from "
                       "today. If you cannot resolve the exact date, output SKIP.")
+        # Read the colleague's words BEFORE the model call — it takes seconds,
+        # and a "Done 👍" arriving meanwhile would otherwise decide this.
+        said_words = _last_staff_words(user)
         raw = _call_claude(history + [{"role": "user", "content":
                                        "(Internal: apply your rules — the booking "
                                        "line, or SKIP.)"}],
@@ -2815,12 +2818,38 @@ def watch_staff_booking(user: str) -> None:
         if not added:
             return  # a duplicate - the booking is already in the diary
         create_calendar_event(fields)
+        # A colleague typed "booked now for Tuesday next week 12pm" on 18 Sep and
+        # the model read it as Thursday 24 September. The date is deliberately
+        # NOT corrected here: this path saves with override_capacity=True, which
+        # skips the only check that refuses Sundays and closed days, and changing
+        # the date breaks save_booking's dedupe so the next staff echo writes a
+        # second row for the model's original day. Say it on the note that
+        # already goes out and let a person decide — no new alert.
+        two_ways = ""
+        try:
+            # Only when a colleague's own message set this off. The customer can
+            # trigger this watcher too ("yes book me for the 21st"), and
+            # said_words is then whatever the colleague last said — possibly days
+            # ago, about another car. A false "I read the day two ways" line on
+            # a correct booking is exactly the alert noise the owner asked to be
+            # rid of.
+            alt = "" if by_customer else wrong_weekday_date(
+                fields.get("date", ""), said_words)
+            if alt:
+                two_ways = ("\n\n⚠️ I read the day two ways. They wrote "
+                            f"\"{said_words[:70]}\", which sounds like "
+                            f"{date.fromisoformat(alt).strftime('%A %d %B')}. "
+                            "Please check before the reminder goes out.")
+                log.warning("Staff booking for %s logged %s, words suggest %s",
+                            user, fields.get("date"), alt)
+        except Exception:
+            log.exception("Weekday cross-check failed for staff booking %s", user)
         send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
                       f"{fields.get('name','')} — {fields.get('car','')} "
                       f"{fields.get('reg','')}\n{fields.get('need','')}\n"
                       f"Date: {fields.get('date','')} (9-11am)\n"
                       "It's in the diary and calendar; the reminder will go out "
-                      "automatically.")
+                      "automatically." + two_ways)
         log.info("Staff-agreed booking logged for %s on %s", user, fields.get("date"))
     except Exception:
         log.exception("watch_staff_booking failed for %s", user)
@@ -3200,6 +3229,182 @@ def _guess_lang_code(text: str) -> str:
         return "lt"
     return "en"
 
+# ── The weekday the customer actually named ──────────────────────────────────
+# 18 Sep 2026: two customers were put in the diary on the wrong day in one
+# afternoon. Robbie wrote "Tuesday sound good 9am" and was answered "Thursday 24
+# September works great". A colleague typed "you are booked now for Tuesday next
+# week 12pm" and watch_staff_booking logged Thursday 24 September too. Both were
+# a Tuesday turned into a Thursday.
+#
+# The model does this arithmetic wrong even though the availability calendar and
+# the staff prompt both print the weekday beside every date, so the day has to be
+# worked out in code. Note that fix_weekday_mentions below then *hid* the error:
+# given "Tuesday 24 September" it rewrites the WORD to match the date, so the
+# customer was told "Thursday" and the chat looked perfectly normal. The customer
+# said Tuesday — the DATE was the half that was wrong.
+#
+# Only full weekday names and the three unmistakable short forms are accepted.
+# "sat", "sun", "wed" and "mon" are ordinary English words ("I sat waiting") and
+# a false match here costs a booking.
+_WEEKDAY_WORDS = {
+    "monday": 0, "tuesday": 1, "tues": 1, "wednesday": 2, "weds": 2,
+    "thursday": 3, "thurs": 3, "friday": 4, "saturday": 5, "sunday": 6,
+}
+_WEEKDAY_ASK_RE = re.compile(
+    r"\b(next\s+week\s+(?:on\s+)?|next\s+|this\s+|coming\s+)?"
+    r"(" + "|".join(sorted(_WEEKDAY_WORDS, key=len, reverse=True)) + r")\b"
+    r"(?:\s+(\d{1,2})(?:st|nd|rd|th)?\s+(" + "|".join(_MONTHS) + r"))?"
+    r"(\s+next\s+week|\s+week)?\b",
+    re.IGNORECASE)
+
+# "any day except Tuesday" / "Monday to Friday apart from Wednesday" — the cue
+# can sit after the weekday it rules out, so this one is checked whole-message.
+def _recent_customer_words_today(user: str, hours: int = 18) -> str:
+    """The customer's own recent messages FROM THIS CONVERSATION.
+
+    _recent_customer_words has no time bound, and nothing ever prunes the
+    messages table, so for a repeat customer the older rows can come from a chat
+    weeks ago. That is harmless when the words are being used to describe a job
+    — and wrong when they are being used to decide which day someone asked for.
+    "Perfect, see you Friday" from last month must not move this week's booking.
+    """
+    try:
+        cutoff = time.time() - hours * 3600
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
+                " AND COALESCE(ts, 0) >= ? ORDER BY id DESC LIMIT 4",
+                (user, cutoff)).fetchall()
+        return " ".join((r[0] or "") for r in rows)
+    except Exception:
+        return ""
+
+_EXCLUDES_A_DAY_RE = re.compile(
+    r"\b(?:except|apart from|other than|instead of)\b"
+    # Everything below is about when they want the car BACK, not the day they
+    # are bringing it in. "yes, my NCT is Tuesday" on a correct Monday booking
+    # must never become an offer to move the drop-off to Tuesday — a one-word
+    # "yes" would then land the car here on the day of the test.
+    #
+    # Note the word boundaries are INSIDE the alternation. Keeping a single \b
+    # on the outside is what let "collecting it Friday" and "ready Friday"
+    # (without the "by") through.
+    r"|\bready\b|\bfinish\w*|\bcollect\w*"
+    r"|\bpick\w*[^.!?]{0,15}\bup\b"
+    r"|\bback (?:by|on|for)\b"
+    r"|\bneed (?:it|the car|them)[^.!?]{0,12}(?:by|for)\b"
+    r"|\b(?:nct|ncts|doe|test|mot)\s+(?:is|on)\b",
+    re.IGNORECASE)
+# ...whereas these sit just before it: "not available on Friday", "can't do
+# Tuesday", "I'm busy Wednesday". Checked over a short run-up only, so that
+# "I'm not sure — Tuesday suits" still resolves normally.
+_NEGATED_DAY_RE = re.compile(
+    # NB: no "off" — "I'll drop off Tuesday" is the commonest booking phrase
+    # there is, and it must keep resolving.
+    r"\b(not|never|cannot|can'?t|won'?t|unable|avoid|busy|away|closed)\b"
+    r"[^.!?]{0,34}$", re.IGNORECASE)
+
+def weekday_asked_for(text: str, today=None) -> str:
+    """The date meant by a weekday named in words, as YYYY-MM-DD.
+
+    Returns "" when no weekday is named, when two different ones are, or when the
+    phrase is genuinely ambiguous. Saying nothing is always safe — the caller
+    then leaves the model's own date alone, which is the behaviour we had."""
+    if not text:
+        return ""
+    today = today or now_local().date()
+    found = set()
+    # A weekday they RULED OUT is not a weekday they asked for. Don wrote "I am
+    # not available on Friday 25th" (18 Sep); read naively that proposes the one
+    # day he had just excluded. Anything of that shape means we know nothing
+    # useful, and "" simply leaves the model's own date alone.
+    if _EXCLUDES_A_DAY_RE.search(text):
+        return ""
+    for m in _WEEKDAY_ASK_RE.finditer(text):
+        run_up = text[max(0, m.start() - 34):m.start()].lower()
+        if _NEGATED_DAY_RE.search(run_up):
+            return ""
+        lead = re.sub(r"\s+", " ", (m.group(1) or "").strip().lower())
+        wd = _WEEKDAY_WORDS[m.group(2).lower()]
+        trail = re.sub(r"\s+", " ", (m.group(5) or "").strip().lower())
+        if m.group(3) and m.group(4):
+            # "Tuesday 22 September" — they gave the date themselves. Trust it
+            # only if the 22nd really is a Tuesday. If the two halves disagree
+            # the customer is confused and a person should read it, not us.
+            try:
+                d = date(today.year, _MONTHS.index(m.group(4).title()) + 1,
+                         int(m.group(3)))
+                if d < today - timedelta(days=30):
+                    d = date(today.year + 1, d.month, d.day)
+            except ValueError:
+                continue
+            if d.weekday() == wd:
+                found.add(d.isoformat())
+            continue
+        # A bare day name means the next one that has not happened yet — the
+        # same rule the staff prompt already states.
+        soonest = today + timedelta(days=((wd - today.weekday()) % 7) or 7)
+        # "next week" is not ambiguous: the week starting after this Sunday.
+        following = today + timedelta(days=7 - today.weekday() + wd)
+        if trail == "week":
+            # Hiberno-English, and used here: "Thursday week" is a week AFTER
+            # the coming Thursday — NOT the same as "Thursday next week", which
+            # is simply Thursday of the next calendar week.
+            found.add((soonest + timedelta(days=7)).isoformat())
+        elif "next week" in lead or "next week" in trail:
+            found.add(following.isoformat())
+        elif lead == "next":
+            # "next Tuesday" means different things to different people. Where
+            # both readings land on the same day it does not matter; where they
+            # do not, say nothing rather than book the wrong one.
+            if soonest == following:
+                found.add(soonest.isoformat())
+            else:
+                return ""
+        else:
+            found.add(soonest.isoformat())
+    return found.pop() if len(found) == 1 else ""
+
+def wrong_weekday_date(booked_date: str, said: str, today=None) -> str:
+    """The date they really asked for, when the booking falls on another weekday.
+
+    "" means there is nothing wrong. The comparison is on the DAY OF THE WEEK,
+    never the date: a customer saying "Tuesday" about a Tuesday three weeks out
+    is perfectly fine and must not be interrupted."""
+    meant = weekday_asked_for(said, today)
+    if not meant or not booked_date:
+        return ""
+    try:
+        booked = date.fromisoformat(booked_date)
+    except ValueError:
+        return ""
+    if booked.weekday() == date.fromisoformat(meant).weekday():
+        return ""
+    return meant
+
+WRONG_DAY_NOTE = {
+    "en": "One thing \U0001F64f you mentioned {meant_wd} earlier, and I've put you "
+          "down for {booked}. Say the word if you'd rather have {meant} and I'll "
+          "move it.",
+    "ru": "Один момент \U0001F64f вы упоминали {meant_wd}, а запись сделана на "
+          "{booked}. Напишите, если удобнее {meant}, и я перенесу.",
+    "lt": "Vienas dalykas \U0001F64f minėjote {meant_wd}, o užregistruota {booked}. "
+          "Parašykite, jei labiau tinka {meant}, ir perkelsiu.",
+    "ro": "Un singur lucru \U0001F64f ați menționat {meant_wd}, iar programarea "
+          "este pentru {booked}. Spuneți-mi dacă preferați {meant} și o mut.",
+}
+
+def _last_staff_words(user: str) -> str:
+    """The colleague's own last message in this chat — what they actually agreed."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'staff'"
+                " ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        return (row[0] or "") if row else ""
+    except Exception:
+        return ""
+
 def fix_weekday_mentions(text: str) -> str:
     if not text:
         return text
@@ -3466,11 +3671,62 @@ def _finish_reply(user: str, answer: str) -> str:
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
             save_message(user, "assistant", answer)
             return answer
+        # The model gets weekday arithmetic wrong. Robbie wrote "Tuesday sound
+        # good 9am" on Friday 18 Sep, was booked for Thursday 24 September, and
+        # was TOLD Thursday — fix_weekday_mentions relabels the weekday to match
+        # whatever date it is given, so the chat reads perfectly either way.
+        #
+        # The window is four messages, not one: the marker is only ever emitted
+        # on the customer's confirming turn, so by then their own word for the
+        # day ("Tuesday") is two or three messages back and the last message is
+        # just "yes".
+        #
+        # Deliberately a note, not a refusal. Returning here would throw the
+        # whole booking away — no row, no slot held, nobody told — on a signal as
+        # weak as a weekday appearing somewhere in the last four messages. The
+        # booking is saved on the model's date and one sentence asks about the
+        # other day, so nothing is lost whichever way it goes.
+        wrong_day_note = ""
+        if not is_owner and not already_booked:
+            try:
+                alt = wrong_weekday_date(booking.get("date", ""),
+                                         _recent_customer_words_today(user))
+                # Only ever name a day we could actually give them. If the day
+                # they said is full, closed or a Sunday, the model moved them off
+                # it for a reason, and offering it back is exactly the
+                # offer-then-retract the owner complains about most.
+                # day_is_full is bool(day_full_reason(...)) on this bot, so the
+                # hard-job quota is already covered by it.
+                if alt and (before_open_date(alt) or day_is_full(
+                        alt, booking.get("need", ""))):
+                    log.info("Not offering %s to %s — we cannot take that day", alt, user)
+                    alt = ""
+                if alt:
+                    log.warning("Booked %s for %s but their own words suggest %s",
+                                booking.get("date"), user, alt)
+                    wrong_day_note = "\n\n" + WRONG_DAY_NOTE.get(
+                        reminder_lang_code(booking.get("lang", "")),
+                        WRONG_DAY_NOTE["en"]).format(
+                            meant_wd=date.fromisoformat(alt).strftime("%A"),
+                            meant=date.fromisoformat(alt).strftime("%A %d %B"),
+                            booked=date.fromisoformat(
+                                booking.get("date", "")).strftime("%A %d %B"))
+            except Exception:
+                log.exception("Weekday cross-check failed for %s", user)
         is_new = True
         try:
             is_new = save_booking(booking)
         except Exception:
             log.exception("Failed to save booking")
+        # Only ever added to a reply that already says something. A marker-only
+        # answer arrives here as "" (process_booking strips the marker), and a
+        # reply that is one parenthesised block is the model thinking out loud.
+        # Appending to either would smuggle it past the two nets further down —
+        # the blank-reply fallback and its "needs a human reply" alert.
+        _visible = (answer or "").strip()
+        if wrong_day_note and _visible and not (
+                _visible.startswith("(") and _visible.endswith(")")):
+            answer = answer + wrong_day_note
         # A repeat of a booking we already hold must not alert, email or make a
         # second calendar entry — that is what filled the diary with doubles.
         if is_new:
@@ -7965,7 +8221,7 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         # The customer may be the one sealing a staff-offered booking ("yes book me
         # for the 21st") — watch for that here too, not just on the staff side.
         if BOOKINGISH_RE.search(text):
-            threading.Thread(target=watch_staff_booking, args=(sender,),
+            threading.Thread(target=watch_staff_booking, args=(sender, True),
                              daemon=True).start()
         return
     if not is_owner:  # remember the customer (alerting about new ones is off by default)
