@@ -845,7 +845,7 @@ def send_invoice_request(user: str, fields: dict) -> None:
         f"Send to:     {fields.get('email', '(not given)')}\n"
         f"Job/visit:   {fields.get('job', '(not given)')}\n"
         f"Customer phone: +{user}\n\n"
-        f"Conversation: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}&user={user}\n"
+        f"Conversation: {PUBLIC_URL}/chats?token={review_link_token()}&user={user}\n"
     )
     wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
     delivered = False
@@ -1083,6 +1083,13 @@ def add_to_waitlist(fields: dict) -> None:
     wanted = (fields.get("wanted") or "").strip()
     if not (phone and booked and wanted) or wanted >= booked:
         return
+    # Cleaned and capped before they are stored, because offer_freed_slot puts
+    # car and name straight into a message to a customer. Belt and braces behind
+    # the master-key gate on waitlistadd: a future allowlist slip must not turn
+    # this back into a way to send arbitrary text.
+    for k, cap in (("car", 40), ("name", 30), ("need", 60)):
+        v = " ".join(str(fields.get(k, "") or "").split())[:cap]
+        fields[k] = clean_car(v) if k == "car" else v
     with closing(db()) as conn, conn:
         row = conn.execute(
             "SELECT id FROM waitlist WHERE phone LIKE ? AND status IN ('waiting','offered')",
@@ -1154,6 +1161,17 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
                    f"up on {nice}{real_booking}! Would you like me to {action_bit}? "
                    "Just reply YES and I'll sort it — drop-off between 9 and 11am "
                    "as usual 👍")
+            # Only ever offer a slot to somebody the bot already knows. A row
+            # typed straight into the waiting list must not become a way to text
+            # a stranger from the business number.
+            with closing(db()) as conn:
+                known = conn.execute(
+                    "SELECT 1 FROM messages WHERE wa_user = ? LIMIT 1", (digits,)).fetchone()
+            if not known:
+                log.warning("Waitlist offer skipped: %s has never messaged us", digits)
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE waitlist SET status='done' WHERE id=?", (wid,))
+                continue
             send_whatsapp(digits, msg)
             save_message(digits, "assistant", msg)
             with closing(db()) as conn, conn:
@@ -2601,7 +2619,7 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
     # full history. Web link carries the READ-ONLY key — alerts go to several phones,
     # and the master key must never ride along in a message anyone can forward.
     parts.append(f"\n💬 Reply in WhatsApp: https://wa.me/{user}")
-    parts.append(f"📜 Full history: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+    parts.append(f"📜 Full history: {PUBLIC_URL}/chats?token={review_link_token()}"
                  f"&user={user}")
     body = "\n".join(parts)
     alert_targets = list(dict.fromkeys(
@@ -3888,7 +3906,7 @@ def _finish_reply(user: str, answer: str) -> str:
                         f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
                         f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
                         "If they moved, cancel the one they are not coming to:\n"
-                        f"{PUBLIC_URL}/admin?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+                        f"{PUBLIC_URL}/admin?token={review_link_token()}"
                         f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
                         f"&need={other[1]}")
             except Exception:
@@ -4716,7 +4734,7 @@ def send_due_reminders() -> None:
                     f"Tomorrow {tomorrow} (id {bid}) AND {later[1]} (id {later[0]}).\n"
                     "Almost certainly a move where the old day was never cancelled. "
                     f"If so, cancel the old one:\n"
-                    f"{PUBLIC_URL}/admin?token={REVIEW_TOKEN or VERIFY_TOKEN}"
+                    f"{PUBLIC_URL}/admin?token={review_link_token()}"
                     f"&action=cancel&date={clean_reg(reg) or phone}&need={tomorrow}")
             except Exception:
                 log.exception("Could not report the double booking for %s", phone)
@@ -6123,18 +6141,51 @@ def outstanding_invoices(min_hours: float = 0.0):
         log.exception("Could not read outstanding invoice requests")
         return []
 
+def _invoice_match(key_fragment: str):
+    """Turn a phone or reg into a LIKE pattern that can only match one customer.
+
+    The key is digits + "|" + reg, and this used to match '%' + fragment + '%'
+    with no minimum length, so "3" marked nearly every outstanding invoice as
+    sent in one request - and done_ts is never cleared anywhere, so there was no
+    undo. A phone now matches on its last nine digits, a reg on the reg half."""
+    frag = (key_fragment or "").upper().replace(" ", "").replace("+", "")
+    digits = "".join(c for c in frag if c.isdigit())
+    if len(digits) >= 7 and digits == frag:      # a phone number
+        return "%" + digits[-9:] + "|%"
+    if len(frag) >= 4 and any(c.isalpha() for c in frag):   # a reg
+        return "%|" + frag
+    return ""
+
 def mark_invoice_done(key_fragment: str) -> int:
-    """Mark matching invoice request(s) as sent. Fragment = phone or reg."""
-    frag = (key_fragment or "").upper().replace(" ", "")
-    if not frag:
+    """Mark a customer's invoice request(s) as sent. Fragment = phone or reg."""
+    like = _invoice_match(key_fragment)
+    if not like:
         return 0
     try:
         with closing(db()) as conn, conn:
             cur = conn.execute("UPDATE invoice_requests SET done_ts = ? WHERE done_ts IS NULL"
-                               " AND UPPER(key) LIKE ?", (time.time(), "%" + frag + "%"))
+                               " AND UPPER(key) LIKE ?", (time.time(), like))
             return cur.rowcount
     except Exception:
         log.exception("Could not mark invoice done")
+        return 0
+
+def mark_invoice_undone(key_fragment: str) -> int:
+    """Put an invoice request back on the outstanding list.
+
+    Marking one done is irreversible otherwise: nothing else in this file ever
+    clears done_ts, so a wrong click meant the accountant was never chased again
+    and nobody would notice. Same shape as openday beside closeday."""
+    like = _invoice_match(key_fragment)
+    if not like:
+        return 0
+    try:
+        with closing(db()) as conn, conn:
+            cur = conn.execute("UPDATE invoice_requests SET done_ts = NULL"
+                               " WHERE done_ts IS NOT NULL AND UPPER(key) LIKE ?", (like,))
+            return cur.rowcount
+    except Exception:
+        log.exception("Could not reopen invoice")
         return 0
 
 def chase_outstanding_invoices() -> None:
@@ -6153,7 +6204,7 @@ def chase_outstanding_invoices() -> None:
         note = ("🧾 Invoice still not sent" + chr(10)
                 + f"Reg {reg or '?'} - customer +{phone}" + chr(10)
                 + f"Asked {n} time(s), first {days} day(s) ago." + chr(10)
-                + f"Details: {PUBLIC_URL}/chats?token={REVIEW_TOKEN or VERIFY_TOKEN}&user={phone}")
+                + f"Details: {PUBLIC_URL}/chats?token={review_link_token()}&user={phone}")
         try:
             if wa:
                 send_whatsapp(wa, note)
@@ -6313,7 +6364,12 @@ def health() -> dict:
     return {"status": "ok",
             "review_key_loaded": bool(REVIEW_TOKEN),
             "review_key_len": len(REVIEW_TOKEN),
-            "master_key_len": len(VERIFY_TOKEN),
+            # A boolean, not the length: GET / is unauthenticated, and the length
+            # of the master key is a free hint nobody outside needs. Whether
+            # webhook signatures are verified is reported by ?action=status, and
+            # only to the master key - telling the open internet that inbound
+            # webhooks are unchecked is an invitation.
+            "master_key_set": bool(VERIFY_TOKEN),
             "model": ANTHROPIC_MODEL,
             "gemini": {"mode": gemini_mode(), "key": bool(GEMINI_API_KEY),
                        "model": GEMINI_MODEL},
@@ -6399,7 +6455,7 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
                      # owner's OWN calendar — it cannot delete or expose anything.
                      "calbackfill", "caltest", "dedupe", "caltidy", "brieftest", "tgchat",
                      "where", "isblocked", "sendwaiting", "remindercheck", "mktemplate",
-                     "templates", "closeday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "editbooking", "voicelog", "askbot", "invoicedone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
+                     "templates", "closeday", "openday", "clearwaiting", "day", "addbooking", "cancel", "delbooking", "editbooking", "voicelog", "askbot", "invoicedone", "invoiceundone", "invoicesout", "fixdates", "gemini", "invoicemail", "invoicewhatsapp", "invoicetest", "invoicereq", "mkrecoverytemplate", "recoverynumber", "recoveryreq", "regcheck", "remindertest", "sendmsg", "mkinvoicetemplate", "retelltoken", "mkreviewtemplate", "reviewtest", "mknextdaytemplate", "nextdaytest", "followupstats", "revenue", "car", "staffreport", "mechanicreport", "tgpending", "setprivatechat", "tgcleanup",
                      # Managing alert recipients is no more exposing than the review key
                      # already is — it can read every conversation regardless.
                      "tgadd", "tgremove", "partstest", "partsgroup", "tgprivate",
@@ -6413,21 +6469,62 @@ READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", 
 # waiting list in one request - ten customers waiting on a person, plus the
 # twenty already handled. The key lives in plain text in CLAUDE.md and has been
 # pasted into chats, browser URLs and tool output for months, so it has to be
-# treated as public. Anything that DELETES data, SENDS a message as the
-# business, or CHANGES where alerts, invoices or calls are routed now needs the
+# treated as public. Anything that DELETES data in bulk, SENDS a message as the
+# business, or CHANGES where alerts, invoices or calls are routed needs the
 # master VERIFY_TOKEN, which exists only in Railway. Single-row diary edits
 # (addbooking, editbooking, cancel, delbooking, closeday) deliberately stay
 # reachable: they are the owner's daily tools, each one is scoped to one row
 # and logged, and none of them can empty a table.
+#
+# 18 Sep 2026: that line was right but was not applied evenly. Eight more
+# actions were on the wrong side of it, found by auditing what each one's code
+# actually does rather than what its name suggests - four of them are called
+# "...test" and every one of those four really sends. If you add an action here,
+# ask the same question: can this delete more than one row, can it put a message
+# in front of a customer, can it move where money or alerts go?
 NEEDS_MASTER_TOKEN = {
-    # deletes or empties
+    # deletes or empties, in bulk
     "clearwaiting",
+    # dedupe walks the WHOLE bookings table and DELETEs every row it judges a
+    # duplicate, plus the matching calendar events — one request, no confirmation,
+    # no undo. Exactly the shape of the clearwaiting call that emptied the
+    # headlights waiting list on 16 Sep. caltidy does the same to the calendar,
+    # sixty days at a time.
+    "dedupe", "caltidy",
+    # calbackfill and caltest WRITE to the shared calendar the staff work from,
+    # and calbackfill is not idempotent - it loops every future booking and posts
+    # a fresh event for each one, so two calls double the diary on screen. The
+    # only tidy-up, caltidy, is on this side of the fence now, so the review key
+    # could make a mess it has no way to clear.
+    "calbackfill", "caltest",
     # sends as the business, to customers or the accountant
     "sendmsg", "sendwaiting", "invoicereq", "recoveryreq",
+    # waitlistadd is a SEND in disguise, and the worst kind: it stores &car= and
+    # &name= for a number of the caller's choosing, and offer_freed_slot then
+    # puts them inside "Good news, {name} - a slot has just freed up ... book
+    # your {car} in" and sends it as free-form text, not a template. Cancel any
+    # booking (cancel is still on the review key, deliberately) and it goes out.
+    # That is attacker-chosen words in front of a real customer - more than
+    # sendmsg or reviewtest can do.
+    "waitlistadd",
     # reviewtest sends the real review template to whatever number is in the
     # query string - it sends every bit as much as sendmsg does, and the first
     # lockdown missed it because its name reads like a dry run.
     "reviewtest",
+    # ...and so do these four, for the same reason. A name ending in "test" is
+    # not a dry run: remindertest and nextdaytest send the real Meta template to
+    # whatever number is in the query string, invoicetest pushes a demo invoice
+    # through the real pipeline to the real invoice inbox and WhatsApp number,
+    # and partstest posts &need=<any text> straight into the parts group.
+    "remindertest", "nextdaytest", "invoicetest", "partstest",
+    # regcheck force-runs the evening reg/make-model sweep, which WhatsApps every
+    # customer whose booking looks incomplete - a mass send with one request.
+    "regcheck",
+    # botresume clears the human-takeover silence, calls the model and SENDS the
+    # reply to a real customer. It was left open because "sendmsg is already
+    # allowed above" - but sendmsg moved to the master key in the very commit
+    # that wrote that sentence, so the reason has been stale ever since.
+    "botresume",
     # fixdates rewrites the date on many bookings at once, with no capacity,
     # Saturday or closed-day check, and deletes a row outright when the new date
     # collides with an existing one. It belongs with clearwaiting, not with the
@@ -6446,6 +6543,17 @@ NEEDS_MASTER_TOKEN = {
 READ_ONLY_ACTIONS -= NEEDS_MASTER_TOKEN
 # Repairing a wiped waiting list must not itself need the master key.
 READ_ONLY_ACTIONS.add("restorealert")
+
+
+def review_link_token() -> str:
+    """The key to put in a link we send out — never the master one.
+
+    Eleven places used to build owner links as "REVIEW_TOKEN or VERIFY_TOKEN".
+    Both are set in production, but that fallback meant the day REVIEW_TOKEN went
+    missing,
+    every Telegram alert and WhatsApp message quietly carries the MASTER key into
+    a chat. A broken link is the better failure."""
+    return REVIEW_TOKEN
 
 
 def can_review(token: str) -> bool:
@@ -6557,10 +6665,12 @@ def contacts_vcf(token: str = Query("")):
 def google_connect(token: str = Query(""), what: str = Query("contacts")):
     """Owner visits this once to authorise Google Contacts. Redirects to Google's
     consent screen; Google then calls /google/callback with the code."""
-    # The review key is enough to START this: all it does is redirect to Google's own
-    # consent screen. Nothing can actually be granted without signing into the Google
-    # account and pressing Allow, which only the owner can do.
-    if not can_review(token):
+    # Master key only. The old reasoning was that starting the flow is harmless
+    # because only the owner can press Allow — but /google/callback never checks
+    # WHICH Google account consented, it simply stores the refresh token it is
+    # handed. Anyone with the public review key could therefore run the flow
+    # against their OWN Google account and become the bot's calendar and contacts.
+    if not (VERIFY_TOKEN and token == VERIFY_TOKEN):
         return Response(status_code=403)
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
         return Response("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Railway first.",
@@ -6585,7 +6695,8 @@ def google_callback(code: str = Query(""), state: str = Query(""), error: str = 
     long-lived refresh token and store it, so contact-saving works from then on."""
     expected, _, kind = state.partition("|")
     kind = kind or "contacts"
-    if not can_review(expected):  # must match the key that started the flow
+    # Must be the master key that started the flow — see /google/connect.
+    if not (VERIFY_TOKEN and expected == VERIFY_TOKEN):
         return Response("Bad state — please start again from /google/connect.", status_code=403)
     if error:
         return Response(f"Google returned: {error}", status_code=400)
@@ -6737,8 +6848,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                                "morning briefing (8am)", "weekly report (Mon 9am)"],
         }
     if action == "closeday":
-        iso = parse_day(date) or date.strip()
+        # Validated, because it used to store whatever it could not parse: a
+        # comma in &date= closed several days in one request, and a typo wrote a
+        # nonsense "closed day" that silently refused bookings forever.
+        iso = parse_day(date)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso or ""):
+            return {"error": "need one real date, e.g. ?action=closeday&date=2026-12-24"}
         days = closed_dates(); days.add(iso)
+        set_setting("closed_dates", ",".join(sorted(d for d in days if d)))
+        return {"closed": sorted(closed_dates())}
+    if action == "openday":
+        # closeday had no counterpart at all, so a day closed by mistake could
+        # only be reopened from Railway. Same key, same scope, one day at a time.
+        iso = parse_day(date)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso or ""):
+            return {"error": "need one real date, e.g. ?action=openday&date=2026-12-24"}
+        days = closed_dates(); days.discard(iso)
         set_setting("closed_dates", ",".join(sorted(d for d in days if d)))
         return {"closed": sorted(closed_dates())}
     if action == "templates":
@@ -6885,7 +7010,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         private = (get_setting("owner_private_chat") or "").strip()
         if not private:
             return {"ok": False, "reason": "owner private chat not linked yet"}
-        user = "".join(ch for ch in (phone or OWNER_WHATSAPP or "353858182839") if ch.isdigit())
+        # &phone= used to choose the row this writes to. The alerts table holds ONE
+        # row per customer, so a sample alert aimed at a real number overwrote
+        # that customer's open alert - losing their place in the waiting list and
+        # the timestamps the 30-minute and 2-hour chases run off. The sample is
+        # always the owner now.
+        user = "".join(ch for ch in (OWNER_WHATSAPP or "353858182839") if ch.isdigit())
         ts = time.time()
         body = ("\U0001F514 TEST — A customer needs you to follow up\n"
                 f"From: Sample Customer (12D12345) +{user}\n"
@@ -7303,6 +7433,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "days_open": round((time.time() - first_ts) / 86400, 1),
                         "reminded": bool(chased)})
         return {"outstanding": out, "count": len(out)}
+    if action == "invoiceundone":
+        n = mark_invoice_undone(phone or need or "")
+        return {"reopened": n} if n else {
+            "reopened": 0, "error": "need a full phone number or a reg"}
     if action == "invoicedone":
         # Mark an invoice as actually sent so it stops being chased and drops off
         # the morning briefing. ?phone=<customer number> or ?reg=<reg>
@@ -7501,7 +7635,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                "template": REMINDER_TEMPLATE, "enabled": REMINDER_ENABLED,
                "customers": [{"name": n, "reg": r, "reminded": bool(x)}
                              for n, p, c, r, x in due]}
-        if due and date == "send":  # ?action=remindercheck&date=send to actually try
+        # The LIST above is harmless and the owner uses it. The send below is not:
+        # it texts due[0] - a real customer booked for tomorrow - with the live
+        # template, never sets `reminded` (so the 7am job sends them a second
+        # copy), and uses REMINDER_LANG rather than theirs. remindertest was
+        # locked for less: its recipient defaults to the owner's own mobile with
+        # sample data. A name reading "check" is no safer than one reading "test".
+        if due and date == "send" and not is_master:
+            out["send_refused"] = ("the live send needs the master token - this "
+                                   "would text a real customer booked tomorrow")
+        if due and date == "send" and is_master:
             n, p, c, r, _ = due[0]
             try:
                 url, tok = send_endpoint()
@@ -7909,8 +8052,8 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # future date so ANY freed slot from their wanted day onward is offered.
         digits = "".join(ch for ch in (phone or "") if ch.isdigit())
         wanted = (date or "").strip()
-        if not (digits and wanted):
-            return {"error": "need phone and date=<wanted earlier day>"}
+        if len(digits) < 7 or not wanted:
+            return {"error": "need a full phone number and date=<wanted earlier day>"}
         with closing(db()) as conn:
             b = conn.execute(
                 "SELECT date FROM bookings WHERE REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','')"
@@ -7924,9 +8067,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
     if action == "waitlistremove":
         # Take a customer off the cancellation list (?phone=): sorted elsewhere,
         # passed their NCT, or just doesn't want the offers.
+        # LIKE '%' + digits matches by suffix, so "&phone=7" used to match every
+        # number ending in 7 and close them all in one UPDATE. Same guard as
+        # cancel_booking uses.
         digits = "".join(ch for ch in (phone or "") if ch.isdigit())
-        if not digits:
-            return {"error": "need phone"}
+        if len(digits) < 7:
+            return {"error": "need a full phone number"}
         with closing(db()) as conn, conn:
             n = conn.execute(
                 "UPDATE waitlist SET status='done' WHERE phone LIKE ? "
@@ -8208,6 +8354,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         "total_customers": total_customers,
         "all_booking_dates": [{"date": dt, "count": c} for dt, c in by_date],
         "next_14_days": days,
+        # valid_signature() returns True for everything when APP_SECRET is unset,
+        # so there was no way to tell whether inbound webhooks are checked at all.
+        # Master key only - it is a statement about the lock, not about the diary.
+        **({"webhook_signature_checked": bool(APP_SECRET)} if is_master else {}),
     }
 
 @app.get("/webhook")
@@ -9174,7 +9324,7 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
                       f"WhatsApp refused our last message: {detail}\n"
                       f"They never saw it \u2014 please ring them.\n"
                       f"\U0001f4dc {PUBLIC_URL}/chats?token="
-                      f"{REVIEW_TOKEN or VERIFY_TOKEN}&user={digits}")
+                      f"{review_link_token()}&user={digits}")
     except Exception:
         log.exception("Could not report the failed delivery for %s", digits)
 

@@ -23,7 +23,16 @@ Hours Mon–Fri 9–18, Sat 9–14 (Saturday = general services only), Sun close
   086 and 085 forward-on-no-answer to it.
 - Read-only admin key: `REVIEW_TOKEN=rev_1bef746188a3d79dab22929581ca0fa14ddb`
   (`/admin?token=...&action=status|day|customers|car|waiting|gaps|revenue|
-  mechanicreport|sendmsg|botresume|...`, `/chats?token=...`).
+  mechanicreport|cancel|...`, `/chats?token=...`).
+  The review key is READ-MOSTLY: it can look at anything and edit ONE diary
+  row at a time. It CANNOT bulk-delete (`dedupe`, `caltidy`, `clearwaiting`,
+  `fixdates`), write to the shared calendar (`calbackfill`, `caltest`), send
+  anything as the business (`sendmsg`, `botresume`, `reviewtest`,
+  `remindertest`, `nextdaytest`, `invoicetest`, `partstest`, `regcheck`, and
+  the send half of `remindercheck&date=send`), connect a Google account, or
+  change where alerts, invoices or calls are routed. Those need the master key
+  from Railway → Variables → VERIFY_TOKEN.
+  `?action=closeday&date=YYYY-MM-DD` shuts a day; `openday` reopens it.
 - Gemini Flash answers all customers (Haiku fallback); Deepgram voice notes ON.
 - Bookings → email onlinebookingnctpass@gmail.com + Google Calendar + Google
   Contacts auto-save (nctpass.ie@gmail.com). Alerts → Telegram bot "Nctpass alert"
@@ -46,7 +55,8 @@ Hours Mon–Fri 9–18, Sat 9–14 (Saturday = general services only), Sun close
 - Wages/mechanic data NEVER to shared Telegram or WhatsApp — owner's private
   Telegram only. Weekly reports (gap report too) → private Telegram only.
 - Humans always win: staff app reply silences the bot 24h; stalled staff chats
-  get swept after 1h; `?action=botresume&date=<num>` resumes the bot NOW.
+  get swept after 1h; `?action=botresume&date=<num>` resumes the bot NOW
+  (master token only — it sends a real message to the customer).
 - Alert chases: customer chased after ALERT_CHASE_HOURS=2 if nobody replies.
 - STAFF "DONE" BUTTON (2026-09-02; owner: "we need only done" — NO separate
   claim/"I've got this" step): every needs-a-person Telegram alert carries one
