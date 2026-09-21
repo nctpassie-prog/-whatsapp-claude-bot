@@ -3513,56 +3513,318 @@ _WEEKDAY_WORDS = {
 _WEEKDAY_ASK_RE = re.compile(
     r"\b(next\s+week\s+(?:on\s+)?|next\s+|this\s+|coming\s+)?"
     r"(" + "|".join(sorted(_WEEKDAY_WORDS, key=len, reverse=True)) + r")\b"
-    r"(?:\s+(\d{1,2})(?:st|nd|rd|th)?\s+(" + "|".join(_MONTHS) + r"))?"
+    # "of" is optional but common - "Monday 21st OF September". Without it that
+    # phrase fell through to the bare-weekday branch and Niamh Convery's real
+    # request went silent.
+    r"(?:\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + "|".join(_MONTHS) + r"))?"
     r"(\s+next\s+week|\s+week)?\b",
     re.IGNORECASE)
 
-# "any day except Tuesday" / "Monday to Friday apart from Wednesday" — the cue
-# can sit after the weekday it rules out, so this one is checked whole-message.
-def _recent_customer_words_today(user: str, hours: int = 18) -> str:
-    """The customer's own recent messages FROM THIS CONVERSATION.
+# STOP TEST ONLY - never used to work out a date. _WEEKDAY_WORDS holds only the
+# long forms on purpose, because a false match there costs a booking. But the
+# walk uses a day word to decide "they said something about which day, so do not
+# reach further back", and for THAT a false match is cheap: it only makes the
+# check stay silent this turn. Without the short forms "wed 23rd is fine" did not
+# count as naming a day and an older "can I come Tuesday?" won.
+_ANY_DAY_WORD_RE = re.compile(
+    r"\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)\b"
+    r"|\b(?:" + "|".join(_WEEKDAY_WORDS) + r")\b", re.IGNORECASE)
 
-    _recent_customer_words has no time bound, and nothing ever prunes the
-    messages table, so for a repeat customer the older rows can come from a chat
-    weeks ago. That is harmless when the words are being used to describe a job
-    — and wrong when they are being used to decide which day someone asked for.
-    "Perfect, see you Friday" from last month must not move this week's booking.
-    """
+def _recent_customer_messages(user: str, limit: int = 8, hours: int = 18) -> list:
+    """The customer's own recent messages FROM THIS CONVERSATION, newest first.
+
+    A LIST, not one joined string, because the two are not the same question.
+    Sean Donovan (21 Sep) opened with "have the car booked in for Wednesday.
+    would it be possible to drop the car off Tuesday evening...", and later wrote
+    "I'll drop it off after 9am Wednesday". Joined, that window holds Wednesday
+    AND Tuesday, reads as ambiguous, and the check says nothing - he went into
+    the diary for Friday. Read one at a time, his latest clear statement wins.
+
+    Eight rather than four because the marker only appears on the confirming
+    turn, and the bot may ask two or three questions in between. Still bounded to
+    18 hours: nothing prunes the messages table, so for a repeat customer older
+    rows belong to a different conversation entirely."""
     try:
         cutoff = time.time() - hours * 3600
         with closing(db()) as conn:
             rows = conn.execute(
                 "SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
-                " AND COALESCE(ts, 0) >= ? ORDER BY id DESC LIMIT 4",
-                (user, cutoff)).fetchall()
-        return " ".join((r[0] or "") for r in rows)
+                " AND COALESCE(ts, 0) >= ? ORDER BY id DESC LIMIT ?",
+                (user, cutoff, limit)).fetchall()
+        return [(r[0] or "") for r in rows]
     except Exception:
-        return ""
+        return []
 
+def _holds_a_slot_on(user: str, date_: str) -> bool:
+    """True if this customer already has a booking on that date.
+
+    Keeps the wrong-day note quiet when the weekday in their messages is already
+    explained - it is the car they booked earlier, not a request for this one.
+    Deliberately phone-only and date-only: the question is "does this person hold
+    any slot that day", not "is this the same booking again"."""
+    phone = "".join(ch for ch in str(user or "") if ch.isdigit())
+    if not date_ or not phone:
+        return False
+    try:
+        with closing(db()) as conn:
+            return bool(conn.execute(
+                "SELECT 1 FROM bookings WHERE date = ?"
+                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+                " LIMIT 1", (date_, "%" + phone[-9:])).fetchone())
+    except Exception:
+        log.exception("holds-a-slot check failed for %s", user)
+        return False
+
+def weekday_from_recent(msgs: list, today=None) -> str:
+    """The day they last named clearly, walking their messages newest first.
+
+    Stops at the FIRST message that says anything about WHICH DAY. If that
+    message is clear, it wins. If it is ambiguous ("Monday or Tuesday, whichever"
+    or "tomorrow or Thursday"), negated ("not available Friday"), or a date
+    instead of a weekday, this returns "" rather than reaching further back -
+    going past a day they have just muddied is how a stale weekday gets used.
+
+    Two kinds of message are stepped OVER rather than stopped on, because neither
+    is them saying which day they want the car in:
+      * pure collection talk - "will it be ready by Friday?" is about getting the
+        car back, and it used to silence the check on the very turn that named
+        the day;
+      * a weekday and a date that CONTRADICT each other - "Wednesday 25
+        September" when the 25th is a Friday. That is the loudest possible sign
+        the bot's arithmetic has gone wrong, and it was being treated as if the
+        customer had said nothing at all."""
+    for m in msgs or []:
+        m = _plain_apostrophes(m or "")
+        found = weekday_asked_for(m, today)
+        if found:
+            return found
+        # They have given up choosing. Nothing older than this counts. Checked
+        # AFTER the day is read, because "Wednesday, any time after 9" names a
+        # day perfectly clearly and was being discarded on the "any time".
+        if _NO_DAY_PREFERENCE_RE.search(m):
+            return ""
+        if _is_only_collection_talk(m):
+            continue    # about getting the car BACK, not which day it comes in
+        if _ANY_DAY_WORD_RE.search(m):
+            if _only_mismatched_pairs(m, today):
+                continue    # "Wednesday 25 September" - evidence, not silence
+            return ""   # they named a day, but not one we can be sure of
+        if _NAMES_A_DATE_RE.search(m):
+            return ""   # they named a date instead - that is their latest word
+    return ""
+
+# "any day except Tuesday" / "Monday to Friday apart from Wednesday" — the cue
+# can sit after the weekday it rules out, so this one is checked whole-message.
 _EXCLUDES_A_DAY_RE = re.compile(
-    r"\b(?:except|apart from|other than|instead of)\b"
-    # Everything below is about when they want the car BACK, not the day they
-    # are bringing it in. "yes, my NCT is Tuesday" on a correct Monday booking
-    # must never become an offer to move the drop-off to Tuesday — a one-word
-    # "yes" would then land the car here on the day of the test.
-    #
-    # Note the word boundaries are INSIDE the alternation. Keeping a single \b
-    # on the outside is what let "collecting it Friday" and "ready Friday"
-    # (without the "by") through.
-    r"|\bready\b|\bfinish\w*|\bcollect\w*"
+    r"\b(?:except|apart from|other than|instead of)\b", re.IGNORECASE)
+
+# ...and these are about when they want the car BACK, not the day they are
+# bringing it in. "yes, my NCT is Tuesday" on a correct Monday booking must never
+# become an offer to move the drop-off to Tuesday - a one-word "yes" would then
+# land the car here on the day of the test.
+#
+# These used to sit inside _EXCLUDES_A_DAY_RE and vetoed the WHOLE message, which
+# was too blunt by half: "Wednesday 9am is perfect. Will it be ready that day?"
+# resolved to nothing and the walk then stopped dead on it. They now kill only
+# the clause they sit in.
+#
+# Note the word boundaries are INSIDE the alternation. Keeping a single \b on the
+# outside is what let "collecting it Friday" and "ready Friday" (without the
+# "by") through.
+_COLLECTION_RE = re.compile(
+    # "ready" needs the collection sense. Bare \bready\b also swallowed
+    # "I'm ready to book in Wednesday", which is the opposite of collection talk.
+    r"\bready\b(?=[^.!?]{0,20}\b(?:by|for|on|at|same|that|this|next|it|then)\b)"
+    r"|\b(?:it|car|them)\s+(?:be\s+)?ready\b"
+    r"|\bfinish\w*|\bcollect\w*"
     r"|\bpick\w*[^.!?]{0,15}\bup\b"
     r"|\bback (?:by|on|for)\b"
+    # "will it be done by Thursday?", "will it be sorted by Friday", "can I get
+    # it back Friday?", "I need it back Monday for work" - all turnaround, all
+    # previously read as a request to come in on that day.
+    r"|\b(?:done|sorted|finished|fixed|serviced)\s+(?:by|for|on)\b"
+    r"|\bget\s+(?:it|the car|them)\s+back\b"
+    r"|\bneed\s+(?:it|the car|them)\s+back\b"
+    # Nicole (+353857607634, 07 Sep) wrote "Before Friday ?" - a deadline, not a
+    # drop-off day. Anchored to a weekday, so "come in before 11am Wednesday"
+    # still resolves normally.
+    r"|\bbefore\s+(?:the\s+)?(?:" + "|".join(_WEEKDAY_WORDS) + r")\b"
     r"|\bneed (?:it|the car|them)[^.!?]{0,12}(?:by|for)\b"
-    r"|\b(?:nct|ncts|doe|test|mot)\s+(?:is|on)\b",
+    r"|\b(?:nct|ncts|doe|test|mot)\s+(?:is|on)\b"
+    # An evening/night drop-off says when the car ARRIVES, not which day the job
+    # is wanted. "will i leave it with you the thursday evening?" was resolving
+    # to that Thursday and being offered against a Friday booking.
+    r"|\b(?:evening|night|eve)\s+before\b"
+    r"|\b(?:" + "|".join(_WEEKDAY_WORDS) + r")\s+(?:evening|night)\b",
     re.IGNORECASE)
+
+# "tomorrow or Thursday", "today or Friday" - they offered two days and only one
+# of them is a weekday WORD, so the ambiguity test (which counts weekday words)
+# saw a single confident day. Apposition - "tomorrow (Thursday)", "tomorrow,
+# Friday" - is deliberately NOT matched: both halves mean the same date there.
+_ALT_DAY_RE = re.compile(
+    r"\b(?:today|tomorrow|tmr|tmrw|2moro)\s+or\b"
+    r"|\bor\s+(?:today|tomorrow|tmr|tmrw|2moro)\b", re.IGNORECASE)
+
+# Where a clause ends, for the purpose of throwing away collection talk. Sentence
+# enders, and the "..., will it ..." hinge Irish customers use without
+# punctuation ("Wednesday grand, will it be ready same day?").
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!?]+"
+    r"|[,;]\s*(?=(?:will|would|can|could|do|does|when|how)\b)"
+    r"|\s+(?=(?:will|would|can|could|do|does|when)\s+(?:it|i|they|you)\b)",
+    re.IGNORECASE)
+
+def _plain_apostrophes(text: str) -> str:
+    """Curly apostrophes flattened, so the refusal guards can see a refusal.
+
+    Sweeping the live chats found "Thursday doesn\u2019t work for me" resolving to
+    a date: every phone keyboard types U+2019, and the patterns all said "'".
+    _NEGATED_DAY_RE has carried can'?t / won'?t since the first version of this
+    check, so it has been missing "I can\u2019t do Wednesday" all along."""
+    return (text or "").replace("\u2019", "'").replace("\u02bc", "'").replace("\u00b4", "'")
+
+def _without_collection_talk(text: str) -> str:
+    """The message with any clause about getting the car BACK removed."""
+    keep = [c for c in _CLAUSE_SPLIT_RE.split(text or "")
+            if c and not _COLLECTION_RE.search(c)]
+    return " ".join(keep).strip()
+
+def _has_negated_day(text: str) -> bool:
+    """True if any day word in the message is preceded by a ruling-out phrase."""
+    for m in _ANY_DAY_WORD_RE.finditer(text or ""):
+        if _NEGATED_DAY_RE.search(text[max(0, m.start() - 34):m.start()].lower()):
+            return True
+    return False
+
+def _is_only_collection_talk(text: str) -> bool:
+    """True when every day this message names sits inside collection talk.
+
+    Such a message is stepped over rather than stopped on: asking when the car
+    will be ready says nothing about which day they want to bring it in, and
+    treating it as if it did is what silenced the check on the confirming turn.
+
+    A message that also rules a day out is NOT stepped over - "not Wednesday, I
+    need it back by Friday" has to stop the walk, or we would reach back and
+    offer the very day they just refused."""
+    if not text or not _ANY_DAY_WORD_RE.search(text):
+        return False
+    if _EXCLUDES_A_DAY_RE.search(text) or _ALT_DAY_RE.search(text):
+        return False
+    if _has_negated_day(text):
+        return False
+    return not _ANY_DAY_WORD_RE.search(_without_collection_talk(text))
+
+def _only_mismatched_pairs(text: str, today=None) -> bool:
+    """True when every day named is a "<Weekday> <num> <Month>" that contradicts itself.
+
+    "Wednesday 25 September", when the 25th is a Friday, is not confusion to be
+    ignored - it is a customer repeating back a slot the bot got wrong, which is
+    the single loudest signal this whole check exists to catch. Sean Donovan's
+    own diary row read "9-11am Wednesday 25 September"."""
+    if not text:
+        return False
+    today = today or now_local().date()
+    if _EXCLUDES_A_DAY_RE.search(text) or _ALT_DAY_RE.search(text):
+        return False
+    if _has_negated_day(text):
+        return False
+    seen = False
+    for m in _WEEKDAY_ASK_RE.finditer(text):
+        if not (m.group(3) and m.group(4)):
+            return False        # a bare day name IS them naming a day
+        try:
+            d = date(today.year, _MONTHS.index(m.group(4).title()) + 1,
+                     int(m.group(3)))
+            if d < today - timedelta(days=30):
+                d = date(today.year + 1, d.month, d.day)
+        except ValueError:
+            return False
+        if d.weekday() == _WEEKDAY_WORDS[m.group(2).lower()]:
+            return False        # the two halves agree - nothing odd here
+        seen = True
+    return seen
+
 # ...whereas these sit just before it: "not available on Friday", "can't do
 # Tuesday", "I'm busy Wednesday". Checked over a short run-up only, so that
 # "I'm not sure — Tuesday suits" still resolves normally.
 _NEGATED_DAY_RE = re.compile(
-    # NB: no "off" — "I'll drop off Tuesday" is the commonest booking phrase
+    # NB: no "off" - "I'll drop off Tuesday" is the commonest booking phrase
     # there is, and it must keep resolving.
-    r"\b(not|never|cannot|can'?t|won'?t|unable|avoid|busy|away|closed)\b"
+    # "last" belongs here too. Salim wrote "i check with your garage last friday
+    # and they said can be fixed" - that is him telling us what happened, and
+    # reading it as a request put Friday in front of his real one.
+    r"\b(not|never|cannot|can'?t|won'?t|unable|avoid|busy|away|closed|last"
+    # "scratch Wednesday", "forget Tuesday" - a refusal that leads.
+    r"|scratch|forget)\b"
     r"[^.!?]{0,34}$", re.IGNORECASE)
+
+# A refusal does not always come first. "I can't do Wednesday" was caught;
+# "Wednesday doesn't suit me I'm afraid" was not, because the guard above only
+# ever reads the run-UP. Eleven real phrasings were verified resolving to a date
+# and producing a note that offered back the very day the customer had just
+# declined. Read over a short run-ON after the day name.
+_REFUSED_AFTER_DAY_RE = re.compile(
+    r"^[^.!?]{0,40}?\b(?:does\s?n[o']?t|do\s?n[o']?t|wo\s?n[o']?t|would\s?n[o']?t"
+    r"|is\s?n[o']?t|are\s?n[o']?t|ai\s?n[o']?t|ca\s?n[o']?t|could\s?n[o']?t"
+    r"|is\s+(?:out|gone|no\s+(?:good|use))|(?:no|any)\s+(?:good|use)"
+    r"|too\s+(?:early|soon|late|tight|far)|is\s+a\s+killer"
+    r"|is\s+(?:a\s+bit\s+|a\s+little\s+)?(?:tight|awkward|tricky|much)"
+    r"|i'?m\s+(?:in\s+work|working|away|busy)|unfortunately)\b",
+    re.IGNORECASE)
+
+# Telling us WHEN THE FAULT APPEARED is not asking for a day, and it is the
+# commonest weekday mention in a garage chat. "was"/"were" are excluded in front
+# of hoping/wondering/thinking/looking/going, because "I was hoping for
+# Wednesday" genuinely is a request.
+_PAST_TENSE_DAY_RE = re.compile(
+    r"\b(?:came|come)\s+on\b|\bstarted\b|\bbegan\b|\bhappened\b|\bfailed\b"
+    r"|\bbought\b|\brang\b|\bphoned\b|\bcalled\b|\btowed\b|\bbroke\b"
+    r"|\bblew\b|\bdied\b|\bnoticed\b|\bstopped\b|\bwent\b|\bgot\b"
+    r"|\bleft\b|\bdropped\b|\bbrought\b|\bcollected\b|\bsince\b"
+    r"|\bha(?:s|ve|d)\s+been\b"
+    r"|\b(?:was|were)\b(?!\s+(?:hoping|wondering|thinking|looking|going|due|able))"
+    r"[^.!?]{0,40}$", re.IGNORECASE)
+
+# "the Tuesday after next", "Tuesday in two weeks", "Tuesday fortnight" - the
+# regex does not understand any of these, dropped them silently, and returned
+# the COMING Tuesday, one to two weeks early.
+_DISTANCE_QUALIFIER_RE = re.compile(
+    r"\bafter\s+next\b|\bfortnight\b|\bin\s+(?:two|three|2|3)\s+weeks?\b"
+    r"|\bweek\s+after\b|\bthe\s+week\s+(?:after|following)\b", re.IGNORECASE)
+
+# "whatever suits you", "I'm flexible", "next available" — they have handed the
+# choice to us. Whatever day they named before that, they have stopped asking
+# for it, and offering it back is the offer-then-retract the owner hates.
+_NO_DAY_PREFERENCE_RE = re.compile(
+    r"\b(?:what|when)ever (?:suits|works|is best|you (?:have|like|can|want))"
+    r"|\bi'?m flexible\b|\bnot fussy\b|\bno preference\b"
+    # NOT "time": "any time" is about the clock, not the day, and it is the
+    # bot's own scripted wording ("drop it in any time we're open"). It was
+    # throwing away "Wednesday, any time after 9".
+    r"|\b(?:any|next available|first available|earliest) (?:day|date|slot)"
+    r"|\bwhatever you have\b|\bwhenever you can\b"
+    r"|\bany time that suits\b|\bup to you\b",
+    re.IGNORECASE)
+
+# A plain date — "the 1st", "24th", "1 October", "26/09". Not a weekday word, but
+# very much them saying which day. Lesley Gray settled on "the 1st", is booked
+# for the 1st, and would have been offered the Saturday she had already dropped.
+_NAMES_A_DATE_RE = re.compile(
+    # An ordinal needs date context. Bare \d{1,2}(?:st|nd|rd|th) also matched
+    # "5th gear is crunching", "the 2nd time back with the same fault" and "the
+    # 4th bulb blew" - and a fault description is exactly what sits between the
+    # customer naming their day and their confirming "yes", so stopping on one
+    # is the Sean Donovan bug all over again.
+    r"\b(?:on|the|for|by|from|until|till)\s+\d{1,2}(?:st|nd|rd|th)\b"
+    r"(?!\s+(?:gear|time|times|party|opinion|bulb|attempt|go|owner|hand|floor))"
+    # A SLASH only. Swept over 2,011 real customer messages the hyphen form
+    # caught "14:00-22:00" (a shift), "3-4 days", "30-5" and "30 - 10" - ranges
+    # and times, not dates - against three genuine hits that all used a slash.
+    # A false match here silences a real wrong-day warning.
+    r"|\b\d{1,2}\s*/\s*\d{1,2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:" + "|".join(_MONTHS) + r")\b",
+    re.IGNORECASE)
 
 def weekday_asked_for(text: str, today=None) -> str:
     """The date meant by a weekday named in words, as YYYY-MM-DD.
@@ -3572,6 +3834,7 @@ def weekday_asked_for(text: str, today=None) -> str:
     then leaves the model's own date alone, which is the behaviour we had."""
     if not text:
         return ""
+    text = _plain_apostrophes(text)
     today = today or now_local().date()
     found = set()
     # A weekday they RULED OUT is not a weekday they asked for. Don wrote "I am
@@ -3580,10 +3843,50 @@ def weekday_asked_for(text: str, today=None) -> str:
     # useful, and "" simply leaves the model's own date alone.
     if _EXCLUDES_A_DAY_RE.search(text):
         return ""
+    # "tomorrow or Thursday" offers two days where only one is a weekday word.
+    if _ALT_DAY_RE.search(text):
+        return ""
+    # Collection talk kills its own clause only, so "Wednesday 9am is perfect.
+    # Will it be ready that day?" still resolves to Wednesday.
+    text = _without_collection_talk(text)
+    if not text:
+        return ""
     for m in _WEEKDAY_ASK_RE.finditer(text):
         run_up = text[max(0, m.start() - 34):m.start()].lower()
         if _NEGATED_DAY_RE.search(run_up):
             return ""
+        # ...and the same question asked of the words AFTER the day name.
+        if _REFUSED_AFTER_DAY_RE.search(text[m.end():m.end() + 48]):
+            return ""
+        # "the warning light came on Wednesday" is history, not a request.
+        if _PAST_TENSE_DAY_RE.search(text[max(0, m.start() - 44):m.start()]):
+            return ""
+        # "the Tuesday after next", "Tuesday in two weeks" - we do not know how
+        # to count these, and guessing lands them a week or two early.
+        if (_DISTANCE_QUALIFIER_RE.search(run_up)
+                or _DISTANCE_QUALIFIER_RE.search(text[m.end():m.end() + 24])):
+            return ""
+        # "Tuesday the 1st" - a day NUMBER beside the day name. The number is
+        # the thing they actually pinned down; if it does not fall on the
+        # weekday we would resolve, we do not know which they meant.
+        near = re.match(r"\s*(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b",
+                        text[m.end():m.end() + 14])
+        if near and not (m.group(3) and m.group(4)):
+            _n = int(near.group(1))
+            _wd = _WEEKDAY_WORDS[m.group(2).lower()]
+            _soon = today + timedelta(days=((_wd - today.weekday()) % 7) or 7)
+            # The number is the thing they actually pinned down, so use it.
+            # "today" is a candidate because "Monday 21st" written on Monday the
+            # 21st means today - dropping it is the past/same-day guard's job,
+            # not the resolver's. If the number matches none of the candidates
+            # ("Monday 31st", "Tuesday the 1st") we cannot tell which week they
+            # mean, and saying nothing is the whole convention here.
+            _hit = [d for d in (today, _soon, _soon + timedelta(days=7))
+                    if d.day == _n and d.weekday() == _wd]
+            if not _hit:
+                return ""
+            found.add(_hit[0].isoformat())
+            continue
         lead = re.sub(r"\s+", " ", (m.group(1) or "").strip().lower())
         wd = _WEEKDAY_WORDS[m.group(2).lower()]
         trail = re.sub(r"\s+", " ", (m.group(5) or "").strip().lower())
@@ -3601,6 +3904,13 @@ def weekday_asked_for(text: str, today=None) -> str:
             if d.weekday() == wd:
                 found.add(d.isoformat())
             continue
+        # A bare day name said on that very day is genuinely two things at
+        # once - today, or this day week - and the `or 7` below silently picked
+        # the far one. "can I bring it in Monday", written on a Monday, was read
+        # as Monday WEEK and the note then offered a day nobody had discussed.
+        # The rule everywhere else here is to say nothing when unsure.
+        if wd == today.weekday() and not lead and not trail:
+            return ""
         # A bare day name means the next one that has not happened yet — the
         # same rule the staff prompt already states.
         soonest = today + timedelta(days=((wd - today.weekday()) % 7) or 7)
@@ -3631,7 +3941,10 @@ def wrong_weekday_date(booked_date: str, said: str, today=None) -> str:
     "" means there is nothing wrong. The comparison is on the DAY OF THE WEEK,
     never the date: a customer saying "Tuesday" about a Tuesday three weeks out
     is perfectly fine and must not be interrupted."""
-    meant = weekday_asked_for(said, today)
+    # `said` is the customer's recent messages (a list, newest first) from the
+    # chat path, or one colleague's message (a string) from the staff path.
+    meant = (weekday_from_recent(said, today) if isinstance(said, (list, tuple))
+             else weekday_asked_for(said, today))
     if not meant or not booked_date:
         return ""
     try:
@@ -3639,6 +3952,14 @@ def wrong_weekday_date(booked_date: str, said: str, today=None) -> str:
     except ValueError:
         return ""
     if booked.weekday() == date.fromisoformat(meant).weekday():
+        return ""
+    # Never name a day that has already gone. A bare "Wednesday" always resolves
+    # forward, but "Friday 11 September" is read as the date they actually wrote
+    # - and read on the 21st, that date is ten days in the past. Offering it back
+    # is nonsense, and it was four of the eight bookings this check would have
+    # spoken up about. Today is dropped for the same reason: a sentence sent this
+    # evening cannot get them a slot this morning.
+    if date.fromisoformat(meant) <= (today or now_local().date()):
         return ""
     return meant
 
@@ -3936,27 +4257,39 @@ def _finish_reply(user: str, answer: str) -> str:
         # was TOLD Thursday — fix_weekday_mentions relabels the weekday to match
         # whatever date it is given, so the chat reads perfectly either way.
         #
-        # The window is four messages, not one: the marker is only ever emitted
-        # on the customer's confirming turn, so by then their own word for the
-        # day ("Tuesday") is two or three messages back and the last message is
-        # just "yes".
+        # We read their last EIGHT messages, one at a time, newest first. The
+        # marker is only ever emitted on the customer's confirming turn, so by
+        # then their own word for the day ("Tuesday") is several messages back
+        # and the last message is just "yes". One at a time rather than joined
+        # because Sean Donovan's opening line held both "Wednesday" and "Tuesday
+        # evening" - joined, that reads as two days and says nothing at all.
         #
         # Deliberately a note, not a refusal. Returning here would throw the
         # whole booking away — no row, no slot held, nobody told — on a signal as
-        # weak as a weekday appearing somewhere in the last four messages. The
-        # booking is saved on the model's date and one sentence asks about the
-        # other day, so nothing is lost whichever way it goes.
+        # weak as the newest message that happens to name a day. The booking is
+        # saved on the model's date and one sentence asks about the other day,
+        # so nothing is lost whichever way it goes.
         wrong_day_note = ""
         if not is_owner and not already_booked:
             try:
                 alt = wrong_weekday_date(booking.get("date", ""),
-                                         _recent_customer_words_today(user))
+                                         _recent_customer_messages(user))
+                # They already hold a slot on that day, so the weekday sitting
+                # in their messages is explained - it is the car they booked
+                # earlier, not a request for this one. Without this a second car
+                # booked onto a different day gets the first car's day offered
+                # back, and "I have the car booked in for Wednesday already"
+                # reads exactly like a request.
+                if alt and _holds_a_slot_on(user, alt):
+                    log.info("Not offering %s to %s - they are already booked that day",
+                             alt, user)
+                    alt = ""
                 # Only ever name a day we could actually give them. If the day
                 # they said is full, closed or a Sunday, the model moved them off
                 # it for a reason, and offering it back is exactly the
-                # offer-then-retract the owner complains about most.
-                # day_is_full is bool(day_full_reason(...)) on this bot, so the
-                # hard-job quota is already covered by it.
+                # offer-then-retract the owner complains about most. day_is_full
+                # is bool(day_full_reason(...)), so the hard-job quota and the
+                # services-only Saturday are both already covered by it.
                 if alt and (before_open_date(alt) or day_is_full(
                         alt, booking.get("need", ""))):
                     log.info("Not offering %s to %s — we cannot take that day", alt, user)
@@ -6709,6 +7042,8 @@ NEEDS_MASTER_TOKEN = {
 READ_ONLY_ACTIONS -= NEEDS_MASTER_TOKEN
 # Repairing a wiped waiting list must not itself need the master key.
 READ_ONLY_ACTIONS.add("restorealert")
+# Reads nothing but the words you hand it: no booking, no customer, no sending.
+READ_ONLY_ACTIONS.add("weekdaytest")
 
 
 def review_link_token() -> str:
@@ -8148,6 +8483,48 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "body": exc.response.text[:600], "model": model}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400], "model": model}
+    if action == "weekdaytest":
+        # Read-only. What does the wrong-day check make of these words? Several
+        # messages can be given separated by ||, NEWEST FIRST, as the walk sees
+        # them. Nothing is saved, sent or booked.
+        msgs = [x.strip() for x in (need or "").split("||") if x.strip()]
+        today = now_local().date()
+        out = [f"today is {today:%A %d %B %Y}", ""]
+        for i, m in enumerate(msgs, 1):
+            one = weekday_asked_for(m, today)
+            why = ""
+            if not one:
+                if not _ANY_DAY_WORD_RE.search(m) and not _NAMES_A_DATE_RE.search(m):
+                    why = "no day mentioned"
+                elif _EXCLUDES_A_DAY_RE.search(m):
+                    why = "except/apart-from"
+                elif _ALT_DAY_RE.search(m):
+                    why = "two days, one of them today/tomorrow"
+                elif _is_only_collection_talk(m):
+                    why = "about getting the car BACK - walk steps over it"
+                elif _has_negated_day(m):
+                    why = "the day is ruled out"
+                elif _PAST_TENSE_DAY_RE.search(m):
+                    why = "past tense - telling us what happened"
+                elif _only_mismatched_pairs(m, today):
+                    why = "weekday and date disagree - walk steps over it"
+                elif _ANY_DAY_WORD_RE.search(m):
+                    why = "names a day, but not one we can be sure of"
+                elif _NAMES_A_DATE_RE.search(m):
+                    why = "names a date rather than a weekday"
+                else:
+                    why = "no day mentioned"
+            out.append(f"{i}. {m[:90]}")
+            out.append(f"     -> {one or 'nothing'}"
+                       + (f"   ({why})" if why else
+                          f"   ({datetime.strptime(one, '%Y-%m-%d'):%A %d %B})"))
+        walked = weekday_from_recent(msgs, today)
+        out += ["", f"WALKED, newest first -> {walked or 'nothing - stays silent'}"]
+        if walked:
+            out.append("   that is "
+                       + datetime.strptime(walked, "%Y-%m-%d").strftime("%A %d %B"))
+            out.append("   A booking on any OTHER weekday would get the note.")
+        return Response("\n".join(out), media_type="text/plain; charset=utf-8")
     if action == "askbot":
         # Dry-run the bot: ?need=<customer message> (optional &date=<lang hint>).
         # Runs the SAME model + knowledge base + availability the customers get,
