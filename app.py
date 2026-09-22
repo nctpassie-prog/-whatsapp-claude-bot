@@ -408,6 +408,20 @@ def clean_car(car: str) -> str:
     c = (car or "").strip()
     if not c or c.upper() in _NOT_A_CAR:
         return ""
+    # A REGISTRATION IS NOT A CAR. The "never book without the make and model"
+    # rule is enforced by checking this field is non-empty, and customers answer
+    # "what car is it?" with their plate all the time - so "151D12345" satisfied
+    # the gate and the booking went into the diary with no make or model on it.
+    #
+    # The anchored Irish-plate shape is the ONLY test here, deliberately. A
+    # "must contain three letters in a row" rule was tried and was catastrophic:
+    # it blanks MG ZS, VW ID.4, VW Up, DS 3, A3, Q5, X5, i30, CX-5, 3008, 500 and
+    # anything written in Cyrillic - and because the make/model gate is hard,
+    # those customers could never be booked at all, on chat or on the phone. It
+    # also wiped the owner's own correction in ?action=editbooking. A rule that
+    # blocks real customers is worse than the gap it closes.
+    if _IRISH_REG_RE.match(re.sub(r"[\s-]+", "", c).upper()):
+        return ""
     return c
 
 # A loose sanity check on a captured reg — real Irish (and UK-import) regs
@@ -966,7 +980,19 @@ def cancel_booking(user: str, fields: dict, allow_multiple: bool = False,
     date_ = (fields.get("date") or "").strip()
     today_iso = now_local().date().isoformat()
     where, args = ["date >= ?"], [today_iso]
-    if date_:
+    # A date the customer names pins the search only while it is still ahead of
+    # us. The model writes the date they MENTIONED, not necessarily the one in
+    # the diary, so "cancel the one from last Tuesday" could pin onto a job that
+    # had already happened and delete it, calendar entry and all.
+    #
+    # The owner's own tools are a different matter and must keep pinning exactly,
+    # past or not: date_strict and allow_multiple callers know the row they mean,
+    # and the one-tap "cancel the old one" link in a double-booking alert
+    # deliberately carries the OLD date. Widening THEIR search is how a stale
+    # link deletes the live booking the alert was telling you to keep.
+    owner_tool = date_strict or allow_multiple
+    past_date = bool(date_) and date_ < today_iso and not owner_tool
+    if date_ and (date_ >= today_iso or owner_tool):
         where, args = ["date = ?"], [date_]
     if reg:
         where.append("UPPER(TRIM(COALESCE(reg,''))) = ?"); args.append(reg)
@@ -1045,6 +1071,16 @@ def cancel_booking(user: str, fields: dict, allow_multiple: bool = False,
     if len(rows) > 1 and not allow_multiple:
         log.warning("Cancellation for %s matched %d future bookings - asking which",
                     user, len(rows))
+        return {"cancelled": 0, "ambiguous": [
+            {"id": r[0], "name": r[1], "car": r[2], "reg": r[3], "date": r[4],
+             "lang": r[6]} for r in rows]}
+    # They named a day that has gone. That tells us nothing about which of their
+    # FUTURE bookings they mean, so never guess from it - ask, even when only one
+    # matches. Without this the search quietly became "any future booking for
+    # this phone" and a reschedule off a missed day deleted a different car.
+    if past_date and rows:
+        log.warning("Cancellation for %s named %s, which has passed - asking which car",
+                    user, date_)
         return {"cancelled": 0, "ambiguous": [
             {"id": r[0], "name": r[1], "car": r[2], "reg": r[3], "date": r[4],
              "lang": r[6]} for r in rows]}
@@ -2226,6 +2262,15 @@ def save_booking(fields: dict, override_capacity: bool = False) -> bool:
             pass
         return False
     if date_:
+        # A second car on the same day for the same phone is still dropped here,
+        # and that is a known bug, not an oversight: the pre-save check that
+        # produces `already_booked`, the Google Calendar event-id UPDATE (which
+        # matches on date + reg-or-phone with no row id) and the reg backfill
+        # below ALL assume one row per phone per day. Loosening this one query on
+        # its own tells the customer they are booked and then refuses them, and
+        # lets the second car's calendar id overwrite the first car's. Fixing it
+        # properly means one shared predicate, an event-id update keyed by row id
+        # and a guarded backfill - not a change to this query alone.
         with closing(db()) as conn:
             dupe = conn.execute(
                 "SELECT id FROM bookings WHERE date = ? AND ("
@@ -3527,7 +3572,21 @@ _WEEKDAY_ASK_RE = re.compile(
 # check stay silent this turn. Without the short forms "wed 23rd is fine" did not
 # count as naming a day and an older "can I come Tuesday?" won.
 _ANY_DAY_WORD_RE = re.compile(
-    r"\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)\b"
+    # "sat" and "sun" are ordinary English words and they are NOT in this list on
+    # their own. On the headlights bot "they're yellowed from the sun" is close to
+    # the commonest fault description there is, and it sits exactly where the
+    # fault description goes - between "Wednesday suits me" and "please book me
+    # in" - so it was stopping the walk and silencing the warning completely.
+    # They only count as days when something around them says so.
+    # The sun is preceded by "the"; the verb is followed by "in" ("sat in the
+    # sun for years"). Everything else - "sat 10am", "sat am", "sat or sun?",
+    # "are ye open sat?", "would sat suit" - is a Saturday, and all of those
+    # stopped the walk before. Requiring on/this/next/coming or a number was far
+    # too strict and traded a cheap false stop for an expensive miss, which is
+    # the wrong way round for a STOP test.
+    r"(?<!the )\b(?:sat|sun)\b(?!\s+in\b)"
+    # The rest are not English words, so they are safe bare.
+    r"|\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri)\b"
     r"|\b(?:" + "|".join(_WEEKDAY_WORDS) + r")\b", re.IGNORECASE)
 
 def _recent_customer_messages(user: str, limit: int = 8, hours: int = 18) -> list:
@@ -3826,6 +3885,16 @@ _NAMES_A_DATE_RE = re.compile(
     r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:" + "|".join(_MONTHS) + r")\b",
     re.IGNORECASE)
 
+# "dropped" and "brought" are past tense AND the commonest booking verbs here -
+# "I dropped it in Tuesday" is history, "I'll get it dropped in Wednesday" is a
+# request. Taking them out of the past-tense list let the history read as a
+# request (a BARE weekday resolves forward, so the past-date backstop can never
+# catch it); leaving them in silenced the request. What actually separates them
+# is intent, so the past-tense test stands down when the same words show it.
+_FUTURE_INTENT_RE = re.compile(
+    r"\b(?:get|getting|gonna|going to|want to|wanna|like to|hoping|plan to"
+    r"|can i|could i|shall i|will|'ll|i'?ll|we'?ll)\b", re.IGNORECASE)
+
 def weekday_asked_for(text: str, today=None) -> str:
     """The date meant by a weekday named in words, as YYYY-MM-DD.
 
@@ -3858,8 +3927,11 @@ def weekday_asked_for(text: str, today=None) -> str:
         # ...and the same question asked of the words AFTER the day name.
         if _REFUSED_AFTER_DAY_RE.search(text[m.end():m.end() + 48]):
             return ""
-        # "the warning light came on Wednesday" is history, not a request.
-        if _PAST_TENSE_DAY_RE.search(text[max(0, m.start() - 44):m.start()]):
+        # "the warning light came on Wednesday" is history, not a request - but
+        # only when the same words are not reaching FORWARD ("I'll get it dropped
+        # in Wednesday" carries both a past participle and a plain intention).
+        _run = text[max(0, m.start() - 44):m.start()]
+        if _PAST_TENSE_DAY_RE.search(_run) and not _FUTURE_INTENT_RE.search(_run):
             return ""
         # "the Tuesday after next", "Tuesday in two weeks" - we do not know how
         # to count these, and guessing lands them a week or two early.
@@ -4104,6 +4176,15 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
     """
     try:
         text = answer or ""
+        # NEVER touch a reply that still carries a hidden marker. When this guard
+        # fires it replaces the WHOLE answer, and it runs before the markers are
+        # processed - so rewriting one throws the marker away with it. "I've
+        # cancelled Thursday for you. How about Tuesday?" would lose its
+        # <<<CANCEL|...>>> and the cancellation would silently never happen; the
+        # same goes for a booking or a handover. A reply carrying a marker is a
+        # confirmation, not an offer, so there is nothing here to guard anyway.
+        if "<<<" in text:
+            return answer
         prop = _PROPOSAL_RE.search(text)
         conversational = False
         if not prop:
@@ -4111,7 +4192,11 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
                 lo = max([text.rfind(c, 0, m.start()) for c in _SENTENCE_ENDS] + [-1])
                 hi = min([h for h in (text.find(c, m.end()) for c in _SENTENCE_ENDS)
                           if h != -1] + [len(text)])
-                if _BOOKINGISH_RE.search(text[lo + 1:hi]):
+                # BOTH patterns. _OFFER_HINT_RE was written for this and then
+                # never referenced, so "we have space that day", "how about" and
+                # "would that suit" went straight through the guard.
+                sentence = text[lo + 1:hi]
+                if _BOOKINGISH_RE.search(sentence) or _OFFER_HINT_RE.search(sentence):
                     prop, conversational = m, True
                     break
         if not prop:
@@ -5187,6 +5272,26 @@ def later_booking_exists(bid: int, phone: str, reg: str, date_: str):
 # be re-sent every hour, at template cost, until the appointment came and went.
 REMINDER_MAX_TRIES = int(os.environ.get("REMINDER_MAX_TRIES", "3"))
 
+def already_confirmed_since(phone: str, since_ts: float) -> bool:
+    """True if the bot has written to this customer since their booking was made.
+
+    The day-before reminder is for people who booked a while ago. Somebody told
+    the date in chat minutes earlier does not need it; somebody whose booking a
+    colleague agreed, or that was typed in by hand or taken over the phone, was
+    never told anything at all and the reminder is the only message there is."""
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) < 7 or not since_ts:
+        return False
+    try:
+        with closing(db()) as conn:
+            return bool(conn.execute(
+                "SELECT 1 FROM messages WHERE wa_user LIKE ? AND role = 'assistant'"
+                " AND COALESCE(ts, 0) >= ? LIMIT 1",
+                ("%" + digits[-9:], since_ts)).fetchone())
+    except Exception:
+        log.exception("Could not check whether %s was already told", digits[-9:])
+        return False
+
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
     if not REMINDER_ENABLED:
@@ -5197,11 +5302,25 @@ def send_due_reminders() -> None:
     tomorrow = (now.date() + timedelta(days=1)).isoformat()
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT id, name, phone, car, reg, time_text, COALESCE(lang, '') FROM bookings"
+            "SELECT id, name, phone, car, reg, time_text, COALESCE(lang, ''),"
+            " COALESCE(created_ts, 0) FROM bookings"
             " WHERE date = ? AND COALESCE(reminded, 0) = 0",
             (tomorrow,),
         ).fetchall()
-    for bid, name, phone, car, reg, tt, lang in rows:
+    for bid, name, phone, car, reg, tt, lang, made_ts in rows:
+        # Somebody who was TOLD the date in chat minutes ago does not need a paid
+        # template repeating it back (garage booking 438: reminder 31 minutes
+        # after the booking, reading to the customer as a mistake). But "booked
+        # today" is the wrong test for that, because a booking a colleague
+        # agreed, one added by hand, or one taken on the phone sends the customer
+        # nothing at all - for those the reminder is the ONLY message they ever
+        # get, and watch_staff_booking's Telegram note promises it will go out.
+        # So the question is whether we have actually written to them since.
+        if made_ts and already_confirmed_since(phone, made_ts):
+            log.info("Reminder for booking %s skipped - they were told when they booked", bid)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            continue
         # Never remind somebody about a day they have already moved off. If the
         # same car holds a LATER booking made AFTER this one, this row is almost
         # certainly the leftover of a reschedule - say so rather than texting the
@@ -5814,7 +5933,11 @@ def chase_unresolved_alerts() -> None:
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT wa_user, ts FROM alerts WHERE ts <= ? AND ts >= ? "
-            "AND COALESCE(chased_ts, 0) < ts", (cutoff, nowts - 24 * 3600)).fetchall()
+            "AND COALESCE(chased_ts, 0) < ts "
+            # Somebody pressed the Telegram "Done" button, so a person has
+            # already dealt with this. Apologising to the customer afterwards for
+            # a wait that is over is the noise the owner complains about most.
+            "AND COALESCE(closed_ts, 0) < ts", (cutoff, nowts - 24 * 3600)).fetchall()
     for user, alert_ts in rows:
         try:
             if is_blocked(user) or is_paused(user) or (
@@ -5891,7 +6014,10 @@ def chase_unresolved_alerts() -> None:
                                 "VALUES (?, 'chase_template', ?)", (user, nowts))
                         log.info("Window closed for %s — template nudge sent", user)
                 continue
-            text = _make_chase(user)
+            # The chase is a customer-facing message like any other, and it was
+            # the one place that skipped this: at 22:40, with the workshop shut
+            # since six, it promised somebody the team would be right back to them.
+            text = after_hours_wording(_make_chase(user))
             # Belt and braces: never send the customer the same line twice in a row.
             with closing(db()) as conn:
                 last = conn.execute(
@@ -6131,8 +6257,18 @@ def followup_week_stats(days: int = 7) -> str:
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
 def alert_resolved(conn, user: str, alert_ts: float) -> bool:
-    """An alert counts as sorted once a colleague replied OR the customer ended up
-    with a booking — the owner's rule: 'she has a booking already, means sorted'."""
+    """An alert counts as sorted once somebody pressed Done, a colleague replied,
+    OR the customer ended up with a booking - the owner's rule: 'she has a
+    booking already, means sorted'."""
+    # Somebody pressed the Telegram "Done" button. That is the most explicit
+    # answer there is, and it was the one thing this never looked at - so a
+    # customer who had been ticked off stayed on the waiting list, in the
+    # evening digest and in the morning briefing. It is why that list never
+    # seemed to go down.
+    closed = conn.execute("SELECT closed_ts FROM alerts WHERE wa_user = ?",
+                          (user,)).fetchone()
+    if closed and (closed[0] or 0) >= alert_ts:
+        return True
     staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
                          (user,)).fetchone()
     if staff and (staff[0] or 0) > alert_ts:
@@ -6245,7 +6381,7 @@ def claim_alert(user: str, who: str) -> tuple:
              else f"Now with you, {who}.")
     return toast, after
 
-def close_alert(user: str, who: str, auto: bool = False) -> tuple:
+def close_alert(user: str, who: str, auto: bool = False, tapped_ts: str = "") -> tuple:
     """'Done' tapped, or a staff reply / booking sorted it. Same (toast, after) shape."""
     now = time.time()
     with closing(db()) as conn:
@@ -6253,6 +6389,18 @@ def close_alert(user: str, who: str, auto: bool = False) -> tuple:
     if not row:
         return "Nothing open for that customer.", None
     ts, claimed_by, _claimed_ts, tg_msgs, tg_text, headline, closed_ts = row
+    # The button carries the timestamp of the alert it was posted under, and that
+    # has to be checked. Telegram messages never expire, every alert goes to
+    # three chats (six copies after the repost), and this table holds ONE row per
+    # customer - so a tap on last week's message closes whatever that customer is
+    # waiting for TODAY. That used to be cosmetic; now that the chase honours
+    # closed_ts it would silence a live case for good.
+    if tapped_ts:
+        try:
+            if int(float(tapped_ts)) != int(ts or 0):
+                return "That one's already been dealt with - this is an older alert.", None
+        except (TypeError, ValueError):
+            pass
     if (closed_ts or 0) >= (ts or 0):
         return "Already closed.", None
     with closing(db()) as conn, conn:
@@ -6313,7 +6461,7 @@ def handle_claim_callback(cq: dict) -> None:
         if kind == "claim" and user:
             toast, after = claim_alert(user, who)
         elif kind == "done" and user:
-            toast, after = close_alert(user, who)
+            toast, after = close_alert(user, who, tapped_ts=_tag)
     except Exception:
         log.exception("Claim button failed: %s", data)
         toast = "Something went wrong — try again."
@@ -6518,6 +6666,12 @@ def send_waiting_conversations(limit: int = 10) -> int:
     nowts = time.time()
     with closing(db()) as conn:
         alerts = conn.execute(
+            # NOTE (open finding): 40 rows is under a day of alerts on the garage,
+            # and this list is newest-first, so the longest-waiting customer is
+            # the one most likely to be missing. Widening it is not enough on its
+            # own - alerts are never aged out, so a bigger window mostly surfaces
+            # dead rows from months ago, and customer_label on every row fans out
+            # to the Google People API. Needs an age floor and all four views.
             "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
         waiting = []
         for u, ts in alerts:
@@ -8192,9 +8346,17 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         except ValueError:
             return {"error": "Pass the original alert time as need=<unix seconds>"}
         with closing(db()) as conn, conn:
+            # closed_ts MUST be cleared here, the way the main alert path does.
+            # This call deliberately rewinds ts so the row keeps its true age, so
+            # any Done stamp already on the row is newer than the timestamp being
+            # restored - and alert_resolved would then read the customer as
+            # already handled the instant the row is recreated. That would leave
+            # the one tool for undoing a wiped waiting list unable to restore
+            # anybody, while still reporting success.
             conn.execute("INSERT INTO alerts (wa_user, ts, chased_ts) VALUES (?, ?, ?) "
                          "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts, "
-                         "chased_ts = excluded.chased_ts", (digits, ts, ts))
+                         "chased_ts = excluded.chased_ts, closed_ts = 0, "
+                         "claimed_by = '', claimed_ts = 0", (digits, ts, ts))
         return {"restored": digits, "waiting_since": _fmt_ts(ts),
                 "customer": customer_label(digits)}
     if action == "clearwaiting":
