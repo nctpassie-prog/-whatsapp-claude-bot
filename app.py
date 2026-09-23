@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -50,7 +51,11 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "change-me")
 # actions ONLY — it can never change or delete anything, so it is safe to share with
 # whoever is helping improve the bot without handing over the master key.
 REVIEW_TOKEN = os.environ.get("REVIEW_TOKEN", "")
-APP_SECRET = os.environ.get("APP_SECRET", "")
+# Stripped: the signature watch strips its candidates, and "safe to set it to
+# exactly that value" has to mean the same bytes here. Meta app secrets are hex
+# and never contain whitespace - a stray space or newline pasted into Railway is
+# the likely failure, and it would otherwise silently reject every customer.
+APP_SECRET = os.environ.get("APP_SECRET", "").strip()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
@@ -7198,6 +7203,8 @@ READ_ONLY_ACTIONS -= NEEDS_MASTER_TOKEN
 READ_ONLY_ACTIONS.add("restorealert")
 # Reads nothing but the words you hand it: no booking, no customer, no sending.
 READ_ONLY_ACTIONS.add("weekdaytest")
+# Header names, counts and a verdict - never a secret or a signature value.
+READ_ONLY_ACTIONS.add("sigwatch")
 
 
 def review_link_token() -> str:
@@ -8687,6 +8694,29 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                        + datetime.strptime(walked, "%Y-%m-%d").strftime("%A %d %B"))
             out.append("   A booking on any OTHER weekday would get the note.")
         return Response("\n".join(out), media_type="text/plain; charset=utf-8")
+    if action == "sigwatch":
+        # Read-only. What has been arriving at /webhook - signed or not, and which
+        # candidate secret (if any) verifies it - with a plain-English verdict.
+        # No secret and no signature value is ever stored, so nothing here can
+        # leak one.
+        try:
+            with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+                rows = conn.execute(
+                    "SELECT ts, phone_id, kind, obj, has256, ok256, has1, ok1,"
+                    " cand_match, headers, ua, fwd, blen, cand_gen, n_changes"
+                    " FROM webhook_sig_log"
+                    " ORDER BY id DESC LIMIT ?", (SIGWATCH_KEEP,)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []          # the table appears with the first webhook after deploy
+        summary = sigwatch_summary(rows)
+        summary["watch_on"] = SIGWATCH_ON
+        summary["dropped_since_restart"] = _SIGWATCH_STATE["dropped"]
+        summary["lock_on"] = bool(APP_SECRET)
+        summary["latest"] = [
+            {"when": _fmt_ts(r[_SW_TS]), "kind": r[_SW_KIND], "phone_id": r[_SW_PHONE],
+             "signed": bool(r[_SW_HAS256]), "old_sha1_only": bool(r[_SW_HAS1] and not r[_SW_HAS256]),
+             "candidate": r[_SW_CAND]} for r in rows[:10]]
+        return summary
     if action == "askbot":
         # Dry-run the bot: ?need=<customer message> (optional &date=<lang hint>).
         # Runs the SAME model + knowledge base + availability the customers get,
@@ -9075,11 +9105,292 @@ def verify(
         return Response(content=hub_challenge, media_type="text/plain")
     return Response(status_code=403)
 
+def _hub256_ok(secret: str, body: bytes, header256: str) -> bool:
+    """Does X-Hub-Signature-256 verify with this secret?
+
+    The ONE definition of a valid signature. The lock uses it and so does the
+    signature watch, on the same raw header value - so the watch can never call a
+    secret "right" that the lock would then refuse. They used to be two separate
+    pieces of code, and the watch also accepted the old sha1 header, which the
+    lock never reads: a verdict of "safe" could have blocked every customer."""
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header256 or "")
+
+
 def valid_signature(body: bytes, signature: str) -> bool:
     if not APP_SECRET:
         return True  # signature check disabled
-    expected = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature or "")
+    return _hub256_ok(APP_SECRET, body, signature)
+
+
+# ── Webhook signature WATCH - report only, never blocks ─────────────────────
+# APP_SECRET is blank, and valid_signature() lets everything through while it is
+# blank - but the moment it holds ANY value, every message not signed with
+# exactly that secret gets a 403. Setting the variable IS the switch. Messages
+# reach this bot through Chakra's pass-through webhook, not straight from a Meta
+# app, so nobody knows what signature (if any) they carry, and a wrong guess
+# would silence the bot for every customer at once.
+#
+# So this only WATCHES, and ?action=sigwatch reads it back. It never stores a
+# secret or a signature value, never changes the response, and swallows its own
+# failures. WEBHOOK_SECRET_CANDIDATES is deliberately NOT APP_SECRET: a secret can
+# be tried out on real traffic there with no risk of switching the lock on.
+#
+# A candidate only counts as a match when the LOCK ITSELF would accept that very
+# request - same _hub256_ok, same raw X-Hub-Signature-256. The old sha1
+# X-Hub-Signature is recorded but never counts, because the lock does not read it.
+SIGWATCH_ON = os.environ.get("SIGWATCH", "1") != "0"
+_SIG_CANDIDATES = [s.strip() for s in
+                   os.environ.get("WEBHOOK_SECRET_CANDIDATES", "").split(",") if s.strip()]
+# Which candidate list a row was tested against, so a verdict is never drawn from
+# rows judged against a different list: editing the variable redeploys, and "#1"
+# would otherwise quietly change meaning. A truncated hash of the list, used only
+# to filter rows - never returned by ?action=sigwatch.
+_SIG_CAND_GEN = (hashlib.sha256("\x00".join(_SIG_CANDIDATES).encode()).hexdigest()[:12]
+                 if _SIG_CANDIDATES else "")
+_SIG256_RE = re.compile(r"^sha256=[0-9a-f]{64}$")
+_SIG1_RE = re.compile(r"^sha1=[0-9a-f]{40}$")
+SIGWATCH_KEEP = 2000
+SIGWATCH_MIN_SAMPLE = 10
+_SIGWATCH_DDL = ("CREATE TABLE IF NOT EXISTS webhook_sig_log ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, phone_id TEXT,"
+                 " kind TEXT, obj TEXT, has256 INTEGER, ok256 INTEGER, has1 INTEGER,"
+                 " ok1 INTEGER, cand_match INTEGER, headers TEXT, ua TEXT, fwd TEXT,"
+                 " blen INTEGER, cand_gen TEXT, n_changes INTEGER)")
+# What counts as a real WhatsApp event: anything receive() would act on - the
+# WhatsApp object label, OR any entry[].changes[] at all, because receive() never
+# checks the label and a pass-through could reshape the payload. The lock would
+# reject every kind alike, so every kind has to be in the evidence.
+_WA_OBJECT = "whatsapp_business_account"
+
+
+def _sig_observation(headers, body: bytes) -> dict:
+    """What arrived at the door - never a secret or a signature VALUE. Pure CPU."""
+    raw256 = headers.get("x-hub-signature-256") or ""   # exactly what the lock is given
+    s1 = (headers.get("x-hub-signature") or "").strip()
+    cand = None                   # None = nothing to test (no candidates or no sha256 header)
+    if _SIG_CANDIDATES and raw256:
+        cand = 0                  # 0 = signed, but by none of the candidates
+        for i, secret in enumerate(_SIG_CANDIDATES, 1):
+            if _hub256_ok(secret, body, raw256):
+                cand = i
+                break
+    kind, phone_id, obj, n_changes = "other", "", "", 0
+    try:
+        data = json.loads(body or b"{}")
+        obj = str(data.get("object", "") or "")[:40]
+        for entry in data.get("entry", []) or []:
+            for change in entry.get("changes", []) or []:
+                n_changes += 1
+                value = change.get("value", {}) or {}
+                field = str(change.get("field", "") or "")
+                phone_id = phone_id or str(
+                    (value.get("metadata") or {}).get("phone_number_id", "") or "")[:30]
+                if value.get("messages"):
+                    kind = "messages"
+                elif value.get("statuses"):
+                    kind = "statuses"
+                elif (value.get("message_echoes") or value.get("smb_message_echoes")
+                      or field == "smb_message_echoes"):
+                    kind = "echoes"
+                elif value.get("calls"):
+                    kind = "calls"
+                elif field == "history" or "history" in value:
+                    kind = "history"
+                elif field:
+                    kind = field[:30]
+    except Exception:
+        kind = "unparseable"
+    return {
+        "ts": time.time(), "phone_id": phone_id, "kind": kind, "obj": obj,
+        "has256": int(bool(raw256)), "ok256": int(bool(_SIG256_RE.match(raw256.strip()))),
+        "has1": int(bool(s1)), "ok1": int(bool(_SIG1_RE.match(s1))),
+        "cand_match": cand, "cand_gen": _SIG_CAND_GEN,
+        # header NAMES only - their values can include things that must not be kept
+        "headers": ",".join(sorted(str(k).lower() for k in headers.keys()))[:600],
+        "ua": str(headers.get("user-agent") or "")[:120],
+        "fwd": str(headers.get("x-forwarded-for") or "").split(",")[0].strip()[:60],
+        "blen": len(body or b""), "n_changes": n_changes,
+    }
+
+
+def _record_sig_observation(obs: dict) -> None:
+    """Runs on the watch's own thread. Its own short-timeout connection, so a
+    locked database costs one dropped observation and never a delayed customer."""
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=2)) as conn, conn:
+            conn.execute(_SIGWATCH_DDL)
+            conn.execute(
+                "INSERT INTO webhook_sig_log (ts, phone_id, kind, obj, has256, ok256,"
+                " has1, ok1, cand_match, headers, ua, fwd, blen, cand_gen, n_changes)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (obs["ts"], obs["phone_id"], obs["kind"], obs["obj"], obs["has256"],
+                 obs["ok256"], obs["has1"], obs["ok1"], obs["cand_match"],
+                 obs["headers"], obs["ua"], obs["fwd"], obs["blen"], obs["cand_gen"],
+                 obs["n_changes"]))
+            conn.execute("DELETE FROM webhook_sig_log WHERE id <="
+                         " (SELECT MAX(id) FROM webhook_sig_log) - ?", (SIGWATCH_KEEP,))
+    except Exception:
+        log.exception("Signature watch could not record an observation (ignored)")
+
+
+# One writer thread fed by a bounded queue. The request only ever does a
+# put_nowait, so it never waits on the database - not even behind itself - and a
+# full queue drops the observation (and counts it) rather than blocking anyone.
+_SIGWATCH_Q = queue.Queue(maxsize=500)
+_SIGWATCH_STATE = {"started": False, "dropped": 0}
+_SIGWATCH_START_LOCK = threading.Lock()
+
+
+def _sigwatch_worker() -> None:
+    while True:
+        try:
+            _record_sig_observation(_SIGWATCH_Q.get())
+        except Exception:
+            log.exception("Signature watch worker hiccup (ignored)")
+
+
+def _sigwatch_enqueue(obs: dict) -> None:
+    """Hand an observation to the writer thread. Never blocks, never raises."""
+    try:
+        if not _SIGWATCH_STATE["started"]:
+            with _SIGWATCH_START_LOCK:
+                if not _SIGWATCH_STATE["started"]:
+                    threading.Thread(target=_sigwatch_worker, name="sigwatch",
+                                     daemon=True).start()
+                    _SIGWATCH_STATE["started"] = True
+        _SIGWATCH_Q.put_nowait(obs)
+    except queue.Full:
+        _SIGWATCH_STATE["dropped"] += 1
+    except Exception:
+        log.exception("Signature watch could not queue an observation (ignored)")
+
+
+# Row layout, as ?action=sigwatch selects it.
+_SW_TS, _SW_PHONE, _SW_KIND, _SW_OBJ, _SW_HAS256, _SW_OK256, _SW_HAS1, _SW_OK1, \
+    _SW_CAND, _SW_HEADERS, _SW_UA, _SW_FWD, _SW_BLEN, _SW_GEN, _SW_NCH = range(15)
+
+
+def sigwatch_summary(rows: list) -> dict:
+    """Turn raw observations into a verdict a person can act on.
+
+    It only ever says APP_SECRET is safe to set when the lock's OWN check would
+    have accepted every real WhatsApp event tested against the current candidate
+    list - enough of them, from every number this bot serves. rows are newest
+    first, in the _SW_* layout."""
+    real = [r for r in rows if r[_SW_OBJ] == _WA_OBJECT or (r[_SW_NCH] or 0) > 0]
+    n = len(real)
+    out = {"candidates_configured": len(_SIG_CANDIDATES),
+           "real_whatsapp_events": n, "other_requests": len(rows) - n}
+    if not n:
+        out["verdict"] = ("Nothing real has arrived since this went live. Leave it a few "
+                          "hours of customer messages and look again.")
+        return out
+    signed = sum(1 for r in real if r[_SW_HAS256])          # the ONLY header the lock reads
+    sha1_only = sum(1 for r in real if r[_SW_HAS1] and not r[_SW_HAS256])
+    out.update({
+        "from": _fmt_ts(real[-1][_SW_TS]), "to": _fmt_ts(real[0][_SW_TS]),
+        "signed_the_way_the_lock_reads": signed,
+        "well_formed": sum(1 for r in real if r[_SW_OK256]),
+        "old_sha1_header_seen": sum(1 for r in real if r[_SW_HAS1]),
+        "by_kind": dict(collections.Counter(r[_SW_KIND] for r in real)),
+    })
+    by_phone = {}
+    for r in real:
+        p = by_phone.setdefault(r[_SW_PHONE] or "(none)", {"events": 0, "signed": 0})
+        p["events"] += 1
+        p["signed"] += int(bool(r[_SW_HAS256]))
+    out["by_phone_number_id"] = by_phone
+    out["user_agents"] = dict(collections.Counter(r[_SW_UA] for r in real).most_common(5))
+    out["forwarded_from"] = dict(collections.Counter(
+        ".".join(r[_SW_FWD].split(".")[:3]) + ".*" if r[_SW_FWD].count(".") == 3
+        else r[_SW_FWD] for r in real).most_common(5))
+    out["header_names_seen"] = sorted(
+        {h for r in real for h in (r[_SW_HEADERS] or "").split(",") if h})
+
+    if signed == 0 and sha1_only:
+        out["verdict"] = (
+            f"None of the {n} real WhatsApp events carry the X-Hub-Signature-256 header "
+            f"the lock checks - {sha1_only} carry only the OLD sha1 header, which the lock "
+            "does not read. Setting APP_SECRET would reject every customer. Do NOT set it.")
+        return out
+    if signed == 0:
+        out["verdict"] = (
+            f"NONE of the {n} real WhatsApp events carried a signature. An app secret "
+            "can never work for these - setting APP_SECRET would reject every "
+            "customer. The lock has to be a private key built into the address Chakra "
+            "forwards to instead.")
+        return out
+    if signed < n:
+        out["verdict"] = (
+            f"Only {signed} of {n} real events carried the signature the lock checks. "
+            f"Switching the lock on would reject the other {n - signed}. "
+            "Do NOT set APP_SECRET.")
+        return out
+    if not _SIG_CANDIDATES:
+        out["verdict"] = (
+            f"All {n} real events carry the signature the lock checks. Next: put the "
+            "secret(s) you want to test into WEBHOOK_SECRET_CANDIDATES in Railway "
+            "(comma-separated). That variable never switches the lock on - it only "
+            "tells us which one matches.")
+        return out
+
+    tested = [r for r in real if (r[_SW_GEN] or "") == _SIG_CAND_GEN]
+    t = len(tested)
+    out["tested_against_current_candidates"] = t
+    if not t:
+        out["verdict"] = ("The candidate list has changed since the last message, so "
+                          "nothing has been tested against it yet. Look again in an hour.")
+        return out
+    matched = collections.Counter(r[_SW_CAND] for r in tested)
+    out["candidate_results"] = {
+        ("no candidate matched" if k == 0 else f"candidate #{k}"): v
+        for k, v in sorted(matched.items(), key=lambda kv: kv[0] or 0)}
+    full = [k for k, v in matched.items() if k and v == t]
+    # Coverage. Every number the bot is SET UP to serve, not just the ones that
+    # happen to have spoken - 086 carries 51 of every 60 garage customers, so an
+    # hour of 086 alone would otherwise "prove" 085. And every (number, event
+    # type) pair seen anywhere in the window must have been tested against THIS
+    # list: echoes and missed calls are rare, and a type that failed under an old
+    # list has to pass again under the new one before anyone switches the lock on.
+    tested_phones = {r[_SW_PHONE] or "(none)" for r in tested}
+    required_phones = ({p for p in ALLOWED_PHONE_IDS if p}
+                       | {r[_SW_PHONE] or "(none)" for r in real})
+    missing = sorted(required_phones - tested_phones)
+    tested_pairs = {(r[_SW_PHONE] or "(none)", r[_SW_KIND]) for r in tested}
+    missing_pairs = sorted({(r[_SW_PHONE] or "(none)", r[_SW_KIND]) for r in real}
+                           - tested_pairs)
+    out["numbers_required"] = sorted(required_phones)
+    if full and t >= SIGWATCH_MIN_SAMPLE and not missing and not missing_pairs:
+        out["verdict"] = (
+            f"All {t} real events tested against the current list verify with candidate "
+            f"#{full[0]}, on every number this bot serves - using the lock's own check. "
+            f"APP_SECRET can safely be set to exactly that value.")
+    elif full:
+        why = []
+        if t < SIGWATCH_MIN_SAMPLE:
+            why.append(f"only {t} events so far (need {SIGWATCH_MIN_SAMPLE})")
+        if missing:
+            why.append(f"nothing tested yet from number id(s) {', '.join(missing)}")
+        if missing_pairs:
+            why.append("not yet tested: " + ", ".join(
+                f"{k} on {p}" for p, k in missing_pairs[:6])
+                + (" and more" if len(missing_pairs) > 6 else ""))
+        out["verdict"] = (f"Candidate #{full[0]} verifies everything tested so far, but "
+                          f"that is not enough yet: {'; '.join(why)}. Do NOT switch the "
+                          "lock on - look again later.")
+    elif matched.get(0, 0) == t:
+        out["verdict"] = (
+            f"All {t} real events are signed, but by NONE of the candidates. The "
+            "secret is probably Chakra's rather than your Meta app's.")
+    else:
+        best = max((k for k in matched if k), key=lambda k: matched[k], default=None)
+        out["verdict"] = (
+            (f"Candidate #{best} matches {matched[best]} of {t} - not all of them. "
+             if best else "")
+            + "Do NOT switch the lock on until one candidate matches every event.")
+    return out
+
 
 def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note: str = "") -> None:
     _t0 = time.time()
@@ -10038,6 +10349,15 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
 @app.post("/webhook")
 async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
+    # Report-only signature watch, for EVERY request and before the lock. It can
+    # never change what happens next: the observation is pure CPU, and the write
+    # happens on the watch's own thread - NOT as a background task, because those
+    # run one after another and the customer's reply would queue behind it.
+    try:
+        if SIGWATCH_ON:
+            _sigwatch_enqueue(_sig_observation(request.headers, body))
+    except Exception:
+        log.exception("Signature watch failed (ignored)")
     if not valid_signature(body, request.headers.get("X-Hub-Signature-256", "")):
         log.warning("Invalid webhook signature")
         return Response(status_code=403)
