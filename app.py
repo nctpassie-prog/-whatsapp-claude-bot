@@ -3253,6 +3253,37 @@ WATCH_BOOKING_SYSTEM = (
     "history of existing work. Only a NEW future appointment counts."
 )
 
+def _other_booking_date(user: str, iso: str) -> str:
+    """The date of this customer's booking on ANOTHER day after today, if any.
+    Today's own booking is the car that is in with us now, not another booking."""
+    digits = "".join(c for c in str(user) if c.isdigit())
+    if len(digits) < 7:
+        return ""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT date FROM bookings WHERE date > ? AND date != ? AND"
+                " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+                " ORDER BY date LIMIT 1",
+                (now_local().date().isoformat(), iso or "", "%" + digits[-9:])).fetchone()
+    except Exception:
+        return ""
+    return row[0] if row else ""
+
+
+def _watch_note_once(user: str, day: str, text: str) -> None:
+    """The watcher runs on every booking-ish message while a colleague has the
+    chat, so the same 'please add it by hand' note would go out each time. Once
+    per customer and day is enough."""
+    key = f"watch_note:{user}:{day}"
+    try:
+        if get_setting(key):
+            return
+        set_setting(key, str(int(time.time())))
+    except Exception:
+        log.exception("watch note memory failed for %s", user)
+    send_telegram(text)
+
 def watch_staff_booking(user: str, by_customer: bool = False) -> None:
     """Silently log a booking that staff agreed in chat, so nothing is lost.
 
@@ -3293,11 +3324,46 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         # A row with no car, no reg AND no job is useless to the workshop (Olga's
         # phantom was exactly that: blank everything, just a date). Tell the owner
         # instead of writing an empty diary line.
-        if not (fields.get("car") or fields.get("reg") or fields.get("need")):
-            send_telegram("📌 Your colleague seems to have agreed a day in chat with "
-                          f"{customer_label(user)} ({fields.get('date')}), but I "
-                          "couldn't tell which car or job — please add it to the "
-                          f"diary by hand. https://wa.me/{user}")
+        # Already in the diary that day: a re-confirmation. Nothing to add and
+        # nothing to tell anyone - checked FIRST, before any rule below can send a
+        # note about a booking that is already there.
+        probe = dict(fields)
+        if len(normalize_phone(probe.get("phone", ""))) < 9:
+            probe["phone"] = user
+        if booking_already_in_diary(probe):
+            # save_booking sees the duplicate and only fills in a reg or car the
+            # row was still missing (the owner's Callum fix); no note either way.
+            # But a date before yesterday it would first move a YEAR ahead (its
+            # wrong-year fix) and then save as a silent booking for next year - a
+            # past visit being talked about ("Done", "test drive done") needs
+            # nothing at all.
+            today_ = now_local().date()
+            try:
+                when = date.fromisoformat(probe["date"])
+            except ValueError:
+                when = None
+            if when and when >= today_ - timedelta(days=1):
+                save_booking(probe, override_capacity=True)
+                return
+            if when and when >= today_ - timedelta(days=60):
+                return  # a recent visit being talked about - nothing to book
+            # About a year back: the model's wrong-year slip, not this visit.
+            # Carry on - save_booking moves it to this year, as for any booking.
+        # 24 Sep 2026: a job with NO car and NO reg is not enough either. Dima told
+        # Lesley "Pop in 9 am tomorrow" to collect a courtesy car while her car was
+        # in with us; the model returned just "full service" and it went into a
+        # full Friday with the capacity override, took the last slot and sent her
+        # a reminder for a booking she never made. A placeholder ("...",
+        # "Unknown") is no car either; a plate typed into the car field is.
+        car = (fields.get("car") or "").strip()
+        if car.lower() in _PLACEHOLDER_CAR:
+            car = ""
+        if not (car or clean_reg(fields.get("reg", "")) or clean_reg(car)):
+            _watch_note_once(user, fields.get("date", ""),
+                             "📌 Your colleague seems to have agreed a day in chat with "
+                             f"{customer_label(user)} ({fields.get('date')}), but I "
+                             "couldn't tell which car — please add it to the "
+                             f"diary by hand if it's a booking. https://wa.me/{user}")
             return
         # The customer's own WhatsApp number always wins over whatever the model
         # wrote in the marker — a marker with phone=... created a booking row
@@ -3337,12 +3403,20 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
                             user, fields.get("date"), alt)
         except Exception:
             log.exception("Weekday cross-check failed for staff booking %s", user)
+        # Also in the diary on another day: usually the old booking of a move
+        # ("can I change from the 25th to the 18th?"). Saved anyway, as before -
+        # the reminder, the capacity count and the day guard all need the row -
+        # but the owner is told so the old one can go.
+        other = _other_booking_date(user, fields.get("date", ""))
+        also = (f"\n\n⚠️ They are also in the diary for {other}. If the day moved, "
+                "please cancel the old booking; if it's a second car or visit, ignore "
+                "this." if other else "")
         send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
                       f"{fields.get('name','')} — {fields.get('car','')} "
                       f"{fields.get('reg','')}\n{fields.get('need','')}\n"
                       f"Date: {fields.get('date','')} (9-11am)\n"
                       "It's in the diary and calendar; the reminder will go out "
-                      "automatically." + two_ways)
+                      "automatically." + two_ways + also)
         log.info("Staff-agreed booking logged for %s on %s", user, fields.get("date"))
     except Exception:
         log.exception("watch_staff_booking failed for %s", user)
@@ -3682,7 +3756,8 @@ _OFFER_HINT_RE = re.compile(
     r"bring it up on|drop (?:it|the car) (?:in|up|off) on|"
     r"would that (?:suit|work)|does that (?:suit|work)|would .{0,25} suit you|"
     r"we (?:have|do have) (?:space|room|a slot|availability)|we could take|"
-    r"i can offer|i could offer|shall i (?:book|put)|how about|what about",
+    r"i can offer|i could offer|shall i (?:book|put)|how about|what about|"
+    r"could we do|can we do|we could do",
     re.IGNORECASE)
 
 def _recent_customer_words(user: str, limit: int = 4) -> str:
@@ -3720,7 +3795,13 @@ def _guess_lang_code(text: str) -> str:
         return "ru"
     if re.search(r"[ăâîșț]|\b(?:sunt|pentru|mașina|programare)\b", t, re.I):
         return "ro"
-    if re.search(r"[ąčęėįšųūž]", t, re.I):
+    # Polish shares ą and ę with Lithuanian; there is no Polish message, so
+    # English is better than the wrong language.
+    if re.search(r"[łśźżćń]|\b(?:dzień|dobry|pasuje|możemy|samochód|dziękuję|proszę)\b",
+                 t, re.I):
+        return "en"
+    if re.search(r"[ąčęėįšųūž]|\b(?:puiku|tinka|tiktų|tiktu|sveiki|dieną|jums|jūsų|galime)\b",
+                 t, re.I):
         return "lt"
     return "en"
 
@@ -4359,6 +4440,202 @@ _BOOKINGISH_RE = re.compile(
     re.IGNORECASE)
 _SENTENCE_ENDS = ".!?" + chr(10)
 
+# Dates the way the bot writes them in other languages. The model copies the
+# English calendar ("29 September") but drops the English weekday, and in Russian
+# it declines the month ("25 сентября"). Index = month number - 1.
+_MONTH_WORDS = {w: i for i, w in enumerate(m.lower() for m in _MONTHS)}
+for _names in (("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                "сентября", "октября", "ноября", "декабря"),
+               # Romanian May is left out: "mai" is also "more / still".
+               ("ianuarie", "februarie", "martie", "aprilie", "", "iunie", "iulie",
+                "august", "septembrie", "octombrie", "noiembrie", "decembrie"),
+               ("stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca",
+                "sierpnia", "września", "października", "listopada", "grudnia")):
+    _MONTH_WORDS.update({w: i for i, w in enumerate(_names) if w})
+# Lithuanian puts the month first: "rugsėjo 29" (d.).
+_LT_MONTH_WORDS = {w: i for i, w in enumerate((
+    "sausio", "vasario", "kovo", "balandžio", "gegužės", "birželio", "liepos",
+    "rugpjūčio", "rugsėjo", "spalio", "lapkričio", "gruodžio"))}
+_DATE_ONLY_RE = re.compile(
+    r"\b(?P<day>\d{1,2})\.?\s+(?P<mon>"
+    + "|".join(sorted(_MONTH_WORDS, key=len, reverse=True)) + r")(?!\w)"
+    r"|\b(?P<ltmon>" + "|".join(_LT_MONTH_WORDS) + r")\s+(?P<ltday>\d{1,2})\b",
+    re.IGNORECASE)
+# Offer words in the languages the bot answers in (the English ones are
+# _BOOKINGISH_RE and _OFFER_HINT_RE). Giedrius, 24 Sep: "gal tinka antradienis,
+# 29 September?" - "does Tuesday suit?" - was not recognised as an offer at all.
+_FOREIGN_OFFER_RE = re.compile(
+    r"запис|запиш|заброни|подойд|подход|удобн|предлож|предлаг|свобод|привез|приезж|как\s+насч"
+    r"|tinka|tiktų|tiktu|registruo|užregistr|atvež|atvažiuo|laisv|siūl|galime"
+    r"|convine|potriv|programa|programez|programăm|aduce|liber|oferi|putem"
+    r"|pasuj|odpowiad|zapis|umówi|przywie|woln|możemy|proponuj",
+    re.IGNORECASE)
+# A day the reply turns DOWN is not an offer. 24 Sep 2026: "Wednesday 30 September
+# is fully booked, but I can book you in for Monday 05 October" was read as an
+# offer of Wednesday and the whole reply was swapped for "that day is already
+# fully booked - the nearest day is Monday 05 October". The customer said yes to
+# the 5th, got the same line again, and went elsewhere.
+_CLAUSE_BREAK_RE = re.compile(
+    r"[,;:()\u2014\u2013]|\s-\s|\b(?:but|however|though|although|whereas)\b",
+    re.IGNORECASE)
+_REFUSED_AFTER_RE = re.compile(
+    r"^\s*(?:is|are|'s|\u2019s|was|has\s+been|have\s+been)\s+"
+    r"(?:(?:now|already|unfortunately|sadly|completely|also|all|currently|still)\s+)*(?:fully\s+)?"
+    r"(?:booked(?:\s+(?:up|out))?|full|taken|gone|closed|unavailable|"
+    r"not\s+(?:available|free|possible|an\s+option))\b"
+    r"|^\s*(?:won.?t|will\s+not|doesn.?t|does\s+not|isn.?t|is\s+not|can.?t|cannot)\s+"
+    r"(?:work|be\s+possible|possible|available|free|suit|be\s+done|happen)\b",
+    re.IGNORECASE)
+_REFUSED_BEFORE_RE = re.compile(
+    r"(?:fully\s+booked|booked\s+(?:up|out)|(?:we.?re|we\s+are|are|is)\s+full"
+    r"|no\s+(?:more\s+)?(?:space|spaces|room|slots?|availability|appointments?)"
+    r"|don.?t\s+have\s+(?:any\s+)?(?:space|room|slots?|availability)"
+    r"|nothing\s+(?:free|left|available)"
+    r"|(?:can.?t|cannot|unable\s+to)\s+(?:do|fit\s+(?:you|it|the\s+car|the\s+van)\s+in|take|offer)"
+    r"|not\s+available|unavailable|instead\s+of|rather\s+than|apart\s+from|except(?:\s+for)?"
+    r"|other\s+than|closed)"
+    r"(?:\s+\S+){0,4}?\s*$",
+    re.IGNORECASE)
+_FIRST_FREE_RE = re.compile(
+    r"\b(?:until|till|from|after|before|next\s+free(?:\s+day)?(?:\s+is)?|earliest(?:\s+free)?"
+    r"(?:\s+day)?(?:\s+is)?|first\s+free(?:\s+day)?(?:\s+is)?)\s*$", re.IGNORECASE)
+# Joins in a list of days: "Monday 28 September, Tuesday 29 September and
+# Wednesday 30 September are fully booked" - the refusal after the list belongs to
+# every day in it (Jake, 23 Sep).
+_LIST_JOIN_RE = re.compile(
+    r"\s*(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or|и|или|și|sau|ir|arba|i|lub)\s+|\s*&\s*)",
+    re.IGNORECASE)
+# A weekday word in the languages the bot answers in - the only word allowed
+# before a bare date in a list ("и вторник 29 сентября").
+_WEEKDAY_WORD = (
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|понедельник\w*|вторник\w*|сред[ауы]|четверг\w*|пятниц\w*|суббот\w*|воскресен\w*"
+    r"|luni|marți|marti|miercuri|joi|vineri|sâmbătă|sambata|duminică|duminica"
+    r"|pirmadien\w*|antradien\w*|trečiadien\w*|treciadien\w*|ketvirtadien\w*"
+    r"|penktadien\w*|šeštadien\w*|sestadien\w*|sekmadien\w*"
+    r"|poniedział\w*|wtor\w*|środ\w*|srod\w*|czwart\w*|piąt\w*|piat\w*|sobot\w*|niedziel\w*)")
+# A foreign date about collecting the car or a part arriving is not an offer.
+# Whole words only: "привоза машины", "детальной", "ajungeți" are ordinary words.
+_NOT_AN_OFFER_FOREIGN_RE = re.compile(
+    r"\bзабир\w*|\bзабрат\w*|\bза\s+машин\w*|\bбудет\s+готов\w*|\bзапчаст\w*"
+    r"|\bдетал(?:ь|и|ей|ью)\b"
+    r"|\bcolect\w*|\bridic\w*|\beste\s+gata\b|\bva\s+fi\s+gata\b|\bpies[ae]\b"
+    r"|\batsiimt\w*|\bparuošt\w*|\bdetal[eė]s?\b|\batkeliaus\b"
+    r"|\bodebra\w*|\bbędzie\s+gotow\w*|\bczęść\b|\bczęści\b|\bdotrze\b",
+    re.IGNORECASE)
+_ADVERSATIVE_RE = re.compile(
+    r"\b(?:but|however|но|однако|dar|însă|insa|bet|tačiau|taciau|ale|lecz)\b", re.IGNORECASE)
+_REFUSED_FOREIGN_RE = re.compile(
+    r"занят|нет\s+(?:свободных\s+)?мест|мест\s+(?:уже\s+)?нет|не\s+(?:можем|получится)"
+    r"|не\s+(?:подход|подойд|удобн|сможе)|netink|netikt|nu\s+(?:vă\s+|va\s+|îți\s+|iti\s+)?"
+    r"(?:convine|merge|potrivește)|nie\s+(?:pasuje|odpowiada)"
+    r"|užimt|nėra\s+(?:laisvų\s+)?viet|vietų\s+nebėra|negalime"
+    r"|ocupat|nu\s+mai\s+(?:sunt|avem)|nu\s+avem\s+loc|nu\s+putem"
+    r"|zajęt|brak\s+(?:wolnych\s+)?miejsc|nie\s+możemy",
+    re.IGNORECASE)
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> tuple:
+    lo = max([text.rfind(c, 0, start) for c in _SENTENCE_ENDS] + [-1]) + 1
+    hi = min([h for h in (text.find(c, end) for c in _SENTENCE_ENDS) if h != -1]
+             + [len(text)])
+    return lo, hi
+
+
+def _skip_listed_days(after: str) -> str:
+    """The text after a day, with any further days of the same list skipped:
+    "..., Tuesday 29 September and Wednesday 30 September are fully booked" ->
+    " are fully booked". A weekday word before a foreign date is allowed
+    ("и вторник 29 сентября")."""
+    while True:
+        j = _LIST_JOIN_RE.match(after)
+        if not j:
+            return after
+        rest = after[j.end():]
+        d = _DAY_MENTION_RE.match(rest)
+        if not d:
+            d = _DATE_ONLY_RE.search(rest[:40])
+            if not d or not re.fullmatch(r"\s*(?:" + _WEEKDAY_WORD + r",?\s*)?",
+                                         rest[:d.start()], re.IGNORECASE):
+                return after
+        after = rest[d.end():]
+
+
+def _refused_day(text: str, start: int, end: int) -> bool:
+    """Does the reply turn this day DOWN ("... is fully booked", "we can't do ...",
+    "instead of ...") rather than offer it? English is judged on the clause the
+    day sits in; the other languages on the part of the sentence up to a "but",
+    because they put commas round the day itself ("пятницу 25 сентября, места
+    уже заняты"). Only what is said about THIS day counts: not the refusal of an
+    earlier day in the same clause, and not past an offer phrase ("Friday 25
+    September is full so how about Wednesday 30 September?")."""
+    lo, hi = _sentence_bounds(text, start, end)
+    before, after = text[lo:start], _skip_listed_days(text[end:hi])
+    cut = [m.end() for m in _CLAUSE_BREAK_RE.finditer(before)]
+    clause_before = before[cut[-1]:] if cut else before
+    cut = [m.end() for rx in (_DAY_MENTION_RE, _DATE_ONLY_RE, _OFFER_HINT_RE)
+           for m in rx.finditer(clause_before)]
+    if cut:
+        clause_before = clause_before[max(cut):]
+    m = _CLAUSE_BREAK_RE.search(after)
+    clause_after = after[:m.start()] if m else after
+    if _FIRST_FREE_RE.search(clause_before):
+        return False  # "fully booked until Monday 05 October" OFFERS the 5th
+    if _REFUSED_AFTER_RE.search(clause_after) or _REFUSED_BEFORE_RE.search(clause_before):
+        return True
+    cut = [m.end() for m in _ADVERSATIVE_RE.finditer(before)]
+    part_before = before[cut[-1]:] if cut else before
+    # Cut at an earlier day, or at an offer word ("мест нет, поэтому предлагаю
+    # вторник") - but NOT at an offer word inside or right after a refusal: "нет
+    # СВОБОДных мест", "не можем ЗАПИСать", "neGALIME", "brak WOLNych miejsc".
+    refs = [(r.start(), r.end()) for r in _REFUSED_FOREIGN_RE.finditer(part_before)]
+    cut = [m.end() for rx in (_DAY_MENTION_RE, _DATE_ONLY_RE) for m in rx.finditer(part_before)]
+    cut += [m.end() for m in _FOREIGN_OFFER_RE.finditer(part_before)
+            if not any(s - 2 <= m.start() <= e + 25
+                       and not re.search(r"[,;:\u2014\u2013]", part_before[e:m.start()])
+                       for s, e in refs)]
+    if cut:
+        part_before = part_before[max(cut):]
+    m = _ADVERSATIVE_RE.search(after)
+    part_after = after[:m.start()] if m else after
+    nxt = [m.start() for rx in (_DAY_MENTION_RE, _DATE_ONLY_RE) for m in rx.finditer(part_after)]
+    if nxt:
+        part_after = part_after[:min(nxt)]
+    return bool(_REFUSED_FOREIGN_RE.search(part_before + " " + part_after))
+
+
+def _offered_days(text: str) -> list:
+    """Every day the reply OFFERS, in order: (day, month index, match). A day the
+    reply turns down is left out. An English "Weekday DD Month" counts inside a
+    booking-ish sentence, as before; any date also counts inside a sentence with an
+    offer word in the customer's language. A question alone does not make an offer:
+    "Is your NCT on Thursday 01 October?" is not one."""
+    found, taken = [], []
+    for rx in (_DAY_MENTION_RE, _DATE_ONLY_RE):
+        for m in rx.finditer(text):
+            if any(m.start() < e and s < m.end() for s, e in taken):
+                continue  # "Tuesday 29 September" is one day, not two
+            taken.append((m.start(), m.end()))
+            lo, hi = _sentence_bounds(text, m.start(), m.end())
+            sentence = text[lo:hi]
+            english_day = rx is _DAY_MENTION_RE
+            if not english_day and _NOT_AN_OFFER_FOREIGN_RE.search(sentence):
+                continue  # "приезжайте за машиной 25 сентября", "piesa ajunge ..."
+            if not ((english_day and (_BOOKINGISH_RE.search(sentence)
+                                      or _OFFER_HINT_RE.search(sentence)))
+                    or _FOREIGN_OFFER_RE.search(sentence)):
+                continue
+            if _refused_day(text, m.start(), m.end()):
+                continue
+            if m.groupdict().get("ltmon"):
+                day, mon = int(m.group("ltday")), _LT_MONTH_WORDS[m.group("ltmon").lower()]
+            else:
+                day, mon = int(m.group("day")), _MONTH_WORDS[m.group("mon").lower()]
+            if 1 <= day <= 31:
+                found.append((m.start(), day, mon, m))
+    return [(d, mo, m) for _pos, d, mo, m in sorted(found, key=lambda t: t[0])]
+
+
 def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
     """If a reply offers a day this job cannot actually have, swap in the honest
     message instead. Shared by the live reply path and the ?action=askbot dry run,
@@ -4377,24 +4654,19 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
             return answer
         prop = _PROPOSAL_RE.search(text)
         conversational = False
-        if not prop:
-            for m in _DAY_MENTION_RE.finditer(text):
-                lo = max([text.rfind(c, 0, m.start()) for c in _SENTENCE_ENDS] + [-1])
-                hi = min([h for h in (text.find(c, m.end()) for c in _SENTENCE_ENDS)
-                          if h != -1] + [len(text)])
-                # BOTH patterns. _OFFER_HINT_RE was written for this and then
-                # never referenced, so "we have space that day", "how about" and
-                # "would that suit" went straight through the guard.
-                sentence = text[lo + 1:hi]
-                if _BOOKINGISH_RE.search(sentence) or _OFFER_HINT_RE.search(sentence):
-                    prop, conversational = m, True
-                    break
-        if not prop:
-            return answer
-        day_num = int(prop.group("day"))
-        month_name = prop.group("mon").capitalize()
+        if prop:
+            day_num = int(prop.group("day"))
+            month_idx = _MONTHS.index(prop.group("mon").capitalize())
+        else:
+            # The first day the reply OFFERS - a day it turns down is skipped, and
+            # dates in the customer's language count (see _offered_days).
+            offered = _offered_days(text)
+            if not offered:
+                return answer
+            day_num, month_idx, prop = offered[0]
+            conversational = True
         today = now_local().date()
-        pd = date(today.year, _MONTHS.index(month_name) + 1, day_num)
+        pd = date(today.year, month_idx + 1, day_num)
         if pd < today - timedelta(days=30):
             pd = pd.replace(year=pd.year + 1)
         need = "" if conversational else (prop.group("need") or "")
@@ -7393,6 +7665,8 @@ READ_ONLY_ACTIONS.add("weekdaytest")
 READ_ONLY_ACTIONS.add("sigwatch")
 # Reads nothing but the words you hand it: no customer, no sending, no alert.
 READ_ONLY_ACTIONS.add("promisetest")
+# Which commit is serving - the deploy probe. Reads nothing else.
+READ_ONLY_ACTIONS.add("version")
 
 
 def review_link_token() -> str:
@@ -8840,6 +9114,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "body": exc.response.text[:600], "model": model}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400], "model": model}
+    if action == "version":
+        # Read-only: which commit this build was deployed from (Railway sets it on
+        # every GitHub deploy), so a deploy can be confirmed by comparing it with
+        # the commit that was pushed.
+        return {"commit": (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:12]}
     if action == "promisetest":
         # Read-only. Would this reply raise the "promised a person" alert?
         # need = <the bot's reply>||<the customer's message it answered>.
