@@ -1650,6 +1650,13 @@ def process_handover(answer: str):
         if "=" in part:
             key, value = part.split("=", 1)
             fields[key.strip().lower()] = value.strip()
+    # A marker with no "key=value" at all - <<<HANDOVER|WANTS SOONER - needs it
+    # Friday>>> - used to come back as {}, which is falsy, so no alert was raised;
+    # and because {} is not None the backstop was skipped as well. The customer had
+    # been told a person would help and nobody knew. Its own text is the reason.
+    if not fields:
+        fields = {"reason": (m.group(1) or "").strip()[:300]
+                  or "the bot handed this over without saying why"}
     return clean, fields
 
 # Phrases that TELL THE CUSTOMER a person has been told. If a reply contains one
@@ -1663,6 +1670,134 @@ _CLAIMS_A_PERSON_RE = re.compile(
     r"|a colleague will (?:come back|be in touch|reply|call|ring)|someone will (?:come back|call|ring|be in touch)"
     r"|they.ll (?:come back|be in touch|call you|ring you)|will (?:come|get) back to you",
     re.IGNORECASE)
+
+# ...and the promises the list above never caught. Measured on every real bot
+# reply (23 Sep 2026): that list caught 120 garage and 44 headlights promises and
+# missed 47 and 16 more. "I'll pass that straight to the team so someone can come
+# back to you" (a billing complaint). "The manager will personally look into
+# this" (a complaint about our work, three times). "Let me check with a colleague
+# and come back to you" (the headlights bot has no rewrite that turns this into a
+# caught phrase). And every non-English promise: "Un coleg va va suna" raised
+# nothing, twice, for a customer asking to be rung.
+#
+# Each phrase needs the promise itself, not just the words around it, so the
+# everyday lines stay quiet: "we'll call you when it's ready", "pass your keys to
+# reception", "someone from the team will meet you", "let me check the diary".
+#
+# These only count when the customer actually said something. After a plain
+# "thanks" or a thumbs-up the bot often signs off with "I'll get back to you as
+# soon as I hear", and a fresh alert on every thank-you is exactly the noise we
+# are trying to remove. On a thank-you turn only the list above counts, so those
+# turns behave exactly as before.
+# "…will call you" counts, "…will call you when it's ready" does not.
+_PERSON_WILL_ACT = (r"(?:come back|get back|be (?:right )?back|(?:call|ring)(?! you (?:when|once)\b)"
+                    r"|contact|be in touch|look into|go through|reply)")
+_CLAIMS_A_PERSON_MORE_RE = re.compile(
+    r"(?:\bi|\bwe|someone|they|the team|a colleague).(?:ll|will) (?:come|get) back to you"
+    r"|(?:\bi|\bwe).ll (?:call|ring) you(?! (?:when|once)\b)(?! as soon as (?:it|the car|your))"
+    r"|(?:\bi.ll|\bi will|\blet me|\bi.m|\bwe.ll|\bwe will) (?:just |now |also )?"
+    r"pass(?:ing)? (?:this|that|it|these|your (?:message|details|question|query|request"
+    r"|enquiry|complaint|feedback|comments?)) (?:on|to|straight|along|over)"
+    r"|\bcan (?:come|get) back to you"
+    r"|\bsomeone (?:can|(?:from|in|on) (?:the|our) team (?:will|can))(?: \w+){0,2}? "
+    + _PERSON_WILL_ACT +
+    r"|\bone of (?:the|our) (?:team|lads|mechanics) (?:will|can)(?: \w+){0,2}? "
+    + _PERSON_WILL_ACT +
+    r"|\bthe (?:manager|owner|boss) will(?: \w+){0,2}? (?:review|check|"
+    + _PERSON_WILL_ACT + r")"
+    r"|\b(?:let me|i.ll|i will) (?:just )?check (?:that |this |it )?with"
+    r"|\bun coleg|\bv[aă] va (?:suna|contacta|raspunde|răspunde)"
+    r"|коллег"
+    r"|свяж[её]тся"
+    r"|перезвон"
+    r"|передал"
+    r"|ответ(?:ит|ят) вам"
+    r"|\bkolega|skontaktuje si[eę]|oddzwoni|przekaza[lł]em"
+    r"|susisieks|perskambins|perdavia",
+    re.IGNORECASE)
+
+# A message that is ONLY a thank-you, an ok or a thumbs-up. Deliberately strict:
+# "👍what price", "ok?", "thanks but the light is still on", "perfect, see you
+# tuesday" and "its ok, not your fault" are all real messages, not thank-yous.
+_ACK_EMOJI = ("\U0001F44D\U0001F44C\U0001F64F\U0001F60A\U0001F642\U0001F600☺❤"
+              "\U0001F499\U0001F49A\U0001F49B\U0001F44F\U0001F4AF✅\U0001F3FB-\U0001F3FF")
+_ACK_EMOJI_ONLY_RE = re.compile("^[\\s" + _ACK_EMOJI + "]+$")
+_ACK_EMOJI_STRIP_RE = re.compile("[" + _ACK_EMOJI + "]")
+_PURE_ACK_RE = re.compile(
+    r"^(?:ok(?:ay|ey)?|k|kk|thanks?(?: you| u)?(?: so much| very much| a million)?|thx|ty"
+    r"|cheers|grand|perfect|sound|lovely|great|brilliant|no (?:problem|worries|bother)"
+    r"|np|cool|nice|super|fab|fair enough|will do|got it|noted|sure)"
+    r"(?:[\s,.!]+(?:ok(?:ay)?|thanks?(?: you| u)?|thx|cheers|grand|perfect|great"
+    r"|no (?:problem|worries)))*[\s.!]*$",
+    re.IGNORECASE)
+
+
+# Customers whose reply is being written by handle_unreadable_message while its
+# own "📎 sent something the bot can't open" alert is certain to follow. A promise
+# in that reply would be a second alert for one video ("Un coleg va arunca o
+# privire...", 19 Sep). Registered only when the 📎 alert WILL fire - not while a
+# colleague holds the chat, not for the owner, a blocked or a paused number.
+_ATTACHMENT_ALERT_FOLLOWS: set = set()
+
+
+def is_pure_ack(text: str) -> bool:
+    """True when a customer message is only a thank-you, an ok or a thumbs-up."""
+    t = (text or "").strip()
+    if not t or len(t) > 25 or "?" in t or any(c.isdigit() for c in t):
+        return False
+    if _ACK_EMOJI_ONLY_RE.match(t):
+        return True
+    words = _ACK_EMOJI_STRIP_RE.sub("", t).strip()
+    return bool(words) and bool(_PURE_ACK_RE.match(words))
+
+
+def turn_already_alerted(user: str) -> bool:
+    """True if another alert already covers this customer's latest message, so a
+    promise in the reply would only be a second alert for the same thing:
+      * the 📎 alert for a video or document is about to follow this reply; or
+      * an OPEN alert was raised after their latest message, in the last two
+        minutes - the unhappy check just before the colleague-path reply, or a
+        cut-off marker, invented inspection or unhappy review just before the
+        backstop.
+    Only THIS turn. An alert from the customer's previous message does not count:
+    folding a second request into it hid that request from the alert, and the
+    chase, which reads the newer message as the bot having moved on, never ran."""
+    if user in _ATTACHMENT_ALERT_FOLLOWS:
+        return True
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts, COALESCE(closed_ts, 0) FROM alerts WHERE wa_user = ?",
+                               (user,)).fetchone()
+            if (not row or (row[1] or 0) >= (row[0] or 0)
+                    or time.time() - (row[0] or 0) >= 120):
+                return False
+            last = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                                (user,)).fetchone()
+    except Exception:
+        return False  # unsure -> let the promise alert
+    return (row[0] or 0) >= ((last[0] if last else 0) or 0)
+
+
+def new_phrases_count_after(customer_text: str) -> bool:
+    """The newer promise phrases count only after a real message, not a bare
+    thank-you or thumbs-up."""
+    return not is_pure_ack(customer_text)
+
+
+def claims_a_person(reply: str, user: str) -> bool:
+    """Does this reply tell the customer that a person will come back to them?
+
+    The original phrases count on every turn, exactly as before. The newer ones
+    count only when the customer's last message was more than a thank-you. That
+    message is read only once a newer phrase has matched, so an ordinary reply
+    costs no extra database read; if the read fails, it counts as a real message
+    and the alert is raised."""
+    if _CLAIMS_A_PERSON_RE.search(reply or ""):
+        return True
+    if not _CLAIMS_A_PERSON_MORE_RE.search(reply or ""):
+        return False
+    return new_phrases_count_after(_recent_customer_words(user, 1))
+
 
 def notify_owner_handover(number: str, fields: dict) -> None:
     """Ping the owner when the bot defers something to a human, so they can follow up."""
@@ -2727,14 +2862,21 @@ def bot_enabled() -> bool:
     """Master switch. Owner can text 'bot off' to silence it everywhere, instantly."""
     return get_setting("bot_enabled", "1") != "0"
 
-def conversation_excerpt(user: str, limit: int = 6) -> str:
-    """The last few messages of a chat, short enough to read on a phone."""
+def conversation_excerpt(user: str, limit: int = 6, mark_after: float = 0.0) -> str:
+    """The last few messages of a chat, short enough to read on a phone.
+
+    With mark_after, EXCERPT_DIVIDER goes in front of the first message newer than
+    that moment (at the very top if every message shown is newer, and nowhere if
+    none is)."""
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT role, content FROM messages WHERE wa_user = ? ORDER BY id DESC LIMIT ?",
+            "SELECT role, content, ts FROM messages WHERE wa_user = ? ORDER BY id DESC LIMIT ?",
             (user, limit)).fetchall()
-    lines = []
-    for role, content in reversed(rows):
+    lines, marked = [], not mark_after
+    for role, content, ts in reversed(rows):
+        if not marked and (ts or 0) > mark_after:
+            lines.append(EXCERPT_DIVIDER)
+            marked = True
         who = {"assistant": "Bot", "staff": "Your team"}.get(role, "Customer")
         text = " ".join((content or "").split())
         if len(text) > 160:
@@ -2868,10 +3010,33 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
                 (user, alert_ts, headline, keep_claim[0], keep_claim[1]))
 
 def alerted_recently(user: str) -> bool:
-    """True if we already warned the owner about this chat lately."""
+    """True if the unhappy check should stay quiet: we warned the owner about this
+    chat lately and either nobody has dealt with it yet, or it WAS the unhappy
+    warning. Every staff reply closes an alert, so re-arming on a closed unhappy
+    alert re-read the same dispute and alerted again after every round of it (the
+    22 Sep missing-bolts chat: 1 alert became 4 in 45 minutes)."""
     with closing(db()) as conn:
-        row = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
-    return bool(row) and (time.time() - (row[0] or 0)) < ALERT_COOLDOWN_HOURS * 3600
+        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, '')"
+                           " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    if not row or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600:
+        return False
+    if (row[1] or 0) < (row[0] or 0):
+        return True  # still open
+    # Dealt with. Some OTHER alert (a hand-over, say) being closed used to mute the
+    # check for six hours, so a customer who turned unhappy an hour later was never
+    # flagged. Now it runs - on what they said since (alert_dealt_with_at).
+    return row[2] == ESCALATION_HEADLINE
+
+def alert_dealt_with_at(user: str) -> float:
+    """When a colleague dealt with this chat's last alert, if that alert was not
+    the unhappy one and is still within the cooldown; otherwise 0."""
+    with closing(db()) as conn:
+        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, '')"
+                           " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    if (not row or (row[1] or 0) < (row[0] or 0) or row[2] == ESCALATION_HEADLINE
+            or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600):
+        return 0.0
+    return float(row[1])
 
 ESCALATION_SYSTEM = (
     "You are quietly monitoring a WhatsApp conversation between a car garage and a "
@@ -2879,17 +3044,37 @@ ESCALATION_SYSTEM = (
     "the customer is clearly unhappy, angry, complaining, disputing a price or the work, "
     "threatening to leave a bad review or go elsewhere, or if there is an argument or "
     "tense situation between the customer and our staff. Do NOT alert for normal "
-    "questions, bookings, or mild impatience. Answer with EXACTLY one line: either 'NO' "
-    "or 'YES: <reason, max 12 words>'."
+    "questions, bookings, or mild impatience. ALSO alert, even if they say it politely, "
+    "when the customer reports that something we worked on is still not right, or that a "
+    "problem appeared within days of collecting from us - answer 'YES: COMEBACK - <what "
+    "went wrong>'. Asking to book a different, unrelated job is NOT a comeback. Answer "
+    "with EXACTLY one line: either 'NO' or 'YES: <reason, max 12 words>'."
+)
+
+ESCALATION_HEADLINE = "⚠️ Customer may be unhappy"
+EXCERPT_DIVIDER = "--- a colleague dealt with an earlier alert here; only what follows is new ---"
+# Added when a colleague has already dealt with an earlier alert about this chat,
+# so the complaint that alert was about is not flagged a second time.
+ESCALATION_SINCE_NOTE = (
+    " A line starting '--- a colleague dealt with' marks where our team already dealt "
+    "with an earlier alert about this chat. Judge ONLY the customer's messages after that "
+    "line: answer YES only if they raise something NEW, or are clearly angrier than "
+    "before. The same issue simply carrying on while our team replies is NO. Answer with "
+    "EXACTLY one line: either 'NO' or 'YES: <reason, max 12 words>'."
 )
 
 def check_escalation(user: str) -> None:
     """Watch a chat a colleague is handling and warn the owner if it turns sour."""
     if not OWNER_WHATSAPP or alerted_recently(user):
         return
-    excerpt = conversation_excerpt(user, 8)
+    # After a colleague dealt with an earlier alert, the model judges only what the
+    # customer said since - otherwise that alert's complaint is flagged again.
+    dealt = alert_dealt_with_at(user)
+    excerpt = conversation_excerpt(user, 8, mark_after=dealt)
     if not excerpt:
         return
+    if dealt and EXCERPT_DIVIDER not in excerpt:
+        return  # nothing has been said since a colleague dealt with it
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -2897,7 +3082,7 @@ def check_escalation(user: str) -> None:
                      "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
             json={"model": ANTHROPIC_MODEL, "max_tokens": 40,
-                  "system": ESCALATION_SYSTEM,
+                  "system": ESCALATION_SYSTEM + (ESCALATION_SINCE_NOTE if dealt else ""),
                   "messages": [{"role": "user", "content": excerpt}]},
             timeout=20,
         )
@@ -2909,7 +3094,7 @@ def check_escalation(user: str) -> None:
     if verdict.upper().startswith("YES"):
         reason = verdict.split(":", 1)[1].strip() if ":" in verdict else ""
         log.info("Escalation detected for %s: %s", user, reason)
-        alert_owner(user, "⚠️ Customer may be unhappy", reason)
+        alert_owner(user, ESCALATION_HEADLINE, reason)
 
 def mark_human_reply(user: str) -> None:
     """A colleague answered this customer from the WhatsApp Business app."""
@@ -3040,7 +3225,7 @@ def _maybe_courtesy_close(user: str) -> None:
     if _FABRICATED_LOOK_RE.search(reply):
         alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
                     "Sent while a colleague was handling the chat - please correct it.")
-    if _CLAIMS_A_PERSON_RE.search(reply):
+    if claims_a_person(reply, user) and not turn_already_alerted(user):
         notify_owner_handover(user, {"reason": "the bot told this customer that a "
                                                "person would come back to them"})
     send_whatsapp(user, reply)
@@ -4610,7 +4795,8 @@ def _finish_reply(user: str, answer: str) -> str:
     # in touch") when the model is no longer emitting one.
     if (handover is None and job is None and not is_owner
             and not job_enquiry_recent(user)
-            and _CLAIMS_A_PERSON_RE.search(answer or "")):
+            and claims_a_person(answer or "", user)
+            and not turn_already_alerted(user)):
         log.warning("Reply to %s promised a person with no HANDOVER marker — alerting anyway", user)
         try:
             notify_owner_handover(user, {"reason": "the bot told this customer that a "
@@ -7205,6 +7391,8 @@ READ_ONLY_ACTIONS.add("restorealert")
 READ_ONLY_ACTIONS.add("weekdaytest")
 # Header names, counts and a verdict - never a secret or a signature value.
 READ_ONLY_ACTIONS.add("sigwatch")
+# Reads nothing but the words you hand it: no customer, no sending, no alert.
+READ_ONLY_ACTIONS.add("promisetest")
 
 
 def review_link_token() -> str:
@@ -8652,6 +8840,24 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "body": exc.response.text[:600], "model": model}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:400], "model": model}
+    if action == "promisetest":
+        # Read-only. Would this reply raise the "promised a person" alert?
+        # need = <the bot's reply>||<the customer's message it answered>.
+        # Nothing is saved, sent or alerted, and no conversation is read.
+        reply, _, cust = (need or "").partition("||")
+        reply, cust = reply.strip(), cust.strip()
+        old = _CLAIMS_A_PERSON_RE.search(reply)
+        more = _CLAIMS_A_PERSON_MORE_RE.search(reply)
+        counts = new_phrases_count_after(cust)
+        return {"reply": reply[:300], "customer": cust[:200],
+                "old_phrase": old.group(0) if old else "",
+                "new_phrase": more.group(0) if more else "",
+                "customer_message_lets_new_phrases_count": counts,
+                "would_alert": bool(old) or (bool(more) and counts),
+                "rule": "old phrases alert on every turn; new ones only after a real message "
+                        "(not a bare thank-you). Either way the live bot stays quiet when "
+                        "another alert already covers the same customer message (one raised "
+                        "since it arrived, or the 📎 alert for a video it cannot open)."}
     if action == "weekdaytest":
         # Read-only. What does the wrong-day check make of these words? Several
         # messages can be given separated by ||, NEWEST FIRST, as the walk sees
@@ -9714,7 +9920,17 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
                   "anything. Sound like a friendly person at the garage.]")
     note = (f"[Customer sent a {what}]" if real
             else "[Customer sent a sticker or reaction]")
-    handle_message(sender, prompt, arrived_on, transcript_note=note)
+    # The 📎 alert below fires for a real attachment unless it is the owner, or the
+    # number is blocked or paused, or a colleague holds the chat. When it will, the
+    # reply's own promise ("a colleague will look at it") must not alert as well.
+    alert_follows = (real and not (OWNER_WHATSAPP and sender == OWNER_WHATSAPP)
+                     and not (is_blocked(sender) or is_paused(sender) or human_handling(sender)))
+    if alert_follows:
+        _ATTACHMENT_ALERT_FOLLOWS.add(sender)
+    try:
+        handle_message(sender, prompt, arrived_on, transcript_note=note)
+    finally:
+        _ATTACHMENT_ALERT_FOLLOWS.discard(sender)
     if not real:
         return  # nothing to chase — no alert, or every sticker would ping the phones
     if OWNER_WHATSAPP and sender == OWNER_WHATSAPP:
