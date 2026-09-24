@@ -1629,7 +1629,7 @@ def notify_owner_feedback(fields: dict, user: str = "") -> None:
     detail = (f"Rating: {fields.get('rating', '?')} · {fields.get('name', '')}\n"
               f"Said: {fields.get('comment', '')}").strip()
     if user:
-        alert_owner(user, "⚠️ Unhappy customer", detail)
+        alert_owner(user, "⚠️ Unhappy customer", detail, kind="feedback")
         return
     # No chat to attach — still push it out on the channels that work.
     note = "⚠️ Unhappy customer\n\n" + detail
@@ -1803,7 +1803,7 @@ def notify_owner_handover(number: str, fields: dict) -> None:
     """Ping the owner when the bot defers something to a human, so they can follow up."""
     number = "".join(ch for ch in str(number) if ch.isdigit())
     alert_owner(number, "🙋 A customer needs you to follow up",
-                fields.get("reason", "a question the bot could not answer"))
+                fields.get("reason", "a question the bot could not answer"), kind="handover")
 
 # ---------------------------------------------------------------- storage
 def db() -> sqlite3.Connection:
@@ -1934,7 +1934,11 @@ def db() -> sqlite3.Connection:
     for ddl in ("claimed_by TEXT DEFAULT ''", "claimed_ts REAL DEFAULT 0",
                 "tg_msgs TEXT DEFAULT ''", "tg_text TEXT DEFAULT ''",
                 "headline TEXT DEFAULT ''", "escalated_ts REAL DEFAULT 0",
-                "owner_ts REAL DEFAULT 0", "closed_ts REAL DEFAULT 0"):
+                "owner_ts REAL DEFAULT 0", "closed_ts REAL DEFAULT 0",
+                # Stage 1b: what the alert is about - branch on these, never on
+                # the headline text. label is the customer label when raised.
+                "kind TEXT DEFAULT ''", "topic TEXT DEFAULT ''",
+                "category TEXT DEFAULT ''", "label TEXT DEFAULT ''"):
         try:
             conn.execute(f"ALTER TABLE alerts ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -1946,6 +1950,10 @@ def db() -> sqlite3.Connection:
                  " headline TEXT, claimed_by TEXT DEFAULT '', claimed_ts REAL DEFAULT 0,"
                  " closed_ts REAL DEFAULT 0, closed_by TEXT DEFAULT '',"
                  " owner_ts REAL DEFAULT 0)")
+    try:
+        conn.execute("ALTER TABLE claim_log ADD COLUMN kind TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # Tidy (2026-09-03): bookings stored with a phone like '0863891825',
     # '085 811 9977' or '+353…' never received their reminder / review texts.
     try:
@@ -2918,13 +2926,199 @@ def _post_alert_template(to: str, one_liner: str) -> tuple:
     log.info("Alert template -> %s: HTTP %s %s", to, r.status_code, body)
     return r.status_code, body
 
-def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = True) -> None:
+# ---------------------------------------------------------------- alert types
+# Every alert_owner call names its KIND. From Stage 1b nothing may branch on the
+# headline text - the headline now changes with what the alert is about - so the
+# later stages (hold, merge, "a booking closes it", the rolling list) read kind,
+# topic and category, which are stored on the alerts row.
+URGENT_KINDS = {"unhappy", "feedback", "review_unhappy", "cancel_failed", "cancel_error",
+                "fabricated", "crash"}
+URGENT_TOPICS = {"comeback", "price_dispute", "bill_dispute", "money", "complaint", "hot_lead"}
+# Which kinds count as routine (listed below the urgent ones) is the owner's call
+# and not decided yet; until then nothing is routine and everything that is not
+# urgent is "unclassified", which sorts WITH the urgent ones - never below them.
+ROUTINE_KINDS: set = set()
+# Kinds whose headline is typed from the reason and the customer's own words. The
+# others (a photo that would not download, a crash, a cancellation...) already say
+# exactly what happened.
+TYPED_KINDS = {"handover", "unhappy", "blank"}
+
+# The fixed prefixes the prompts put on a HANDOVER reason.
+_TOPIC_PREFIXES = (
+    ("wants sooner", "wants_sooner"), ("replacement car", "replacement_car"),
+    ("courtesy car", "replacement_car"), ("hot lead", "hot_lead"),
+    ("phone-booking reg correction", "reg_correction"), ("comeback", "comeback"),
+)
+# Otherwise the topic comes from the reason plus the customer's last two
+# messages. Deliberately narrow: a wrong "COMPLAINT" on a plain question misleads
+# the person who picks it up, so only unmistakable wording counts. Built from the
+# 78 real alerts of 21-24 Sep (customers type "thaught" and "taught", too).
+_TOPIC_WORDS = (
+    ("comeback", re.compile(
+        r"\bcomeback\b|\bstill (?:not (?:working|fixed|right|sorted)|the same (?:problem|issue|noise))"
+        r"|\b(?:not|never) (?:been )?fixed\b|\bdidn.?t (?:fix|sort)\b"
+        r"|\bsame (?:problem|issue|noise|fault) (?:again|as before)"
+        r"|\b(?:again|back on|came back) (?:after|since) (?:the|your|you|my) (?:service|repair|fix|work)"
+        r"|\b(?:after|since) (?:you|u|the lads) (?:serviced|fixed|repaired|did it|worked on)"
+        r"|\bafter (?:the|your) (?:service|repair)\b.{0,40}\b(?:on|again|still|light)"
+        r"|\bjust after being (?:fitted|repaired|fixed|serviced)\b"
+        r"|\b(?:collected|picked (?:it|the car|the van) up)\b.{0,80}\b(?:not working|isn.?t working"
+        r"|won.?t (?:work|start|turn on)|lights? (?:is |are )?(?:on|staying on)|warning light|leak|noise)",
+        re.IGNORECASE)),
+    ("price_dispute", re.compile(
+        r"\bth?[ao]ught (?:it|the (?:total|price|job|bill|cost))?.{0,20}"
+        r"(?:€\s?\d{2,4}|\d{2,4}\s?(?:€|euro|eur)\b)"
+        r"|\b(?:was told|you (?:said|told me|quoted)|quoted me)\b.{0,30}"
+        r"(?:€\s?\d{2,4}|\d{2,4}\s?(?:€|euro|eur)\b)[^.?!]{0,60}"
+        r"\b(?:but|now|instead|charg|invoice|bill|more|higher|extra)"
+        r"|\bmore than (?:you|the) (?:said|quoted|quote)\b|\bover ?charg"
+        r"|\b(?:serious|joking|kidding)\b.{0,40}\bprice\b"
+        r"|\bprice\b.{0,30}\b(?:too (?:much|high)|a joke|crazy|robbery)\b",
+        re.IGNORECASE)),
+    ("bill_dispute", re.compile(
+        r"\b(?:invoice|bill)\b.{0,40}\b(?:wrong|mistake|incorrect|discount)\b"
+        r"|\bshould (?:of|have) been told\b[^.?!]{0,60}\b(?:part|charg|cost|price|bill|invoice|fitted|replac)"
+        r"|\bdid ?n.?o?t (?:agree|authori[sz]e|consent|ask for)\b"
+        r"|\bnever (?:agreed|authori[sz]ed|asked for)\b|\bpromised (?:a|me a|us a) discount\b"
+        r"|\bcharged (?:me )?for (?:something|a part|work) .{0,30}\b(?:not|never|didn)",
+        re.IGNORECASE)),
+    ("money", re.compile(
+        r"\brefund\b|\bmoney back\b|\bcharged (?:me )?twice\b|\bdouble[- ]charg|\bpaid twice\b"
+        r"|\b(?:send|give) me (?:back )?(?:\d+|the) (?:euro|eur|€)|\brevolut me\b",
+        re.IGNORECASE)),
+    ("complaint", re.compile(
+        r"\bnot happy\b|\bunhappy\b|\bcomplain|\bdisgrace|\bridiculous\b|\billegal\b"
+        r"|\bunacceptable\b|\brip ?off\b|\bdisgust|\bnot good enough\b|\bbad review\b"
+        r"|\bvery disappoint|\bfurious\b|\bshocking (?:service|job)\b"
+        r"|\bdidn.?t expect\b.{0,40}\b(?:so long|this long|to wait|without)\b",
+        re.IGNORECASE)),
+)
+TOPIC_TITLES = {
+    "comeback": "🔁 COMEBACK", "price_dispute": "💶 PRICE DISPUTE",
+    "bill_dispute": "💶 BILL DISPUTE", "money": "💶 MONEY / REFUND",
+    "complaint": "😠 COMPLAINT", "wants_sooner": "⏩ WANTS SOONER",
+    "replacement_car": "🚗 REPLACEMENT CAR", "hot_lead": "🔥 HOT LEAD",
+    "reg_correction": "🔢 REG CORRECTION",
+}
+# Reasons that say nothing about THIS customer - the headline then quotes the
+# customer's own words instead.
+_GENERIC_REASON_RE = re.compile(
+    r"^(?:the bot told this customer that a person would come back to them"
+    r"|a question the bot could not answer|the bot handed this over without saying why"
+    r"|the bot's note was cut short|the bot could not produce an answer)",
+    re.IGNORECASE)
+# A message worth quoting says something: not a thank-you or a thumbs-up in any
+# language the customers write in, and not a placeholder for a sticker or a video.
+_THANKS_ONLY_RE = re.compile(
+    r"^\W*(?:ok(?:ay)?\W*)?(?:ок|окей|хорошо|харашо|ладно|mersi|mul[tț]umesc|multumesc|спасибо|благодарю|ačiū|aciu"
+    r"|dzi[eę]kuj[eę]|dzieki|thank(?:s| you)|cheers|grand)\b[\s,.!]*"
+    r"(?:(?:so|very) much|a million|a lot|mult|большое|labai|bardzo)?[\s,.!]*"
+    r"(?:(?:i |really )?appreciate (?:it|your help|that)|much appreciated|god bless(?: you)?"
+    r"|have a (?:good|nice|great|lovely) (?:day|evening|night|weekend))?[\s,.!👍🙏😊]*$",
+    re.IGNORECASE)
+
+
+def classify_alert(kind: str, reason: str, words: str) -> tuple:
+    """(topic, category) for an alert: the topic from the HANDOVER reason's fixed
+    prefix, else from unmistakable wording in the reason and the customer's last
+    two messages; the category from the kind and the topic."""
+    r = (reason or "").strip()
+    low = r.lower()
+    topic = ""
+    for prefix, name in _TOPIC_PREFIXES:
+        if low.startswith(prefix):
+            topic = name
+            break
+    if not topic:
+        text = f"{r} {words or ''}"
+        for name, rx in _TOPIC_WORDS:
+            if rx.search(text):
+                topic = name
+                break
+    if kind in URGENT_KINDS or topic in URGENT_TOPICS:
+        category = "urgent"
+    elif kind in ROUTINE_KINDS:
+        category = "routine"
+    else:
+        category = "unclassified"
+    return topic, category
+
+
+def quotable_words(messages: list) -> str:
+    """From the customer's latest messages (newest first), the newest one that
+    says something - an alert usually fires on the "Ok thanks" after the real
+    question (G02 "Ok" / "No update?"). Falls back to the newest."""
+    for m in messages:
+        t = " ".join((m or "").split())
+        if (t and not t.startswith("[Customer sent") and not is_pure_ack(t)
+                and not _THANKS_ONLY_RE.match(t)):
+            return t
+    return " ".join((messages[0] or "").split()) if messages else ""
+
+
+def _headline_detail(reason: str, last_words: str) -> str:
+    """What the headline says after the type: the reason with its fixed prefix
+    taken off, or - when the reason is one of the bot's generic ones - the
+    customer's own words, quoted."""
+    r = " ".join((reason or "").split())   # one line: it goes into the email subject
+    if r and not _GENERIC_REASON_RE.match(r):
+        for prefix, _name in _TOPIC_PREFIXES:
+            if r.lower().startswith(prefix):
+                r = r[len(prefix):].lstrip(" -—–:|")
+                break
+        return r[:80].rstrip() + ("…" if len(r) > 80 else "")
+    w = " ".join((last_words or "").split())
+    if not w:
+        return ""
+    return "“" + w[:80].rstrip() + ("…" if len(w) > 80 else "") + "”"
+
+
+def typed_headline(base: str, kind: str, topic: str, reason: str, last_words: str) -> str:
+    """The alert's first line, saying what it is about. Only the kinds in
+    TYPED_KINDS are typed; every alert keeps its Done button and full ladder."""
+    if kind not in TYPED_KINDS:
+        return base
+    detail = _headline_detail(reason, last_words)
+    if topic in TOPIC_TITLES:
+        return f"{TOPIC_TITLES[topic]} — {detail}" if detail else TOPIC_TITLES[topic]
+    if kind in ("handover", "blank"):
+        return f"🙋 FOLLOW UP — {detail}" if detail else base
+    if kind == "unhappy":
+        return f"⚠️ UNHAPPY — {detail}" if detail else base
+    return base
+
+
+def _last_customer_messages(user: str, limit: int = 4) -> list:
+    """The customer's own latest messages, newest first ([] if unreadable)."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
+                " ORDER BY id DESC LIMIT ?", (user, limit)).fetchall()
+        return [r[0] or "" for r in rows]
+    except Exception:
+        return []
+
+
+def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = True,
+                kind: str = "") -> None:
     """Send the owner (and manager, if set) a short note plus the conversation."""
     recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
     # No early return when there are no WhatsApp recipients — Telegram and email
     # below are the channels that actually reach the owner.
-    parts = [headline, f"From: {customer_label(user)}", f"Came in on: {line_label()}"]
+    # What is this alert about? The kind comes from the caller; the topic and the
+    # category from the reason and the customer's own words (Stage 1b). A failure
+    # here must never stop the alert itself.
+    label = customer_label(user)
+    topic, category = "", "unclassified"
+    try:
+        recent = _last_customer_messages(user, 4)
+        topic, category = classify_alert(kind, reason, " ".join(recent[:2]))
+        headline = typed_headline(headline, kind, topic, reason, quotable_words(recent))
+    except Exception:
+        log.exception("Could not type the alert for %s", user)
+    parts = [headline, f"From: {label}", f"Came in on: {line_label()}"]
     if reason:
         parts.append(f"What's wrong: {reason}")
     excerpt = conversation_excerpt(user)
@@ -2939,7 +3133,7 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
     body = "\n".join(parts)
     alert_targets = list(dict.fromkeys(
         [n for n in recipients] + ALERT_NUMBERS))  # owner/manager + any extra alert numbers
-    one_liner = f"{headline} — from {customer_label(user)}" + (f" ({reason})" if reason else "")
+    one_liner = f"{headline} — from {label}" + (f" ({reason})" if reason else "")
     # WhatsApp owner-alerts only work if this account can actually send them. Template
     # sends need a payment method on the WABA (error 131042) and free-form needs an
     # open 24h window (131047), so when Telegram is carrying alerts we skip WhatsApp
@@ -2996,18 +3190,26 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
         with closing(db()) as conn, conn:
             conn.execute(
                 "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
-                " headline, escalated_ts, owner_ts, closed_ts)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)"
+                " headline, escalated_ts, owner_ts, closed_ts, kind, topic, category, label)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)"
                 " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
                 " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
                 " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
-                " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0",
+                " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0,"
+                " kind = excluded.kind, topic = excluded.topic,"
+                " category = excluded.category, label = excluded.label",
                 (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
-                 tg_text, headline))
+                 tg_text, headline, kind, topic, category, label))
             conn.execute(
-                "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (user, alert_ts, headline, keep_claim[0], keep_claim[1]))
+                "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts, kind)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (user, alert_ts, headline, keep_claim[0], keep_claim[1], kind))
+
+def _is_unhappy_alert(headline: str, kind: str) -> bool:
+    """Was this the unhappy check's own alert? By kind from Stage 1b on - the
+    headline now carries the topic - and by the old headline for rows raised
+    before that, which have no kind."""
+    return kind == "unhappy" or (not kind and headline == ESCALATION_HEADLINE)
 
 def alerted_recently(user: str) -> bool:
     """True if the unhappy check should stay quiet: we warned the owner about this
@@ -3016,8 +3218,8 @@ def alerted_recently(user: str) -> bool:
     alert re-read the same dispute and alerted again after every round of it (the
     22 Sep missing-bolts chat: 1 alert became 4 in 45 minutes)."""
     with closing(db()) as conn:
-        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, '')"
-                           " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, ''),"
+                           " COALESCE(kind, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
     if not row or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600:
         return False
     if (row[1] or 0) < (row[0] or 0):
@@ -3025,15 +3227,15 @@ def alerted_recently(user: str) -> bool:
     # Dealt with. Some OTHER alert (a hand-over, say) being closed used to mute the
     # check for six hours, so a customer who turned unhappy an hour later was never
     # flagged. Now it runs - on what they said since (alert_dealt_with_at).
-    return row[2] == ESCALATION_HEADLINE
+    return _is_unhappy_alert(row[2], row[3])
 
 def alert_dealt_with_at(user: str) -> float:
     """When a colleague dealt with this chat's last alert, if that alert was not
     the unhappy one and is still within the cooldown; otherwise 0."""
     with closing(db()) as conn:
-        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, '')"
-                           " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
-    if (not row or (row[1] or 0) < (row[0] or 0) or row[2] == ESCALATION_HEADLINE
+        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, ''),"
+                           " COALESCE(kind, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    if (not row or (row[1] or 0) < (row[0] or 0) or _is_unhappy_alert(row[2], row[3])
             or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600):
         return 0.0
     return float(row[1])
@@ -3094,7 +3296,7 @@ def check_escalation(user: str) -> None:
     if verdict.upper().startswith("YES"):
         reason = verdict.split(":", 1)[1].strip() if ":" in verdict else ""
         log.info("Escalation detected for %s: %s", user, reason)
-        alert_owner(user, ESCALATION_HEADLINE, reason)
+        alert_owner(user, ESCALATION_HEADLINE, reason, kind="unhappy")
 
 def mark_human_reply(user: str) -> None:
     """A colleague answered this customer from the WhatsApp Business app."""
@@ -3220,11 +3422,11 @@ def _maybe_courtesy_close(user: str) -> None:
         log.warning("Assist reply for %s suppressed - it tried to confirm a booking: %r",
                     user, reply[:200])
         alert_owner(user, "🙋 The bot nearly confirmed a booking while you had this chat",
-                    "It was stopped before sending. Please confirm the day with them yourself.")
+                    "It was stopped before sending. Please confirm the day with them yourself.", kind="assist_booking")
         return
     if _FABRICATED_LOOK_RE.search(reply):
         alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
-                    "Sent while a colleague was handling the chat - please correct it.")
+                    "Sent while a colleague was handling the chat - please correct it.", kind="fabricated")
     if claims_a_person(reply, user) and not turn_already_alerted(user):
         notify_owner_handover(user, {"reason": "the bot told this customer that a "
                                                "person would come back to them"})
@@ -4731,7 +4933,7 @@ def _finish_reply(user: str, answer: str) -> str:
             try:
                 alert_owner(user, "🙋 A customer needs you to follow up",
                             "The bot's note was cut short — check the chat for what "
-                            "they asked.")
+                            "they asked.", kind="handover")
             except Exception:
                 log.exception("Failed to alert owner about truncated marker")
     answer = no_false_checking(after_hours_wording(answer))
@@ -4780,7 +4982,7 @@ def _finish_reply(user: str, answer: str) -> str:
                 alert_owner(user, "⏳ Customer wants a date we're not taking yet",
                             f"They asked for {booking.get('date', 'an earlier date')} "
                             f"({booking.get('car', '')} {booking.get('reg', '')} — "
-                            f"{booking.get('need', '')}). Squeeze them in?")
+                            f"{booking.get('need', '')}). Squeeze them in?", kind="not_open_date")
             except Exception:
                 log.exception("Failed to alert owner about an early-date request")
             save_message(user, "assistant", answer)
@@ -4950,7 +5152,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             + (f"\n⚠️ They said {cancel.get('date','')}, the diary "
                                f"said {b.get('date','')} — cancelled the real one."
                                if b.get("date_mismatch") else ""),
-                            needs_reply=False)
+                            needs_reply=False, kind="cancel_done")
         except Exception:
             log.exception("Failed to cancel booking for %s", user)
         if not cancelled_something and result.get("ambiguous"):
@@ -4980,7 +5182,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             + (f" ({cancel.get('date','')})" if cancel.get("date") else "")
                             + f", but the diary could not be read ({result['error']}). "
                               "NOTHING was cancelled and the booking is probably still "
-                              "there. They have been told we are checking.")
+                              "there. They have been told we are checking.", kind="cancel_error")
             except Exception:
                 log.exception("Could not alert on the failed cancellation for %s", user)
         elif not cancelled_something:
@@ -4996,7 +5198,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             + (f" ({cancel.get('date','')})" if cancel.get("date") else "")
                             + ", but I could not match that to a booking on their "
                               "number. It may be saved under a different phone or reg."
-                            + " They have been told we are checking.")
+                            + " They have been told we are checking.", kind="cancel_failed")
             except Exception:
                 log.exception("Could not alert on the failed cancellation for %s", user)
     answer, customer = process_customer(answer)
@@ -5056,7 +5258,7 @@ def _finish_reply(user: str, answer: str) -> str:
         try:
             alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
                         "It cannot see the workshop, so anything it told them about the car "
-                        "may be invented — please read the chat and correct it.")
+                        "may be invented — please read the chat and correct it.", kind="fabricated")
         except Exception:
             log.exception("Fabricated-inspection alert failed")
     # A job enquiry is already on its way to the owner with the applicant's
@@ -5112,7 +5314,7 @@ def _finish_reply(user: str, answer: str) -> str:
         if not is_owner and job is None and not job_enquiry_recent(user):
             try:
                 alert_owner(user, "A customer message needs a human reply",
-                            "The bot could not produce an answer and sent a holding message.")
+                            "The bot could not produce an answer and sent a holding message.", kind="blank")
             except Exception:
                 log.exception("Failed to alert owner about blank reply")
     save_message(user, "assistant", answer)
@@ -6093,7 +6295,7 @@ def handle_review_reply(sender: str, text: str) -> bool:
     save_message(sender, "assistant", reply)
     try:
         alert_owner(sender, f"⭐ Unhappy after visit — rated {score}/5",
-                    reason=text.strip()[:300])
+                    reason=text.strip()[:300], kind="review_unhappy")
     except Exception:
         log.exception("Could not alert owner about unhappy review reply")
     return True
@@ -7104,21 +7306,69 @@ def send_unresolved_digest() -> None:
     set_setting("unresolved_digest_sent", today_iso)
     nowts = time.time()
     with closing(db()) as conn:
-        alerts = conn.execute(
-            "SELECT wa_user, ts, claimed_by FROM alerts WHERE COALESCE(closed_ts, 0) < ts "
-            "ORDER BY ts DESC LIMIT 40").fetchall()
-        waiting = [(u, ts, by) for u, ts, by in alerts if not alert_resolved(conn, u, ts)]
-    if not waiting:
+        waiting, older = waiting_alerts(conn)   # oldest first, inside the age floor
+    if not waiting and not older:
         return  # a quiet list needs no message
-    lines = [f"🚨 Still unanswered today — {len(waiting)} customer(s) waiting on a person:"]
-    for user, ts, by in waiting[:15]:
+    lines = [f"🚨 Still unanswered today — {len(waiting)} customer(s) waiting on a person, "
+             "longest-waiting first:"]
+    for user, ts, label, headline in waiting[:15]:
         hrs = (nowts - ts) / 3600
         waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)}d"
-        lines.append(f"• {customer_label(user)} — waiting {waited} — no reply, "
-                     f"nobody pressed Done — wa.me/{user}")
+        what = f" — {headline[:60]}" if headline else ""
+        lines.append(f"• {_alert_label(user, label)} — waiting {waited}{what} — wa.me/{user}")
+    if len(waiting) > 15:
+        lines.append(f"+{len(waiting) - 15} more")
+    if older:
+        lines.append(older_waiting_line(older))
     lines.append("The bot has alerted and chased each one; they need a human reply.")
     send_telegram_private("\n".join(lines))
     log.info("Sent unresolved digest: %d waiting", len(waiting))
+
+# Waiting lists (Stage 1b): OLDEST first, inside an age floor, with a count of the
+# older ones still waiting. Every list used to take the NEWEST 30-40 alerts, so the
+# customer who had waited longest was the one most likely to be missing.
+WAITING_DAYS = int(os.environ.get("WAITING_DAYS", "7"))
+
+
+def waiting_alerts(conn, days: int = WAITING_DAYS) -> tuple:
+    """Customers still waiting on a person, as two lists of (user, ts, label,
+    headline): those from the last `days` days, OLDEST first, and the older ones
+    (up to 60 days before that - anything older is a dead row), NEWEST first, which
+    every list names briefly rather than hiding behind a number."""
+    floor = time.time() - days * 86400
+    rows = conn.execute(
+        "SELECT wa_user, ts, COALESCE(label, ''), COALESCE(headline, '') FROM alerts"
+        " WHERE ts >= ? ORDER BY ts ASC", (floor,)).fetchall()
+    waiting = [r for r in rows if not alert_resolved(conn, r[0], r[1])]
+    rows = conn.execute(   # newest first: the ones that have only just passed the floor
+        "SELECT wa_user, ts, COALESCE(label, ''), COALESCE(headline, '') FROM alerts"
+        " WHERE ts < ? AND ts >= ? AND COALESCE(closed_ts, 0) < ts ORDER BY ts DESC",
+        (floor, floor - 60 * 86400)).fetchall()
+    return waiting, [r for r in rows if not alert_resolved(conn, r[0], r[1])]
+
+
+def _alert_label(user: str, label: str) -> str:
+    """The label stored with the alert, so a list does not ask Google for every name."""
+    return label or customer_label(user)
+
+
+def older_waiting_line(older: list, most: int = 5) -> str:
+    """"Older than 7 days, still waiting: Gibbons (11d), +353876954701 (13d), +2 more".
+    Names only those under three weeks - the ones that have just passed the floor,
+    newest first - so the line does not repeat the same long-dead rows for weeks."""
+    if not older:
+        return ""
+    now_ = time.time()
+    recent = [r for r in older if now_ - r[1] < 21 * 86400][:most]
+    names = [f"{_alert_label(u, label)} ({int((now_ - ts) // 86400)}d)"
+             for u, ts, label, _h in recent]
+    rest = len(older) - len(recent)
+    if not names:
+        return (f"{rest} customer(s) have been waiting more than 3 weeks"
+                f" (older than {WAITING_DAYS} days)")
+    return (f"Older than {WAITING_DAYS} days, still waiting: " + ", ".join(names)
+            + (f", +{rest} more" if rest else ""))
+
 
 def send_waiting_conversations(limit: int = 10) -> int:
     """Send each still-waiting customer to Telegram as its OWN message.
@@ -7128,24 +7378,14 @@ def send_waiting_conversations(limit: int = 10) -> int:
     """
     nowts = time.time()
     with closing(db()) as conn:
-        alerts = conn.execute(
-            # NOTE (open finding): 40 rows is under a day of alerts on the garage,
-            # and this list is newest-first, so the longest-waiting customer is
-            # the one most likely to be missing. Widening it is not enough on its
-            # own - alerts are never aged out, so a bigger window mostly surfaces
-            # dead rows from months ago, and customer_label on every row fans out
-            # to the Google People API. Needs an age floor and all four views.
-            "SELECT wa_user, ts FROM alerts ORDER BY ts DESC LIMIT 40").fetchall()
-        waiting = []
-        for u, ts in alerts:
-            if not alert_resolved(conn, u, ts):
-                waiting.append((u, ts))
+        waiting, older = waiting_alerts(conn)   # oldest first, inside the age floor
     sent = 0
-    for user, ts in waiting[:limit]:
+    for user, ts, label, headline in waiting[:limit]:
         hrs = (nowts - ts) / 3600
         waited = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)} days"
         body = (f"⏰ WAITING {waited}\n"
-                f"{customer_label(user)}\n\n"
+                f"{_alert_label(user, label)}\n"
+                + (f"{headline}\n" if headline else "") + "\n"
                 f"{conversation_excerpt(user, 8) or '(no messages)'}\n\n"
                 f"Open chat: https://wa.me/{user}")
         try:
@@ -7153,7 +7393,16 @@ def send_waiting_conversations(limit: int = 10) -> int:
             sent += 1
         except Exception:
             log.exception("Could not send waiting conversation for %s", user)
-    if not waiting:
+    rest = len(waiting) - min(len(waiting), limit)
+    if rest or older:
+        more = [f"+{rest} more waiting (oldest shown first)"] if rest else []
+        if older:
+            more.append(older_waiting_line(older))
+        try:
+            send_telegram("…and " + "; ".join(more) + ".")
+        except Exception:
+            log.exception("Could not send the waiting-list footer")
+    elif not waiting:
         send_telegram("✅ Nobody is waiting on a reply right now.")
     return sent
 
@@ -7354,12 +7603,7 @@ def send_daily_briefing(force: bool = False) -> None:
             "SELECT name, car, reg, need FROM bookings WHERE date = ?", (today_iso,)).fetchall()
         tom_rows = conn.execute(
             "SELECT name, car, reg, need FROM bookings WHERE date = ?", (tomorrow_iso,)).fetchall()
-        alerts = conn.execute(
-            "SELECT a.wa_user, a.ts FROM alerts a ORDER BY a.ts DESC LIMIT 40").fetchall()
-        waiting = []
-        for u, ts in alerts:
-            if not alert_resolved(conn, u, ts):
-                waiting.append((u, ts))
+        waiting, older = waiting_alerts(conn)   # oldest first, inside the age floor
     parts = [f"☀️ Good morning — {now.strftime('%A %d %B')}", ""]
     if today_rows:
         parts.append(f"📅 IN TODAY ({len(today_rows)}) — drop-off 9-11am:")
@@ -7372,13 +7616,22 @@ def send_daily_briefing(force: bool = False) -> None:
         parts.append(f"➡️ Tomorrow: {len(tom_rows)} booked in.")
     if waiting:
         parts.append("")
-        parts.append(f"⚠️ STILL WAITING ON YOU ({len(waiting)}):")
-        for u, ts in waiting[:12]:
+        parts.append(f"⚠️ STILL WAITING ON YOU ({len(waiting)}), longest-waiting first:")
+        for u, ts, label, headline in waiting[:12]:
             hrs = int((nowts - ts) / 3600)
             when = f"{hrs}h" if hrs < 48 else f"{hrs // 24} days"
-            parts.append(f"  • {customer_label(u)} — waiting {when}")
+            what = f" — {headline[:70]}" if headline else ""
+            parts.append(f"  • {_alert_label(u, label)} — waiting {when}{what}")
+        if len(waiting) > 12:
+            parts.append(f"  +{len(waiting) - 12} more")
+        if older:
+            parts.append("  " + older_waiting_line(older))
         parts.append("")
         parts.append("Reply to these in WhatsApp, or they'll keep waiting.")
+    elif older:
+        parts.append("")
+        parts.append(f"✅ Nobody from the last {WAITING_DAYS} days is waiting on a reply.")
+        parts.append("  " + older_waiting_line(older))
     else:
         parts.append("")
         parts.append("✅ Nobody waiting on a reply — all clear.")
@@ -7919,18 +8172,29 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         nowts = time.time()
         out = []
         with closing(db()) as conn:
+            # Oldest first, inside the age floor (Stage 1b) - it used to be the
+            # newest 30, so the longest wait was the first to drop off.
             rows = conn.execute(
-                "SELECT wa_user, ts, COALESCE(chased_ts,0) FROM alerts "
-                "ORDER BY ts DESC LIMIT 30").fetchall()
-            for u, ts, chased in rows:
+                "SELECT wa_user, ts, COALESCE(chased_ts,0), COALESCE(label,''),"
+                " COALESCE(headline,''), COALESCE(kind,''), COALESCE(topic,''),"
+                " COALESCE(category,'') FROM alerts WHERE ts >= ? ORDER BY ts ASC",
+                (nowts - WAITING_DAYS * 86400,)).fetchall()
+            for u, ts, chased, label, headline, kind, topic, category in rows:
                 replied = alert_resolved(conn, u, ts)
-                out.append({"customer": customer_label(u),
+                out.append({"customer": _alert_label(u, label),
                             "alerted": _fmt_ts(ts),
                             "hours_ago": round((nowts - ts) / 3600, 1),
                             "someone_replied": replied,
-                            "chased": bool(chased and chased >= ts)})
+                            "chased": bool(chased and chased >= ts),
+                            "headline": headline, "kind": kind, "topic": topic,
+                            "category": category})
+            _w, older = waiting_alerts(conn)
         return {"waiting": [r for r in out if not r["someone_replied"]],
-                "handled": [r for r in out if r["someone_replied"]]}
+                "handled": [r for r in out if r["someone_replied"]],
+                "window_days": WAITING_DAYS,
+                "older_still_waiting": [{"customer": _alert_label(u, label), "alerted": _fmt_ts(ts),
+                                         "days_ago": int((nowts - ts) // 86400), "headline": h}
+                                        for u, ts, label, h in older]}
     if action == "isblocked":
         bl = load_blocklist()
         probe = "".join(c for c in date if c.isdigit())
@@ -8091,17 +8355,20 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         with closing(db()) as conn:
             rows = conn.execute(
                 "SELECT wa_user, ts, claimed_by, claimed_ts, closed_ts, escalated_ts, owner_ts,"
-                " headline, tg_msgs FROM alerts WHERE ts > ? ORDER BY ts DESC LIMIT 40",
+                " headline, tg_msgs, COALESCE(label,''), COALESCE(kind,''), COALESCE(topic,''),"
+                " COALESCE(category,'') FROM alerts WHERE ts > ? ORDER BY ts ASC LIMIT 200",
                 (nowts - 3 * 86400,)).fetchall()
         out = []
-        for user, ts, by, cts, clts, ets, ots, headline, tg_msgs in rows:
+        for (user, ts, by, cts, clts, ets, ots, headline, tg_msgs, label, kind, topic,
+             category) in rows:
             if (clts or 0) >= ts:
                 state = f"closed {when(clts)}" + (f" (was with {by})" if by else "")
             elif (by or "").strip():
                 state = f"claimed by {by} at {when(cts)}"
             else:
                 state = "open — nobody has claimed it"
-            out.append({"customer": customer_label(user), "headline": headline or "",
+            out.append({"customer": _alert_label(user, label), "headline": headline or "",
+                        "kind": kind, "topic": topic, "category": category,
                         "raised": when(ts), "state": state,
                         "reposted_30min": bool(ets and ets >= ts),
                         "sent_to_owner_2h": bool(ots and ots >= ts),
@@ -10138,7 +10405,7 @@ def handle_missed_call(caller: str, arrived_on: str = "") -> None:
         _missed_call_alerted[digits] = now
         try:
             alert_owner(digits, "📞 Missed WhatsApp call AGAIN — please ring them back",
-                        f"{len(hist)} missed calls in 24h and nothing typed in the chat")
+                        f"{len(hist)} missed calls in 24h and nothing typed in the chat", kind="missed_call")
         except Exception:
             log.exception("Missed-call alert failed for %s", digits)
     if now - _missed_call_replied.get(digits, 0) < 3600:
@@ -10219,7 +10486,7 @@ def handle_unreadable_message(sender: str, what: str, arrived_on: str = "") -> N
     try:
         alert_owner(sender, "📎 Customer sent something the bot can't open",
                     f"They sent a {what} — open WhatsApp to see it. "
-                    "The bot told them a colleague would come back to them.")
+                    "The bot told them a colleague would come back to them.", kind="attachment")
     except Exception:
         log.exception("Failed to alert owner about unreadable message from %s", sender)
 
@@ -10350,7 +10617,7 @@ def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: s
         save_message(sender, "assistant", apology)
         try:
             alert_owner(sender, "📷 Couldn't download a customer's photo",
-                        "Open WhatsApp on the phone to see what they sent and reply.")
+                        "Open WhatsApp on the phone to see what they sent and reply.", kind="photo_fail")
         except Exception:
             log.exception("Photo-download alert failed for %s", sender)
         return
@@ -10371,7 +10638,7 @@ def handle_image_message(sender: str, media_id: str, caption: str, arrived_on: s
             save_message(sender, "assistant", fallback)
             alert_owner(sender, "📷 Couldn't read a customer's photo",
                         "The bot failed to process a photo — open the WhatsApp app "
-                        "to see it and reply.")
+                        "to see it and reply.", kind="photo_fail")
         except Exception:
             log.exception("Photo fallback also failed for %s", sender)
 
@@ -10609,7 +10876,7 @@ async def retell_function(request: Request):
             # caller's own words only reach the alert if they are saved first.
             save_message(caller, "user", f"[phone message via the voice agent] {note}")
             alert_owner(caller, "📞 Phone message — please ring them back",
-                        note[:300] + (f" (they rang {to_num})" if to_num else ""))
+                        note[:300] + (f" (they rang {to_num})" if to_num else ""), kind="phone_msg")
         else:
             send_telegram("📞 PHONE MESSAGE (voice agent, number withheld)\n"
                           f"From: {who or '?'} — {label}\n"
@@ -10708,7 +10975,7 @@ def _serialized(user: str, fn, *args, **kwargs) -> None:
                 if not is_blocked(user):
                     alert_owner(user, "⚠️ The bot crashed on this customer's message — "
                                       "please reply to them by hand",
-                                "Bot error while reading the message; nothing was sent back")
+                                "Bot error while reading the message; nothing was sent back", kind="crash")
             except Exception:
                 log.exception("Could not record the crashed inbound for %s", user)
 
