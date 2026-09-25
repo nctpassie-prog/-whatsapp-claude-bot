@@ -2653,9 +2653,264 @@ def _hard_count(date_str: str) -> int:
                             (date_str,)).fetchall()
     return sum(1 for (n,) in rows if is_hard_job(n or "") and not is_long_stay(n or ""))
 
+# Owner, 25 Sep 2026: "must be 4 service only for saturdays" - up to four cars,
+# GENERAL SERVICES ONLY, no repairs. The gate used to turn a Saturday down only
+# for a hard job (is_hard_job), so everything else - brakes, pads and discs,
+# NCT-fail repairs, a standalone pre-NCT check, headlight alignment, tyres, drop
+# links - went straight through whenever the model slipped. It did, four times:
+# a standalone pre-NCT check (22 Aug), a coolant gauge check (29 Aug), a centre
+# brake light over the phone (5 Sep) and a headlight alignment from the website
+# form (12 Sep) all went into a Saturday. So on a Saturday this is a whitelist:
+# the job has to SAY it is a service, and must not name anything else.
+#
+# Two readers, because the text comes in two shapes. A job summary - the booking
+# marker, the "Just to confirm: ..., <job>, drop-off ..." read-back, the phone
+# agent's job, a waiting-list row - is short and names the job, so it gets the
+# strict test, saturday_service_only(). A customer's own words ramble ("2.0L
+# diesel engine", "sounds good", "my NCT is due in October") and often name no job
+# at all, so saturday_words_kind() says 'other' only for a named job and can
+# answer '' (nothing named); guard_day_proposal decides what '' means.
+_SATURDAY_SERVICE_RE = re.compile(
+    r"\bservic(?:e|es|ed|ing)\b|\boil\s{0,3}(?:and|&|\+|/)\s{0,3}(?:oil\s+)?filters?\b"
+    r"|\boil (?:change|filter change)\b|\binterim\b"
+    r"|техобслуж|техническ\w* обслуж|замен\w* масла|масло и фильтр|\bсервис\w*|(?-i:\bТО\b)"
+    r"|technin\w* priežiūr|tepal\w*(?:\s+ir\s+\w+)?\s+keitim|\bservis\w*|\brevizi"
+    r"|schimb\w* (?:de )?ulei",
+    re.IGNORECASE)
+# ...a service word that is not asking for one: done already, done elsewhere, or
+# a thing named after a service.
+_SATURDAY_SERVICE_NOT_RE = re.compile(
+    r"\b(?:not|no|without|don'?t need|do not need|never)\s+(?:a |the |any )?servic\w*"
+    r"|\b(?:been|recently|already|had it|had the car|was|were|got it|got the car)\s+"
+    r"(?:just\s+)?servic(?:ed|e done)\b"
+    r"|\bservic(?:ed|e done)\s+(?:last|already|elsewhere|recently|yesterday|back in|before"
+    r"|previously|by (?:the|a|another|my))\b"
+    r"|\b(?:after|since)\s+(?:the |its |a |my |your |his |her |their |our |last )?servic\w*"
+    r"|(?<!same as )(?<!as per )(?<!like )(?<!same as my )(?<!as per my )(?<!like my )"
+    r"(?<!same as the )\b(?:last|previous|recent|earlier)\s+(?:\w+\s*/\s*)?"
+    r"servic\w*"
+    r"|\bservic\w*\s+(?:history|light|book|indicator|reminder|interval|record|reset|due date"
+    r"|station|centre|center|department|manager|desk)"
+    r"|\b(?:automatic|auto|gearbox|dsg|transmission)\s+service(?:\s+kit)?\b"
+    r"|\b(?:customer|self[- ]?|great|good|excellent|brilliant|amazing|fantastic)\s+service\b",
+    re.IGNORECASE)
+# A job that is not a general service: named parts, repairs and symptoms. Words a
+# service is itself written with (oil, filters, spark plugs, a coolant top-up)
+# are deliberately not here.
+_SATURDAY_OTHER_JOB_RE = re.compile(
+    r"repair|\bbrak\w*|\bbreak(?:s|ing)? ?(?:pads?|discs?|system|pedal|fluid|lights?|shoes?"
+    r"|calipers?)\b|\bbreaks\b|\bpads?\b|\bdiscs?\b|\bcalip\w*"
+    r"|\bhandbrake|\balign\w*|\btracking\b|\btyres?\b|\btires?\b|\bpunctur\w*|\bwheels?\b"
+    r"|\bbalancing\b|\bhub\b|\bbulbs?\b|\bheadl\w*|\bhead ?lamps?\b|\bfog ?lamps?\b"
+    r"|(?<!service )\blights?\b|\bindicators?\b|\blamps?\b|\bexhaust|\bweld\w*|\bcv\b"
+    r"|\bdrive ?shafts?|\bjoints?\b|\bbush\w*|\bdrop ?links?\b|\blinks\b|\btrack ?rods?\b"
+    r"|\bsteering|\bcontrol arms?\b|\bwishbone|\bsprings?\b|\bshocks?\b|\bstruts?\b"
+    r"|\bsubframe|\banti-?roll|\bsway bar|\bbatter(?:y|ies)\b|\balternator|\bstarter\b"
+    r"|\bglow ?plugs?\b|\bcoil ?packs?\b|\btiming (?:belt|chain|kit)|\bcam ?belt|\bfan ?belt"
+    r"|\bbelts?\b|\bchain\b|\bwater ?pump|\bfuel ?pump|\bradiator|\bthermostat|\bgaskets?\b"
+    r"|\bhead ?gasket|\bsump\b(?! plug)|\boil cooler|\bturbo|\bturbin\w*|\binjector|\ba/?c\b"
+    r"|\bair ?con\w*"
+    r"|\bre-?gas\w*|\bclimate control|\bdpf\b|\begr\b|\badblue|\bcatalytic|\bcat converter"
+    r"|\bemission|\bwipers?\b|\bwindscreen|\bwindshield|\bmirrors?\b"
+    r"|\bwindow (?:motor|regulator|switch)|\bsunroof|\bcentral locking|\bdoor lock|\bkey ?fob"
+    r"|\bfob\b|\bhorn\b|\bheater\b|\bblower|\bsensors?\b|\bwiring|\bfuses?\b|\bcvrt\b"
+    r"|\bdoe\b|\btacho|\bnoise|\bsound (?:from|when|coming)|\b(?:strange|weird|funny|loud|odd|a|the)"
+    r" sound\b|\b(?:doesn'?t|does not|not) (?:sound|feel|drive|run) (?:quite )?right"
+    r"|\bleak\w*|\brattl\w*|\bknock\w*|\bsqueak\w*|\bsqueal\w*|\bgrind\w*|\bvibrat\w*"
+    r"|\bclunk\w*|\bclonk\w*|\bclick(?:s|ing)?\b(?! (?:the|on|this|that) link)|\bwhin(?:e|es|ing)\b"
+    r"|\bhumming\b|\bburning\b|\bcrunch\w*"
+    r"|\busing (?:a lot of |loads of |too much )?(?:oil|coolant|water)\b(?!\s+(?:i|we|you)\b)"
+    r"|\blos(?:ing|es|t) (?:oil|coolant|water|power)\b|\bflush\b|\bhandles?\b|\becu\b|\bsoftware\b"
+    r"|\bsmok\w*|\bjudder\w*|\bshudder\w*|\bshak(?:e|es|ing|y)\b|\bwobbl\w*"
+    r"|\bpull\w* (?:to|left|right)\b|\bmisfir\w*|\bstall\w*|\boverheat\w*|\bwarning\b"
+    r"|\bgauges?\b|\bcoolant (?:loss|issues?|problems?|warning|keeps|dropping|going)"
+    r"|\b(?:a|some|the|big|major|small|slight|real)\s+problems? with (?:the|my|her|his|its|our|a)\b"
+    r"|(?<!nu-i )(?<!nicio )(?<!fără )(?<!fara )\bprobl[eé]m[aăe]\b"
+    r"|(?<!nicio )(?<!fără )(?<!fara )\bprobleme\b|(?<!без )(?<!нет )\bпроблем"
+    r"|(?<!my )(?<!our )(?<!your )(?<!own )\bfault\w*|\berror\b|\bdiagnos\w*"
+    r"|\bcheck(?:ed)? (?:it |the car |car )?over\b"
+    r"|\b(?:isn'?t|is not|aren'?t|are not|wasn'?t|stopped|stops) working\b"
+    r"|(?<!i'm )(?<!im )(?<!i am )(?<!we're )(?<!we are )(?<!be )(?<!i’m )\bnot working\b"
+    r"|\bdoesn'?t work\b|\bwon'?t (?:start|go|open|close|lock)"
+    r"|\bbroken down|\bbroke down|\b(?:had|have|having) a breakdown|\bbreak(?:s|ing)? down\b"
+    r"|\brecovery\b|\btow(?:ed|ing| truck| bar)?\b|\bjump ?start|\bcomeback|\bgoodwill|\bfail\w*"
+    r"|\bretest|\bremap\w*|\bprogramm\w*|\bimmobili\w*|\blinkage|\blocks?\b(?!\s*box)"
+    r"|\blocking\b(?! wheel)|\bfix(?:ing)?\b(?!\s+(?:up\b|a (?:date|time|day)))"
+    r"|\b(?:take|have) a (?:quick )?look at (?:it|the car|her|this|that)\b"
+    r"|\bpre-?purchase|\bvaluation|\bbody ?work|\bdents?\b|\bdented\b|\bscratch\w*|\bpaint\w*"
+    r"|\brust\w*|\bразвал|\bсхожд|\bдиагност|\bремонт|\bтормоз|\bколодк|\bшин[аыу]\b"
+    r"|\bфар[аыуе]?\b|\bгрм\b|\bсцеплен|\bподушк|\bподвеск|\bremont|\bstabdž|\bpadang"
+    r"|\bpaskirstym|\bsuvedim|\bsankab|\bdiagnost|\breparaț|\breparat|\bfr[aâ]n[aăe]\b"
+    r"|\bpl[aă]cu[tț]|\bdiagnoz|\bpierder|\banvelop|\bgeometri|\bdistribuți|\bambreiaj|\bdiscuri",
+    re.IGNORECASE)
+# The NCT is not a service. The free pre-NCT check that comes WITH one is -
+# whichever is named first ("pre-NCT check and a full service", a customer on
+# 25 Aug) and however it is joined on.
+_SATURDAY_NCT_RE = re.compile(r"\bnct\b|pre-?nct|\bprenct\b|technin\w* apži", re.IGNORECASE)
+_SATURDAY_NCT_WITH_SERVICE_RE = re.compile(
+    r"(?:\bfree\s+)?(?:pre[- ]?)?nct\s{0,3}(?:check(?:[- ]?up)?|inspection)?\s{0,3}(?:(?:with"
+    r"|included|as well|thrown in|as part of)\b|incl\w*\.?)[^.?!\n]{0,20}"
+    r"(?:servic|oil (?:and filter )?change)"
+    r"|(?:servic\w*|oil (?:and filter )?change)\b[^.?!\n]{0,30}?(?:\band\b|\bwith\b|&|\+"
+    r"|\bplus\b|\bincl\w*\.?|,|;)\s{0,3}(?:and\s+)?(?:also\s+)?(?:the |a )?(?:free )?"
+    r"(?:pre[- ]?nct|nct (?:check|inspection))"
+    r"|pre[- ]?nct\s{0,3}(?:check(?:[- ]?up)?|inspection)?\s{0,3}(?:\band\b|&|\+|\bplus\b|,|;)"
+    r"\s{0,3}(?:(?:a|an|the|full|general|yearly|annual|interim|major|minor|basic|regular"
+    r"|standard)\s+)*(?:servic|oil (?:and filter )?change)",
+    re.IGNORECASE)
+# The NCT as a job in a customer's own words ("my NCT is on the 10th" is not one).
+_SATURDAY_NCT_JOB_RE = re.compile(
+    r"pre[- ]?nct|\bprenct\b|\bnct\s+(?:fail\w*|repair\w*|re-?test\w*|prep\w*|check\w*"
+    r"|inspection|work|items?|problems?|issues?|sheet|results?|report)"
+    r"|\b(?:issues?|items?|things?|problems?|faults?)\s+(?:\w+\s+)?(?:on|from|for|with|in)\s+"
+    r"(?:the |my |its )?nct\b",
+    re.IGNORECASE)
+# ...and the NCT only mentioned: its date, or the service being before it.
+_SATURDAY_NCT_MENTION_RE = re.compile(
+    r"(?<!pre-)(?<!pre )(?<!pre)\bnct\s+(?:is\s+)?(?:due|on|in|date|next|expires?|coming up"
+    r"|booked)\b[^,.;()\n]{0,30}"
+    r"|\b(?:before|ahead of)\s+(?:the |my |its |an? |his |her )?nct\b"
+    r"|\bfor\s+(?:the |my |its |his |her )?nct\b(?!\s+(?:fail|repair|re-?test|prep|check"
+    r"|inspection|items?|work))",
+    re.IGNORECASE)
+# "check it over for the NCT" is how customers ask for the pre-NCT check (Edward,
+# 28 Aug: "full service and check over for nct on Saturday 5th").
+_SATURDAY_PRENCT_ALIAS_RE = re.compile(
+    r"\b(?:check|look|inspect\w*)\s+(?:it\s+|the car\s+|her\s+|him\s+)?(?:over\s+)?"
+    r"(?:for|before)\s+(?:the\s+|my\s+|its\s+|an?\s+|her\s+)?nct\b",
+    re.IGNORECASE)
+# The website form's field name: "🔧 Service: Headlight Alignment" (its own line).
+_SATURDAY_FORM_LABEL_RE = re.compile(r"(?im)^[^\w\n]*service:[ \t]*")
+# Words that look like a job and are not one. The car described - "a 2.0L diesel
+# engine", "turbo diesel", "automatic gearbox" (on 5 Aug Ignas asked for "a full
+# oil service for my car, a 2020 Volvo XC60 with a 2.0L diesel engine", and
+# is_hard_job read that as engine work); a service or oil light that is only why
+# they want the service; "no warning lights"; keys left on the wheel; work that
+# was already done ("just had new tyres fitted").
+_SAT_ENGINE_WORK_AHEAD = (
+    r"(?!\s*(?:light|noise|fault|problem|issue|management|warning|repair|work|won|keeps|makes"
+    r"|making|cut|stall|overheat|smok|knock|rattl|mount|fail|trouble|misfir|is making|has a"
+    r"|has been|runs rough))")
+_SAT_NO_FAULT_NOUN = (
+    r"(?:lights?|checklights?|noises?|faults?|issues?|problems?|leaks?|smoke|codes?|errors?"
+    r"|rattles?|knocks?|vibrations?)")
+_SATURDAY_NOT_A_JOB_RE = re.compile(
+    r"\b\d(?:\.\d)?(?:\s?(?:l|litre|liter)\b)?(?:\s?(?:petrol|diesel|hybrid|tdi|tsi|tfsi|hdi|dci"
+    r"|cdi|crdi|turbo))?\s{1,3}engined?s?\b" + _SAT_ENGINE_WORK_AHEAD +
+    r"|\b(?:petrol|diesel|hybrid|electric|tdi|tsi|tfsi|hdi|dci|cdi|crdi|vvt-?i|ecoboost"
+    r"|turbo(?:charged)?|v6|v8|v12|small|big)\s{1,3}engined?s?\b" + _SAT_ENGINE_WORK_AHEAD +
+    r"|\bengine (?:size|capacity|type|code)\b|\bturbo[- ]?(?:diesel|petrol)\b"
+    r"|\b\d\.\d\s?(?:t|turbo|tsi|tfsi|tdi)\b"
+    r"|\b(?:automatic|auto|manual|dsg|cvt)\s+(?:transmission|gearbox)\b(?!\s*(?:fault|problem"
+    r"|issue|repair|noise|slipping|warning|light|servic|oil|fluid|flush))"
+    r"|\belectric (?:car|vehicle)\b"
+    r"|\b(?:it'?s|is|fully|hybrid|plug-in)\s+electric\b(?=\s*(?:$|[.,;!?)]))"
+    r"|\b(?:service|oil|spanner|wrench|inspection|maintenance)[ \t]+(?:due[ \t]+)?(?:warning[ \t]+)?"
+    r"(?:light|indicator|warning|message|reminder|symbol)s?\b(?:[ \t]+warning\b)?"
+    r"(?:[ \t]+(?:is|came|has come|has been"
+    r"|keeps coming|comes|showing|flashing|popped))?(?:[ \t]+(?:up[ \t]+)?on\b)?"
+    r"|\b(?:no|without(?: any)?|not any|never had any|there (?:are|were|is) no)\s+(?:(?:dash(?:board)?"
+    r"|warning|check|engine|other|obvious|known|real|major)\s+){0,2}" + _SAT_NO_FAULT_NOUN +
+    r"(?:\s{0,3}(?:,|or|nor)\s+(?:(?:warning|dash(?:board)?|engine|other)\s+)?"
+    + _SAT_NO_FAULT_NOUN + r")*\b"
+    r"|\bkeys?\s+(?:\w+\s+)?(?:on|under|behind|by|at|in)\s+(?:the\s+)?(?:front\s+|back\s+|rear\s+"
+    r"|driver'?s?\s+)?wheel\b|\b[24]\s?(?:wheel|x)\s?(?:drive|4)\b|\blocking wheel nuts?(?: key)?\b"
+    r"|\b\d{2}\s?(?:inch|in|\")?\s?(?:alloy\s+)?wheels\b"
+    r"|\b(?:just|recently|already) (?:had|got) (?:new |the |a )?\w+(?: \w+)? (?:fitted|done"
+    r"|replaced|changed)\b",
+    re.IGNORECASE)
+# "service and <X>" in a job summary: X has to be part of the service or filler -
+# anything else tied on is another job, even one no list above knows. The car's
+# make and model are filler too ("Full service - Toyota Yaris"), but the word after
+# them is still judged ("Full service - VW Golf gear selector").
+_SAT_CAR_WORDS = (
+    r"toyota|vw|volkswagen|ford|nissan|hyundai|kia|skoda|audi|bmw|mercedes(?:-benz)?|merc"
+    r"|renault|peugeot|citroen|opel|vauxhall|honda|mazda|volvo|seat|fiat|mini|dacia|lexus|tesla"
+    r"|mitsubishi|suzuki|jeep|jaguar|land|rover|range|subaru|cupra|golf|focus|corolla|yaris"
+    r"|qashqai|octavia|polo|fiesta|passat|civic|avensis|auris|astra|corsa|clio|megane|leaf"
+    r"|automatic|auto|manual")
+_SATURDAY_TIE_RE = re.compile(
+    r"(?:\bservic\w*|\))\s{0,3}(?:\band\b|&|\+|\bplus\b|\balso\b|\bas well as\b|\bwith\b|w/|,|;"
+    r"|:|\.|\bthen\b|\s[-–]\s|\()\s{0,3}(?:(?:the|a|an|my|new|some|full|free|also|and|then|with"
+    r"|includes?|including|incl|replace|replacing|change|changing|fit|fitting|reset|resetting"
+    r"|top up|topping up|car|van|diesel|petrol|hybrid|ev|phev|dash|" + _SAT_CAR_WORDS + r")\s+)*"
+    r"(?P<x>[a-z'-]+)",
+    re.IGNORECASE)
+_SATURDAY_TIE_OK = {
+    "oil", "oils", "filter", "filters", "air", "cabin", "pollen", "fuel", "spark", "plugs", "free",
+    "pre", "prenct", "pre-nct", "nct", "courtesy", "customer", "customer's", "drop-off", "drop",
+    "collection", "collect", "pickup", "pick", "wait", "waiting", "will", "please", "pls",
+    "thanks", "thank", "cheers", "on", "for", "at", "in", "to", "this", "that", "i", "i'd", "i'm",
+    "i'll", "id", "im", "we", "you", "it", "its", "it's", "can", "could", "would", "is", "are",
+    "how", "what", "when", "do", "does", "if", "no", "saturday", "book", "booking",
+    "price", "cost", "much", "possible", "there", "they", "interim", "major", "minor", "yearly",
+    "annual", "general", "standard", "regular", "basic", "service", "servicing", "top", "top-up",
+    "topup", "fluids", "fluid", "coolant", "screenwash", "levels", "synthetic", "fully", "castrol",
+    "own", "supplied", "parts", "labour", "incl", "including", "included", "vat", "plus", "from",
+    "petrol", "diesel", "hybrid", "phev", "plug-in", "ev", "car", "van", "reset", "dash",
+    # the model sometimes names the car: "Full service - Toyota Yaris"
+    "toyota", "vw", "volkswagen", "ford", "nissan", "hyundai", "kia", "skoda", "audi", "bmw",
+    "mercedes", "merc", "renault", "peugeot", "citroen", "opel", "vauxhall", "honda", "mazda",
+    "volvo", "seat", "fiat", "mini", "dacia", "lexus", "tesla", "mitsubishi", "suzuki", "jeep",
+    "jaguar", "subaru", "cupra", "golf", "focus", "corolla", "yaris", "qashqai", "octavia",
+    "polo", "fiesta", "passat", "civic", "avensis", "auris", "astra", "corsa", "clio", "megane",
+    "mercedes-benz", "land", "rover", "range", "leaf", "automatic", "auto", "manual"}
+# "service and check ..." is part of the service only for the oil and levels.
+_SATURDAY_TIE_CHECK_OK_RE = re.compile(
+    r"\s+(?:the\s+)?(?:oil|levels?|fluids?|fluid levels)\b", re.IGNORECASE)
+
+
+def _saturday_plain(text: str) -> str:
+    """The words with the look-alikes above taken out (see _SATURDAY_NOT_A_JOB_RE)."""
+    t = _SATURDAY_FORM_LABEL_RE.sub(" ", text or "")
+    t = _SATURDAY_PRENCT_ALIAS_RE.sub(" pre-NCT check ", t)
+    t = _SATURDAY_NOT_A_JOB_RE.sub(" ", t)
+    return _SATURDAY_NCT_MENTION_RE.sub(" ", t)
+
+
+def _saturday_asks_for_service(text: str) -> bool:
+    """Some service word in it is a request for one, not a past or elsewhere one."""
+    negated = [(m.start(), m.end()) for m in _SATURDAY_SERVICE_NOT_RE.finditer(text)]
+    return any(not any(s <= m.start() < e for s, e in negated)
+               for m in _SATURDAY_SERVICE_RE.finditer(text))
+
+
+def saturday_service_only(need: str) -> bool:
+    """A job summary names a general service (service / full service / interim /
+    oil change, with the free pre-NCT check at most) and nothing else."""
+    n = _saturday_plain(need)
+    if not _saturday_asks_for_service(n):
+        return False
+    if is_hard_job(n) or _SATURDAY_OTHER_JOB_RE.search(n):
+        return False
+    if _SATURDAY_NCT_RE.search(n) and not _SATURDAY_NCT_WITH_SERVICE_RE.search(n):
+        return False
+    for m in _SATURDAY_TIE_RE.finditer(n):
+        x = m.group("x").lower()
+        if x in ("check", "checks", "inspection"):
+            if not _SATURDAY_TIE_CHECK_OK_RE.match(n, m.end()):
+                return False
+        elif x not in _SATURDAY_TIE_OK:
+            return False
+    return True
+
+
+def saturday_words_kind(words: str) -> str:
+    """A customer's own words: 'other' when they name a job that is not a general
+    service, 'service' when they ask for a service and name nothing else, and ''
+    when they name no job at all."""
+    w = _saturday_plain(words)
+    if (is_hard_job(w) or _SATURDAY_OTHER_JOB_RE.search(w)
+            or (_SATURDAY_NCT_JOB_RE.search(w) and not _SATURDAY_NCT_WITH_SERVICE_RE.search(w))):
+        return "other"
+    return "service" if _saturday_asks_for_service(w) else ""
+
+
 def day_full_reason(date_str: str, need: str = "") -> str:
     """'' = bookable; 'capacity' = day genuinely full; 'hard' = this KIND of job
-    has used its daily quota (or it's a hard job on a services-only Saturday)."""
+    cannot go on this day: its hard-job quota is used, or it is not a general
+    service and the day is a services-only Saturday. An empty need is not judged
+    for its kind - only for room."""
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
     except Exception:
@@ -2666,9 +2921,16 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     cap = day_capacity(d)
     if n >= cap:
         return "capacity"
+    # Saturday is general services only - a long stay too: it still takes one of
+    # the four places, and it is not a service.
+    if need and d.weekday() == 5 and not saturday_service_only(need):
+        return "hard"
+    if d.weekday() == 5:
+        # A service it is, so the weekday hard-job quota has nothing to say: on the
+        # raw words it would read "Full oil service - 2.0L diesel engine" as engine
+        # work and refuse it once one car is booked.
+        return ""
     if need and is_hard_job(need) and not is_long_stay(need):
-        if d.weekday() == 5:
-            return "hard"  # Saturday is general services only
         if _hard_count(date_str) >= HARD_JOBS_PER_DAY:
             return "hard"
         # Owner 2026-08-27: a nearly-booked day keeps its LAST slots for easy
@@ -2680,6 +2942,100 @@ def day_full_reason(date_str: str, need: str = "") -> str:
 def day_is_full(date_str: str, need: str = "") -> bool:
     """True if the date has no free slot for THIS kind of job."""
     return bool(day_full_reason(date_str, need))
+
+# A person may have agreed a Saturday job the bot turns down: staff do make
+# exceptions ("staff said bring Saturday": 29 Aug brake discs and a goodwill tyre,
+# 5 Sep injectors). The bot never books one itself - the staff watcher and the
+# owner's addbooking do that, past the gate - but when it turns a Saturday job
+# down and a person may have said yes, the owner is told, once, to check it.
+# (Four review rounds of reading a colleague's yes from their words kept finding
+# refusals read as a yes - "Saturday is booked", "only next week" - so the words
+# only decide who is TOLD, never what is booked.)
+# The owner's own text goes out through the bot (?action=sendmsg) and is stored as
+# the bot's: "Hi Lesley, Tadas here - ...".
+_SAT_OWNER_TEXT_RE = re.compile(
+    r"\b(?:tadas|dima|vlad|boris) here\b|\bthis is (?:tadas|dima|vlad|boris)\b"
+    r"|looking after this for you", re.IGNORECASE)
+
+
+def _colleague_named_saturday(user: str, date_str: str) -> bool:
+    """A colleague (or the owner's text through the bot) mentioned this Saturday in
+    this chat in the last 7 days: "the 26th", "26 Sept", or a bare "Saturday" that,
+    said when it was, means this one. A photo from the app is not a mention."""
+    try:
+        d = datetime.strptime(date_str or "", "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    if d.weekday() != 5:
+        return False
+    dated = re.compile(
+        r"\b%d(?:st|nd|rd|th)\b|\b%d(?:st|nd|rd|th)?\s+(?:of\s+)?%s|\b%d/0?%d\b"
+        % (d.day, d.day, d.strftime("%b").lower(), d.day, d.month), re.IGNORECASE)
+    tz = now_local().tzinfo
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT role, content, COALESCE(ts, 0) FROM messages WHERE wa_user = ?"
+                " AND role IN ('staff', 'assistant') AND COALESCE(ts, 0) >= ? ORDER BY id",
+                (user, now_local().timestamp() - 7 * 86400)).fetchall()
+    except Exception:
+        return False
+    for role, content, ts in rows:
+        text = content or ""
+        if text.lstrip().startswith("[") or (role == "assistant"
+                                             and not _SAT_OWNER_TEXT_RE.search(text)):
+            continue
+        if dated.search(text):
+            return True
+        if re.search(r"\bsat(?:urday)?s?\b", text, re.IGNORECASE):
+            ahead = (d - datetime.fromtimestamp(ts or 0, tz).date()).days
+            if 0 <= ahead <= 13:
+                return True
+    return False
+
+
+# The customer says a person agreed their Saturday: "The booking was approved by
+# the staff" (Faizan, 1 Sep), "as discussed this morning", "Dima said the brakes
+# can go in Saturday", "Vlad already booked me for Saturday". "Your mechanic said
+# the pads were low" or "my insurance approved it" is not that.
+_SAT_CUSTOMER_SAYS_AGREED_RE = re.compile(
+    r"\bas (?:discussed|agreed|arranged)\b|\bapproved by\b"
+    r"|\b(?:booking|it|this|saturday|that) (?:was |is |has been |got )?(?:approved|agreed|okayed"
+    r"|ok'?d)\b"
+    r"|\b(?:dima|vlad|tadas|boris|your colleague|your mechanic|your staff|the staff|the lads)\b"
+    r"[^.?!\n,]{0,60}(?:\b(?:said|told me|told us)\s+(?:(?:that|it'?s|it is|it was|i could|i can"
+    r"|we could|to|me to|us to|just|the \w+ (?:can|could) (?:go|come) in(?: on)?)\s+)*"
+    r"(?:bring|drop|come in|pop in|book|fine|ok|grand|saturday|sat)\b"
+    r"|\bconfirmed\s+(?:for\s+|on\s+)?(?:the\s+)?(?:saturday|sat)\b"
+    r"|\b(?:agreed|ok'?d|okayed|(?:already )?booked (?:me|it|us|her|him)(?: in)?)\b)",
+    re.IGNORECASE)
+
+
+def _saturday_refusal_alert(user: str, booking: dict) -> None:
+    """A Saturday job was just turned down (offered or booked) and a person may have
+    agreed it - a colleague mentioned that Saturday lately, or the customer says
+    someone said yes. Tell the owner, once per customer and day, who can add it by
+    hand (addbooking) if it is true."""
+    try:
+        if datetime.strptime(booking.get("date", ""), "%Y-%m-%d").date().weekday() != 5:
+            return
+        key = f"sat_agreed_alert:{user}:{booking.get('date')}"
+        if get_setting(key):
+            return
+        says = _SAT_CUSTOMER_SAYS_AGREED_RE.search(" ".join(_last_customer_messages(user, 6)))
+        if not (says or _colleague_named_saturday(user, booking.get("date", ""))):
+            return
+        who = ("the customer says someone agreed it" if says
+               else "a colleague talked about that Saturday in the chat")
+        alert_owner(user, "🙋 Saturday job turned down - " + who,
+                    f"They asked for {booking.get('date')} "
+                    f"({(booking.get('need', '') or 'no job given')[:80]}). The bot said that "
+                    "day is fully booked for this kind of work (Saturdays are general services "
+                    "only). If a colleague did agree it, add it by hand and let them know.",
+                    kind="saturday_agreed")
+        set_setting(key, str(int(time.time())))   # after it went out: a failed send tries again
+    except Exception:
+        log.exception("Saturday refusal alert failed for %s", user)
 
 def next_day_for_job(need: str, not_before: str = "") -> str:
     """Nearest bookable day for this job, nicely formatted — for the honest
@@ -4857,6 +5213,128 @@ def _offered_days(text: str) -> list:
     return [(d, mo, m) for _pos, d, mo, m in sorted(found, key=lambda t: t[0])]
 
 
+# The reply already turns the Saturday down for the kind of job, as the knowledge
+# base asks: "Saturday 29 August is for general services only, so we're not able
+# to book brake and disc work on that day ... Would Friday 28 August or Monday
+# 31 August suit?" (Victor, 26 Aug). _refused_day does not read that as a
+# refusal, and swapping it for the template threw away the weekdays it offered.
+# Judged on the Saturday's own clause only: "Since you can't take a day off work,
+# Saturday 26 September would be ideal" OFFERS it, and so does "Saturday 22
+# August (general servicing only, which suits your service)".
+_SATURDAY_JOB_NO_RE = re.compile(
+    r"(?:not able|unable|can.?t|cannot|won.?t be able|don.?t|do not)\s+(?:to\s+)?"
+    r"(?:book|do|take|fit|carry out|offer|schedule)\b[^.!?\n]{0,40}\b(?:repairs?|brakes?|pads?"
+    r"|discs?|nct|alignment|tyres?|diagnos\w*|work|jobs?)\b"
+    r"|\bno repairs\b|\b(?:isn'?t|is not|not) (?:available|possible|suitable) for (?:the |your |a |this )?"
+    r"(?:repair|brake|nct|alignment|tyre|diagnos|job|work)",
+    re.IGNORECASE)
+_SATURDAY_SERVICES_ONLY_RE = re.compile(
+    r"(?:general )?servic\w* only|only (?:for |do |take )?(?:general )?servic", re.IGNORECASE)
+_SATURDAY_OFFER_CUE_RE = re.compile(
+    r"\b(?:free|space|room|availab\w*|works?|suits?|perfect|ideal|fine|great|drop|bring"
+    r"|book you|would you|could you|shall i|slots?)\b", re.IGNORECASE)
+
+
+def _saturday_turned_down_for_job(text: str, m) -> bool:
+    """The clause naming this day says no to the job, in so many words (or says
+    Saturday is for services only and offers nothing)."""
+    lo, hi = _sentence_bounds(text, m.start(), m.end())
+    before, after = text[lo:m.start()], text[m.end():hi]
+    cut = [x.end() for x in _CLAUSE_BREAK_RE.finditer(before)]
+    nxt = _CLAUSE_BREAK_RE.search(after)
+    clause = (before[cut[-1]:] if cut else before) + " " + (after[:nxt.start()] if nxt else after)
+    return bool(_SATURDAY_JOB_NO_RE.search(clause)
+                or (_SATURDAY_SERVICES_ONLY_RE.search(clause)
+                    and not _SATURDAY_OFFER_CUE_RE.search(clause)))
+
+
+# The customer adds the service to something else: "it's also due its yearly
+# service", "yes and full service if you can" (Thomas: after a timing belt).
+_SATURDAY_ALSO_RE = re.compile(
+    r"\b(?:also|as well|too|while it'?s (?:in|there)|at the same time|both|another thing"
+    r"|on top of that|anyway|plus)\b|^\W*(?:(?:yes|yeah|ok|okay)\W+)?(?:and\b|\+)"
+    r"|\b(?:and|with) (?:a |the |its )?(?:full |yearly |annual |general |basic )?servic",
+    re.IGNORECASE)
+# A repair put off in the same breath: "not the brakes", "I'll do the brakes another
+# time", "leave the tyres for now".
+_SATURDAY_DEFERRED_RE = re.compile(
+    r"\b(?:not|no|without|leave|skip)\s+(?:the\s+|a\s+|any\s+|my\s+)?[\w-]+(?:\s+[\w-]+)?"
+    r"(?:\s+(?:for now|till later|until later|this time))?"
+    r"|\b(?:i'?ll|we'?ll|will|can)\s+(?:do|get|leave|sort)\s+(?:the\s+)?[\w-]+(?:\s+[\w-]+)?\s+"
+    r"(?:another|some other|later|next)\b[^.,;!?]*", re.IGNORECASE)
+# ...or puts it INSTEAD of what was talked about: "just the service for now", "only
+# the service, not the brakes", "ok, a service on Saturday then".
+_SATURDAY_REPLACE_RE = re.compile(
+    r"\b(?:just|only)\s+(?:do\s+)?(?:the\s+|a\s+)?(?:full\s+|general\s+|basic\s+|yearly\s+)?"
+    r"servic\w*(?!\s*(?:and\b|&|\+|plus\b|with\b|as well|,\s*and\b))|\bservice only\b"
+    r"|\binstead\b|\bfor now\b|\brather\b|\bthen[\s.!?]*$", re.IGNORECASE)
+
+
+def _saturday_visit(user: str):
+    """(role, text, ts) of this visit, oldest first: the messages the model sees (the
+    last MAX_HISTORY, as get_history) plus the customer's last four, cut at the last
+    silence of 14 days or more - a customer back after a month is a new visit, and
+    what the car needed then is not what it needs now. None when the chat cannot be
+    read."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT id, role, content, COALESCE(ts, 0) FROM messages WHERE wa_user = ?"
+                " ORDER BY id DESC LIMIT ?", (user, MAX_HISTORY)).fetchall()
+            rows += conn.execute(
+                "SELECT id, role, content, COALESCE(ts, 0) FROM messages WHERE wa_user = ?"
+                " AND role = 'user' ORDER BY id DESC LIMIT 4", (user,)).fetchall()
+    except Exception:
+        return None
+    rows = [r for _, r in sorted({r[0]: r for r in rows}.items())]
+    start = 0
+    for i in range(1, len(rows)):
+        if rows[i][3] and rows[i - 1][3] and rows[i][3] - rows[i - 1][3] >= 14 * 86400:
+            start = i
+    return [(r[1] or "", r[2] or "", r[3] or 0) for r in rows[start:]]
+
+
+def saturday_need_from_words(user: str, words: str, widen: bool = True) -> str:
+    """What a Saturday offer is judged by when all there is to go on is the
+    customer's own words: 'service' for a plain service, the words themselves for
+    another job (so the refusal and next_day_for_job see the real job), and ''
+    when no job is named - that is judged for room only, as before.
+
+    Live, the words are this visit's (_saturday_visit: cut at a 14-day
+    silence). A repair named anywhere in the visit wins - "front pads and discs
+    please" and then "can you service it on Saturday?" is a weekday job, and that
+    is how the model will book it - unless the newest message puts the service
+    INSTEAD ("just the service for now", "ok, a service on Saturday then"). When
+    their words name no job at all, the bot's own read-back ("Just to confirm:
+    ... (reg), <job>, drop-off ...") decides. Matthew, 19 Aug: the coolant gauge
+    was five messages back, the last four said only "maybe 31st", and he was
+    offered and booked a Saturday for it. widen=False (the askbot dry run)
+    judges `words` alone."""
+    rows = _saturday_visit(user) if widen else None
+    if rows is None:
+        kind = saturday_words_kind(words)
+        return {"service": "service", "other": words}.get(kind, "")
+    said = [c for r, c, t in rows if r == "user"]
+    for c in reversed(said):      # newest first
+        if (_SATURDAY_REPLACE_RE.search(c) and not _SATURDAY_ALSO_RE.search(c)
+                and saturday_words_kind(_SATURDAY_DEFERRED_RE.sub(" ", c)) == "service"):
+            return "service"      # "just the service for now, I'll do the brakes another time"
+        kind = saturday_words_kind(c)
+        if kind == "other":
+            return c
+        if kind == "service":
+            break                 # "can you service it Saturday?": a repair in the visit wins
+    visit = "\n".join(said)
+    kind = saturday_words_kind(visit)
+    if kind:
+        return {"service": "service", "other": visit}[kind]
+    for r, c, t in reversed(rows):
+        pm = _PROPOSAL_RE.search(c or "") if r == "assistant" else None
+        if pm and pm.group("need"):
+            need = pm.group("need")
+            return "service" if saturday_service_only(need) else need
+    return ""
+
 def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
     """If a reply offers a day this job cannot actually have, swap in the honest
     message instead. Shared by the live reply path and the ?action=askbot dry run,
@@ -4874,26 +5352,39 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
         if "<<<" in text:
             return answer
         prop = _PROPOSAL_RE.search(text)
-        conversational = False
         if prop:
-            day_num = int(prop.group("day"))
-            month_idx = _MONTHS.index(prop.group("mon").capitalize())
+            days = [(int(prop.group("day")), _MONTHS.index(prop.group("mon").capitalize()),
+                     prop, False)]
         else:
-            # The first day the reply OFFERS - a day it turns down is skipped, and
+            # The days the reply OFFERS - a day it turns down is skipped, and
             # dates in the customer's language count (see _offered_days).
-            offered = _offered_days(text)
-            if not offered:
+            days = [(d, mo, mm, True) for d, mo, mm in _offered_days(text)]
+            if not days:
                 return answer
-            day_num, month_idx, prop = offered[0]
-            conversational = True
         today = now_local().date()
-        pd = date(today.year, month_idx + 1, day_num)
-        if pd < today - timedelta(days=30):
-            pd = pd.replace(year=pd.year + 1)
-        need = "" if conversational else (prop.group("need") or "")
-        if not need:
-            need = need_hint or _recent_customer_words(user)
-        reason = day_full_reason(pd.isoformat(), need)
+        skipped = None
+        for day_num, month_idx, prop, conversational in days:
+            pd = date(today.year, month_idx + 1, day_num)
+            if pd < today - timedelta(days=30):
+                pd = pd.replace(year=pd.year + 1)
+            need = "" if conversational else (prop.group("need") or "")
+            if not need:
+                need = need_hint or _recent_customer_words(user)
+                if pd.weekday() == 5:
+                    need = saturday_need_from_words(user, need, widen=not need_hint)
+            reason = day_full_reason(pd.isoformat(), need)
+            # A Saturday the reply itself already turns down for this job is not
+            # an offer: judge the day it offers instead (Victor, 26 Aug). Only for
+            # the job - a Saturday that is simply full is still judged here.
+            if (conversational and reason == "hard" and pd.weekday() == 5
+                    and _saturday_turned_down_for_job(text, prop)):
+                skipped = skipped or (pd, need, reason, prop, conversational)
+                continue
+            break
+        else:
+            # Every day it names, it turns down for the job: judge the first one
+            # anyway - the honest message names a day that will take the job.
+            pd, need, reason, prop, conversational = skipped
         if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
             alt = next_day_for_job(need)
             msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
@@ -4903,9 +5394,12 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "") -> str:
             log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
                      user, pd, reason, need[:60],
                      "conversational" if conversational else "confirm-format")
+            if reason == "hard" and pd.weekday() == 5 and not need_hint:
+                _saturday_refusal_alert(user, {"date": pd.isoformat(), "need": need})
     except Exception:
         log.exception("Proposal capacity guard failed (reply sent unchanged)")
     return answer
+
 
 # The bot has no eyes in the workshop and cannot ring anyone, yet it keeps saying
 # it just did. business_info has banned this since 3 Sep and the model still wrote
@@ -5009,11 +5503,13 @@ def _finish_reply(user: str, answer: str) -> str:
         if (not is_owner and not already_booked
                 and day_full_reason(booking.get("date", ""), booking.get("need", "")) == "hard"):
             alt = next_day_for_job(booking.get("need", ""))
-            log.info("Booking for %s rejected: hard-job quota full", booking.get("date"))
+            log.info("Booking for %s rejected: not a job for that day (hard-job quota, or "
+                     "Saturday services only)", booking.get("date"))
             answer = HARD_FULL_MSG.get(
                 reminder_lang_code(booking.get("lang", "")), HARD_FULL_MSG["en"]
             ).format(alt=alt)
             save_message(user, "assistant", answer)
+            _saturday_refusal_alert(user, booking)
             return answer
         if not is_owner and not already_booked and day_is_full(booking.get("date", ""), booking.get("need", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
@@ -12028,8 +12524,9 @@ def _voice_availability() -> str:
         hard_left = 0 if (d.weekday() == 5 or left < HARD_NEEDS_FREE_SLOTS) else min(
             left, max(0, HARD_JOBS_PER_DAY - hard.get(iso, 0)))
         out.append({"date": iso, "day": d.strftime("%A"),
-                    "slots_for_services_nct_brakes": left,
-                    "slots_for_other_jobs": left,
+                    "slots_for_services_nct_brakes": 0 if d.weekday() == 5 else left,
+                    "slots_for_general_service": left,
+                    "slots_for_other_jobs": 0 if d.weekday() == 5 else left,
                     "slots_for_diagnostics": hard_left,
                     "saturday_services_only": d.weekday() == 5})
     return out
@@ -12053,13 +12550,18 @@ async def retell_function(request: Request):
         today = now_local().date()
         return {"today": f"{today.strftime('%A %d %B %Y')}",
                 "open_days": _voice_availability(),
-                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. ANY job can "
-                         "book any open day up to 4 weeks ahead. HARD JOBS - "
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Monday to "
+                         "Friday ANY job can book any open day up to 4 weeks ahead. HARD JOBS - "
                          "diagnostics, injectors, turbo, clutch, engine repairs or "
                          "engine noise, electrical, suspension - need "
                          "slots_for_diagnostics (max 4 a day; 0 on Saturdays, which "
                          "are general services only). When a day has none left, "
                          "offer the nearest day that still shows hard-job space. "
+                         "SATURDAYS ARE GENERAL SERVICES ONLY: a plain service (with the "
+                         "free pre-NCT check at most) can have a Saturday; NCT work, "
+                         "brakes, tyres, alignment, bulbs, a pre-NCT check on its own and "
+                         "every other repair or check cannot - offer those the nearest "
+                         "weekday. "
                          "ONLY offer days from open_days - if the caller wants a "
                          "later date, take a message.")}
 
@@ -12103,6 +12605,8 @@ async def retell_function(request: Request):
             return {"booked": False, "reason": "we are closed that day — pick from check_availability"}
         need = fields["need"]
         r = day_full_reason(iso, need)
+        if r == "hard" and d.weekday() == 5:
+            return {"booked": False, "reason": "Saturdays take general services only - no repairs, NCT work, checks or diagnostics. Offer the nearest weekday from check_availability"}
         if r == "hard":
             return {"booked": False, "reason": "that day is full for hard jobs (Saturdays are services only) — pick another date from check_availability"}
         if r:
