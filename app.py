@@ -1800,6 +1800,48 @@ def claims_a_person(reply: str, user: str) -> bool:
     return new_phrases_count_after(_recent_customer_words(user, 1))
 
 
+def mark_person_promised(user: str, source: str) -> None:
+    """Remember that this customer was just told a person will come back to them
+    (Stage 1d). A needs-a-person alert, a promise in a reply however it was worded,
+    a chase holding message, the missed-call text-back. 919773579970 sent three
+    videos on 18 Sep, was told a colleague would look, heard nothing, and on Sunday
+    got the "would you like me to get you booked in?" marketing template."""
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO person_promised (wa_user, ts, source) VALUES (?, ?, ?)"
+                         " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
+                         " source = excluded.source", (user, time.time(), (source or "")[:40]))
+    except Exception:
+        log.exception("Could not record the person-promised flag for %s", user)
+
+
+def person_promised_since(user: str, since_ts: float) -> bool:
+    """Is a promise that a person would come back still standing? True when it
+    was made at or after since_ts (normally the customer's latest message), or
+    when everything the customer has written since the promise is filler - an
+    "ok", a thank-you, a thumbs-up, a sticker. "Oki" after "the team will pick
+    this up" is not a new enquiry (919773579970, 18 Sep). Unsure counts as yes."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts FROM person_promised WHERE wa_user = ?",
+                               (user,)).fetchone()
+            if not row:
+                return False
+            if (row[0] or 0) >= (since_ts or 0):
+                return True
+            later = [r[0] or "" for r in conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND ts > ?",
+                (user, row[0] or 0))]
+    except Exception:
+        return True
+    # (A photo or a PDF is a real enquiry the bot reads and quotes - only a
+    # sticker or reaction is filler.)
+    return bool(later) and all(
+        t.startswith("[Customer sent a sticker") or is_pure_ack(t)
+        or t.strip(" .!").lower() in ("oki", "okk", "okey", "okie", "ta")
+        for t in later)
+
+
 def notify_owner_handover(number: str, fields: dict) -> None:
     """Ping the owner when the bot defers something to a human, so they can follow up."""
     number = "".join(ch for ch in str(number) if ch.isdigit())
@@ -1888,6 +1930,17 @@ def db() -> sqlite3.Connection:
     conn.execute("CREATE TABLE IF NOT EXISTS followup_log ("
                  " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                  " wa_user TEXT, kind TEXT, ts REAL)")
+    # Why a nudge was skipped, or what it was about (Stage 1d). Kinds: same_day,
+    # next_day and chase_template are real sends; next_day_skip is a decision
+    # NOT to send; hand_followup goes on the morning briefing for a person.
+    try:
+        conn.execute("ALTER TABLE followup_log ADD COLUMN note TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # When the bot last told this customer a PERSON would come back to them. Until
+    # they write again, no automatic "still interested?" nudge may go out.
+    conn.execute("CREATE TABLE IF NOT EXISTS person_promised ("
+                 " wa_user TEXT PRIMARY KEY, ts REAL, source TEXT DEFAULT '')")
     # Customers who took a later date than they wanted — the cancellation list.
     # When a booking is cancelled, its slot is offered to the earliest waiter.
     conn.execute("CREATE TABLE IF NOT EXISTS waitlist ("
@@ -3575,6 +3628,7 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
                 "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts, kind)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (user, alert_ts, headline, keep_claim[0], keep_claim[1], kind))
+        mark_person_promised(user, "alert:" + (kind or "?"))
 
 def _is_unhappy_alert(headline: str, kind: str) -> bool:
     """Was this the unhappy check's own alert? By kind from Stage 1b on - the
@@ -5840,6 +5894,10 @@ def _finish_reply(user: str, answer: str) -> str:
     if not is_owner:
         answer = diary_gap_check_reply(user, answer, booked=bool(booking),
                                        freed=freed_dates)
+    # Stage 1d: however the promise was worded, and whether or not it raised an
+    # alert on this turn, no automatic nudge may follow it until they write again.
+    if not is_owner and claims_a_person(answer or "", user):
+        mark_person_promised(user, "reply")
     save_message(user, "assistant", answer)
     return answer
 
@@ -6964,6 +7022,8 @@ def send_weekly_gap_report(force: bool = False) -> None:
              f"🙋 Times a human was needed: {handovers}"]
     try:
         parts.append("🔁 " + followup_week_stats())
+        parts.append("   (Paid reminders only go Mon-Fri 10-5 and Sat 10-12, never Sunday, so "
+                     "enquiries from about 11am Friday to 10am Saturday get none.)")
     except Exception:
         log.exception("Follow-up stats failed")
     if lines:
@@ -7104,6 +7164,19 @@ def sweep_stalled_staff_chats() -> None:
         except Exception:
             log.exception("Stalled-chat sweep failed for %s", user)
 
+def _chase_note(user: str, hours: int, outcome: str) -> None:
+    """Tell the owner/staff DIRECTLY that a customer is still waiting, and what the
+    bot did about it - never via alert_owner, which resets the alert timestamp and
+    made the chaser re-fire the identical apology every three hours (Holly got the
+    same message four times in one day)."""
+    try:
+        send_telegram(f"⏰ Still waiting — nobody has replied\n"
+                      f"{customer_label(user)}\n"
+                      f"It's been about {hours}h. {outcome}\n"
+                      f"Open chat: https://wa.me/{user}")
+    except Exception:
+        log.exception("Failed to notify owner about unanswered alert")
+
 def chase_unresolved_alerts() -> None:
     """Chase alerts nobody has acted on.
 
@@ -7166,58 +7239,64 @@ def chase_unresolved_alerts() -> None:
             if handled:
                 continue
             hours = int((nowts - alert_ts) / 3600)
-            # Notify the owner DIRECTLY — never via alert_owner, which resets the
-            # alert timestamp and made the chaser re-fire the identical apology every
-            # three hours (Holly got the same message four times in one day).
+            # WhatsApp's 24h wall: once the customer has been silent longer than the
+            # window, Meta silently blocks a normal message. The approved template
+            # used to go instead - the "you were asking us yesterday, would you like
+            # me to get you booked in?" marketing nudge - to somebody waiting on a
+            # PERSON (Stage 1d). Only a colleague can put that right, so staff are
+            # told plainly and nothing goes to the customer.
+            # chased_ts is already set, so this is the only chase this alert gets:
+            # whatever goes wrong below, staff still hear about it.
             try:
-                send_telegram(f"⏰ Still waiting — nobody has replied\n"
-                              f"{customer_label(user)}\n"
-                              f"It's been about {hours}h. The customer has been sent "
-                              f"a holding message.\nOpen chat: https://wa.me/{user}")
+                with closing(db()) as conn:
+                    last_in = conn.execute(
+                        "SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                        "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
             except Exception:
-                log.exception("Failed to notify owner about unanswered alert")
-            # WhatsApp's 24h wall: once the customer has been silent longer than
-            # the window, a normal chase is silently blocked by Meta — the
-            # approved template is the only thing that still gets through.
-            with closing(db()) as conn:
-                last_in = conn.execute(
-                    "SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
-                    "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
-            if not last_in or nowts - last_in[0] > 23 * 3600:
-                made = _make_nextday(user)
-                if made:
-                    t_lang, t_topic = made
-                    with closing(db()) as conn:
-                        nm = conn.execute(
-                            "SELECT name FROM customers WHERE wa_number = ?",
-                            (user,)).fetchone()
-                    if send_nextday_template(user, (nm[0] if nm and nm[0] else ""),
-                                             t_topic, t_lang):
-                        save_message(user, "assistant",
-                                     "[Template nudge sent: offered to get them "
-                                     f"booked in — {t_topic}]")
-                        with closing(db()) as conn, conn:
-                            conn.execute(
-                                "INSERT INTO followup_log (wa_user, kind, ts) "
-                                "VALUES (?, 'chase_template', ?)", (user, nowts))
-                        log.info("Window closed for %s — template nudge sent", user)
+                log.exception("Chase: could not read the last message for %s", user)
+                last_in = ("?",)   # unsure: do not message the customer
+            if not last_in:
+                _chase_note(user, hours, "They have only called and never typed, so the "
+                                         "bot can't message them — please ring them back.")
+                continue
+            if last_in == ("?",) or nowts - last_in[0] > FOLLOWUP_WINDOW_HOURS * 3600:
+                _chase_note(user, hours, "WhatsApp's 24-hour window has closed, so the "
+                                         "customer was NOT messaged — please ring them or "
+                                         "reply from the WhatsApp app.")
+                log.info("Window closed for %s — staff told, customer not messaged", user)
                 continue
             # The chase is a customer-facing message like any other, and it was
             # the one place that skipped this: at 22:40, with the workshop shut
             # since six, it promised somebody the team would be right back to them.
-            text = after_hours_wording(_make_chase(user))
-            # Belt and braces: never send the customer the same line twice in a row.
-            with closing(db()) as conn:
-                last = conn.execute(
-                    "SELECT content FROM messages WHERE wa_user = ? AND role = "
-                    "'assistant' ORDER BY id DESC LIMIT 1", (user,)).fetchone()
-            if text and last and (last[0] or "").strip() == text.strip():
-                log.info("Chase for %s identical to last message — skipping", user)
+            try:
+                text = after_hours_wording(_make_chase(user))
+                # Belt and braces: never send the customer the same line twice in a row.
+                with closing(db()) as conn:
+                    last = conn.execute(
+                        "SELECT content FROM messages WHERE wa_user = ? AND role = "
+                        "'assistant' ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+                if text and last and (last[0] or "").strip() == text.strip():
+                    log.info("Chase for %s identical to last message — skipping", user)
+                    text = ""
+            except Exception:
+                log.exception("Chase text for %s failed", user)
                 text = ""
+            sent = False
             if text:
-                send_whatsapp(user, text)
-                save_message(user, "assistant", text)
-                log.info("Chased unanswered alert for %s (%dh)", user, hours)
+                try:
+                    send_whatsapp(user, text)
+                    save_message(user, "assistant", text)
+                    mark_person_promised(user, "chase")
+                    sent = True
+                    log.info("Chased unanswered alert for %s (%dh)", user, hours)
+                except Exception:
+                    log.exception("Chase message to %s failed", user)
+            # Said after the outcome, not before it: this note used to claim a
+            # holding message had gone out even when the model skipped it or it
+            # was a repeat. (send_whatsapp reports no failure; a NOT DELIVERED
+            # alert follows one on its own.)
+            _chase_note(user, hours, "The bot sent them a holding message." if sent
+                        else "The customer was NOT messaged — please reply to them.")
         except Exception:
             log.exception("Failed to chase unresolved alert for %s", user)
 
@@ -7233,10 +7312,18 @@ def _maybe_followup(user: str, nowts: float) -> None:
                                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         done = conn.execute("SELECT inbound_ts FROM followups WHERE wa_user = ?",
                             (user,)).fetchone()
-    # If a human has been alerted about this chat recently, leave it to them — don't nudge.
+    # If a human has been alerted about this chat recently - or an alert from the
+    # last WAITING_DAYS days is still not dealt with - leave it to them; don't
+    # nudge. Older alerts are dead rows (a missed call staff rang back never
+    # closes) and must not silence a new enquiry for good. The same for a
+    # customer who was told a person would come back to them (Stage 1d).
     with closing(db()) as conn:
         alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
-    if alerted and nowts - (alerted[0] or 0) < 24 * 3600:
+        open_alert = (bool(alerted) and (alerted[0] or 0) >= nowts - WAITING_DAYS * 86400
+                      and not alert_resolved(conn, user, alerted[0] or 0))
+    if alerted and (nowts - (alerted[0] or 0) < 24 * 3600 or open_alert):
+        return
+    if last_in and person_promised_since(user, last_in[0]):
         return
     if not last or last[0] != "assistant":
         return  # it's already the customer's turn, or no history
@@ -7285,34 +7372,133 @@ def send_due_followups() -> None:
 # Once WhatsApp's 24h window closes, only an approved template can reach the
 # customer. This chases enquiries that got an answer/quote and then went cold.
 
-NEXTDAY_SYSTEM = (
-    "You are helping the NCTPass car garage decide whether to send a next-day "
-    "'still interested?' WhatsApp template to a customer who enquired yesterday "
-    "and went quiet. Read the conversation. Reply with EXACTLY one line in the "
-    "form LANG|TOPIC where LANG is one of en, ru, ro, lt (the customer's "
-    "language) and TOPIC is a short phrase (max 6 words, in that language, "
-    "lowercase) naming what they asked about, e.g. 'a service for your Golf' "
-    "or 'the DPF clean quote'. Reply exactly SKIP instead if ANY of these: "
-    "they already booked, they said no / not interested / found elsewhere, it "
-    "was a complaint or dispute, they only asked opening hours or directions, "
-    "the conversation was small talk, or a nudge could feel pushy or unwelcome. "
-    "When in doubt, SKIP.")
+# The nudge decision (Stage 1d). The old prompt ended "When in doubt, SKIP" and
+# the old code logged every SKIP as a SENT nudge - 77 of the week's 84 "sent"
+# follow-ups were the model deciding not to send. Now the code rules out everyone
+# a nudge would be wrong for (nudge_blockers) BEFORE the model is asked, and the
+# model answers one narrow question. Anything but an explicit YES line is a no.
+NUDGE_SYSTEM = (
+    "You decide ONE thing for the NCTPass car garage: should this customer, who went "
+    "quiet, get a short WhatsApp message saying 'you were asking us yesterday about X "
+    "- would you like me to get you booked in?'. Read the conversation.\n"
+    "Answer YES only if the customer asked about a job, a price or a booking for "
+    "their own car, got an answer, and then simply went quiet without booking.\n"
+    "Answer NO if any of these is true: they booked, or said they will ring, call in "
+    "or book themselves; they said no, not now, found somewhere else, or sold or "
+    "scrapped the car; they named a later time (\"I'll let you know next week\", "
+    "\"after payday\"); it is a complaint, a dispute, a comeback or a question about "
+    "work we already did; they are waiting for a person or a call back; they only "
+    "asked opening hours, directions or where their car is; it was small talk, a "
+    "wrong number, a job application or a supplier.\n"
+    "Reply with EXACTLY one line. For yes: YES|LANG|TOPIC, where LANG is en, ru, ro or "
+    "lt (the customer's language) and TOPIC is a short lowercase phrase of at most 6 "
+    "words, in that language, naming what they asked about, e.g. 'a service for your "
+    "golf'. For no: NO.")
 
-def _make_nextday(user: str):
+# A colleague already talked to this customer this week, so no automatic message
+# can go - the only question is whether something NEW is left for a person to
+# pick up. Michelle (23 Sep): after her service invoice she asked about rear
+# brakes and a courtesy car and said "I will chat when I collect the car" - which
+# the paid-nudge question rightly answers NO to, and which is exactly what a
+# person should follow up.
+HAND_SYSTEM = (
+    "A colleague at the NCTPass car garage has already been talking to this customer. "
+    "Decide ONE thing: is there a NEW job, price or booking for their car that the "
+    "customer asked about and that is still open - not booked, not turned down, and "
+    "not clearly dealt with by a colleague? It counts even if they said they would "
+    "talk about it later, in person, when collecting the car, or would ring. It does "
+    "NOT count if the chat is only about collecting the car, where it is, paying, "
+    "thanks, or the job that was just done.\n"
+    "Reply with EXACTLY one line: YES|TOPIC (TOPIC = at most 6 words, in English, "
+    "naming the open job, e.g. 'rear brake pads and discs') or NO.")
+
+# What _call_claude returns when the model could not be reached. A nudge decision
+# that meets it is simply tried again on the next hourly pass - logging it would
+# make an outage look like a real NO, and each enquiry is judged only once.
+MODEL_FAILED_PREFIX = "Sorry, I couldn't process your message right now"
+
+_NUDGE_YES_RE = re.compile(r"^\W*YES\W*\|\s*([A-Za-z]{2})\s*\|\s*(.+?)\s*$", re.IGNORECASE)
+# The hand question reads EVERY line, and only whole-line verdicts count:
+# "Answer: NO" is a no, "No booking was made yet" is not.
+_HAND_YES_LINE_RE = re.compile(
+    r"^\W*(?:(?:answer|decision|verdict)\s*:\s*)?\W*YES\s*\|\s*(.+?)\s*$", re.IGNORECASE)
+# ...a NO may carry its reason after a real separator ("NO - only collecting the
+# car", "NO (collection only)"); "No-one", "No problem" and "No, but..." are not verdicts.
+_HAND_NO_LINE_RE = re.compile(
+    r"^\W*(?:(?:answer|decision|verdict)\s*:\s*)?\W*NO(?:\W*$|\s*(?:[–—(|:.]|-(?:\s|$)))",
+    re.IGNORECASE)
+_THINKING_RE = re.compile(r"<(thinking|thought)>.*?</\1>|</?(?:thinking|thought)>",
+                          re.IGNORECASE | re.DOTALL)
+
+
+def _ask_lines(user: str, system: str):
+    """The model's non-empty lines for this chat ([] if there is no chat), or
+    "error" when the model could not be reached."""
     history = get_history(user)
     if not history:
-        return None
+        return []
     messages = history + [{"role": "user", "content":
-                           "(Internal: decide per your rules — LANG|TOPIC or SKIP.)"}]
-    raw = (_call_claude(messages, NEXTDAY_SYSTEM) or "").strip()
-    if not raw or raw.upper().startswith("SKIP") or "|" not in raw:
+                           "(Internal: answer the question in your instructions - one "
+                           "line, exactly in the format asked.)"}]
+    try:
+        raw = (_call_claude(messages, system) or "").strip()
+    except Exception:
+        log.exception("Nudge decision failed for %s", user)
+        return "error"
+    if raw.startswith(MODEL_FAILED_PREFIX):
+        return "error"
+    raw = _THINKING_RE.sub("", raw)
+    lines = [ln.strip() for ln in raw.splitlines()
+             if ln.strip() and not ln.strip().startswith("```")]
+    log.info("Nudge question for %s answered: %r", user, " / ".join(lines)[:200])
+    return lines
+
+
+def _ask_one_line(user: str, system: str) -> str:
+    """The model's first real line ('' if none), or "error" when unreachable."""
+    lines = _ask_lines(user, system)
+    return lines if lines == "error" else (lines[0] if lines else "")
+
+
+def _clean_topic(t: str) -> str:
+    t = (t or "").strip().strip(' .*_`"\'').strip()[:60]
+    return "" if ("|" in t or "<" in t) else t
+
+
+def _make_nudge(user: str):
+    """The paid-nudge decision: (lang, topic) on an explicit YES; "error" when the
+    model could not be reached (try again next pass); None for NO or anything that
+    does not parse."""
+    line = _ask_one_line(user, NUDGE_SYSTEM)
+    if line == "error":
+        return "error"
+    m = _NUDGE_YES_RE.match(line)
+    if not m:
         return None
-    lang, topic = raw.split("|", 1)
-    lang = lang.strip().lower()[:2]
-    topic = topic.strip().strip('."')[:60]
+    lang, topic = m.group(1).lower(), _clean_topic(m.group(2))
     if lang not in ("en", "ru", "ro", "lt") or not topic:
         return None
     return lang, topic
+
+
+def _make_hand_check(user: str):
+    """The 'follow up by hand' decision: the open job's topic on YES; None on an
+    explicit NO; "error" when the model could not be reached. An answer that does
+    not parse is listed anyway ("(see chat)") - a wrong briefing line costs a
+    colleague one line to read, a dropped one costs the job."""
+    lines = _ask_lines(user, HAND_SYSTEM)
+    if lines == "error":
+        return "error"
+    stripped = [ln.strip(" `*_") for ln in lines]
+    nos = [ln for ln in stripped if _HAND_NO_LINE_RE.match(ln)]
+    yeses = [m for m in (_HAND_YES_LINE_RE.match(ln) for ln in stripped) if m]
+    if nos and not yeses:
+        return None
+    if yeses and not nos:
+        topic = _clean_topic(yeses[-1].group(1))
+        # ('dropped' / 'briefed' are the log's own markers)
+        return topic if topic and topic.lower() not in ("dropped", "briefed") else "(see chat)"
+    return "(see chat)"   # both, or neither: a person decides
 
 def _send_nextday_in(to: str, params: list, lang_code: str) -> bool:
     try:
@@ -7352,12 +7538,104 @@ def send_nextday_template(to: str, name: str, topic: str, lang: str = "") -> boo
         return _send_nextday_in(to, params, REMINDER_LANG)
     return False
 
+NUDGE_RECENT_BOOKING_DAYS = 14
+NUDGE_STAFF_DAYS = 7
+NUDGE_PAID_CAP_DAYS = 30
+FOLLOWUP_SENT_KINDS = ("same_day", "next_day", "chase_template")
+FOLLOWUP_PAID_KINDS = ("next_day", "chase_template")
+NUDGE_RULES_TEXT = (
+    "A paid 'still interested?' nudge goes only 24-48h after the customer's last "
+    "message, Mon-Fri 10:00-17:00 or Sat 10:00-12:00 (never Sunday) - so enquiries "
+    "from about 11am Friday until 10am Saturday get none. It never goes to anyone with "
+    "a booking (future, or made in the last 14 days), a colleague's message in the "
+    "last 7 days, an alert under 48h old or still open from the last 7 days, a "
+    "promise that a person would come back to them, or a paid nudge in the last 30 "
+    "days. When a colleague's message is the only reason and the customer then asked "
+    "about something new, it goes on the morning briefing to follow up by hand.")
+
+
+def _last_staff_ts(conn, user: str) -> float:
+    """The newest thing a colleague sent this customer from the WhatsApp app."""
+    row = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'staff'",
+                       (user,)).fetchone()
+    took = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+    return max((row[0] if row else 0) or 0, (took[0] if took else 0) or 0)
+
+
+def nudge_blockers(user: str, nowts: float, paid: bool, hand: bool = False) -> list:
+    """Why no automatic nudge may go to this customer, checked BEFORE the model is
+    asked (Stage 1d). [] means nothing is in the way. Codes: booked, staff, alert,
+    promised, paid_cap. Each comes from a real mistake in the week to 23 Sep: Alan's
+    second template after nine days waiting on staff (paid_cap), 919773579970 on a
+    Sunday with an unanswered alert (alert, promised), Michelle's while the garage
+    was already talking to her (staff).
+
+    hand=True is the 'follow up by hand' question, which sends the customer
+    nothing: the job a colleague has just finished does not count as 'booked'
+    (only a booking for a day still ahead, or one made after the colleague last
+    wrote), an alert the colleague has since answered in WhatsApp does not
+    count, and neither does a promise - the one that gets this far is the
+    hang-up text-back, which only invites them to chat."""
+    why = []
+    tail = user[-9:]
+    today_iso = now_local().date().isoformat()
+    with closing(db()) as conn:
+        last_in = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                               (user,)).fetchone()
+        last_in = (last_in[0] if last_in else 0) or 0
+        staff_ts = _last_staff_ts(conn, user)
+        made_since = nowts - NUDGE_RECENT_BOOKING_DAYS * 86400
+        if hand:
+            made_since = max(made_since, staff_ts)
+        if conn.execute(
+                "SELECT 1 FROM bookings WHERE "
+                "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? "
+                "AND (COALESCE(date, '') >= ? OR COALESCE(created_ts, 0) >= ?) LIMIT 1",
+                ("%" + tail, today_iso, made_since)).fetchone():
+            why.append("booked")
+        if staff_ts >= nowts - NUDGE_STAFF_DAYS * 86400:
+            why.append("staff")
+        # Under 48h old: blocked even after Done (a Done after a phone call must
+        # not reopen nudging at once). Unresolved: only inside the waiting-list
+        # window - an older one is a dead row, not a reason to go silent for good.
+        alert = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        fresh = bool(alert) and nowts - (alert[0] or 0) < 48 * 3600
+        if hand and alert and staff_ts > (alert[0] or 0):
+            fresh = False   # a colleague has answered it in WhatsApp since
+        if alert and (fresh or ((alert[0] or 0) >= nowts - WAITING_DAYS * 86400
+                                and not alert_resolved(conn, user, alert[0] or 0))):
+            why.append("alert")
+        if paid and conn.execute(
+                "SELECT 1 FROM followup_log WHERE wa_user = ? AND kind IN "
+                "('next_day', 'chase_template') AND ts >= ? LIMIT 1",
+                (user, nowts - NUDGE_PAID_CAP_DAYS * 86400)).fetchone():
+            why.append("paid_cap")
+    if not hand and person_promised_since(user, last_in):
+        why.append("promised")
+    return why
+
+
+def _log_followup(user: str, kind: str, ts: float, note: str = "") -> None:
+    with closing(db()) as conn, conn:
+        conn.execute("INSERT INTO followup_log (wa_user, kind, ts, note) VALUES (?, ?, ?, ?)",
+                     (user, kind, ts, (note or "")[:120]))
+
+
+def nudge_send_hours(now) -> bool:
+    """Paid nudges: Mon-Fri 10:00-17:00, Saturday 10:00-12:00, never Sunday."""
+    wd, h = now.weekday(), now.hour
+    return (wd < 5 and 10 <= h < 17) or (wd == 5 and 10 <= h < 12)
+
+
 def send_due_nextday_followups() -> None:
     if not (FOLLOWUP_ENABLED and NEXTDAY_ENABLED):
         return
     now = now_local()
-    if not (10 <= now.hour < 19):
-        return  # polite daytime hours only
+    # The loop runs 9am-8pm every day: a 'follow up by hand' decision sends the
+    # customer nothing, so it is not tied to the paid hours. Paid sends are.
+    if not (9 <= now.hour < 20):
+        return
+    paid_hours = nudge_send_hours(now)
     nowts = time.time()
     with closing(db()) as conn:
         users = [r[0] for r in conn.execute(
@@ -7365,11 +7643,11 @@ def send_due_nextday_followups() -> None:
             (nowts - 2 * 86400,)).fetchall()]
     for user in users:
         try:
-            _maybe_nextday(user, nowts)
+            _maybe_nextday(user, nowts, paid_hours)
         except Exception:
             log.exception("Next-day follow-up failed for %s", user)
 
-def _maybe_nextday(user: str, nowts: float) -> None:
+def _maybe_nextday(user: str, nowts: float, paid_hours: bool = True) -> None:
     if is_blocked(user) or (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
         return
     if not bot_enabled() or is_paused(user) or human_handling(user):
@@ -7379,17 +7657,16 @@ def _maybe_nextday(user: str, nowts: float) -> None:
                             "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         last_in = conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
                                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
-        alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        # Every decision about this enquiry is logged, sent or not, so each quiet
+        # lead is judged ONCE - re-asking on every hourly pass would let a
+        # borderline case flip to yes on the twentieth try.
         already = conn.execute(
-            "SELECT 1 FROM followup_log WHERE wa_user = ? AND kind = 'next_day' AND ts > ?",
+            "SELECT 1 FROM followup_log WHERE wa_user = ? AND kind IN "
+            "('next_day', 'next_day_skip', 'hand_followup') AND ts > ?",
             (user, (last_in[0] if last_in else 0))).fetchone()
-        tail = user[-9:]
-        booked = conn.execute(
-            "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
-            "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
-            ((last_in[0] if last_in else nowts), "%" + tail)).fetchone()
         name_row = conn.execute("SELECT name FROM customers WHERE wa_number = ?",
                                 (user,)).fetchone()
+        staff_ts = _last_staff_ts(conn, user)
     if not last or last[0] != "assistant":
         return  # customer came back — nothing to chase
     if not last_in:
@@ -7398,16 +7675,36 @@ def _maybe_nextday(user: str, nowts: float) -> None:
     # Only in the 24h..48h band: window just closed, enquiry still warm.
     if quiet < FOLLOWUP_WINDOW_HOURS * 3600 + 3600 or quiet > 48 * 3600:
         return
-    if already or booked:
+    if already:
         return
-    if alerted and nowts - (alerted[0] or 0) < 48 * 3600:
-        return  # a person is (or was just) on it — don't template over them
-    decision = _make_nextday(user)
+    # A colleague wrote in the last week and nothing else is in the way: no
+    # automatic message can go, but if the customer asked about something new
+    # after that (Michelle, 23 Sep: rear brakes after her service invoice) a person
+    # follows it up from the morning briefing, instead of it being dropped in
+    # silence. Not a paid message, so neither the paid cap nor the paid hours apply.
+    if nudge_blockers(user, nowts, paid=False, hand=True) == ["staff"]:
+        if staff_ts >= last_in[0]:
+            # The colleague wrote after the customer's last message: they have it.
+            _log_followup(user, "next_day_skip", nowts, "staff")
+            return
+        open_job = _make_hand_check(user)
+        if open_job == "error":
+            return   # the model could not be reached: ask again next pass
+        _log_followup(user, "hand_followup" if open_job else "next_day_skip", nowts,
+                      ("staff|" + open_job) if open_job else "staff,model")
+        return
+    if not paid_hours:
+        return   # nothing logged, so an in-hours pass in the band can still send
+    blockers = nudge_blockers(user, nowts, paid=True)
+    if blockers:
+        _log_followup(user, "next_day_skip", nowts, ",".join(blockers))
+        return
+    decision = _make_nudge(user)
+    if decision == "error":
+        return   # the model could not be reached: ask again next pass
     if not decision:
-        with closing(db()) as conn, conn:
-            conn.execute("INSERT INTO followup_log (wa_user, kind, ts) "
-                         "VALUES (?, 'next_day', ?)", (user, nowts))
-        return  # record the SKIP so we never re-judge this enquiry
+        _log_followup(user, "next_day_skip", nowts, "model")
+        return
     lang, topic = decision
     name = (name_row[0].split()[0] if name_row and name_row[0] else "")
     if send_nextday_template(user, name, topic, lang):
@@ -7416,31 +7713,123 @@ def _maybe_nextday(user: str, nowts: float) -> None:
                      f"Hi {name or 'there'}, you were asking us yesterday about "
                      f"{topic}. Would you like me to get you booked in? Just reply "
                      "here and I'll sort it out for you.")
-        with closing(db()) as conn, conn:
-            conn.execute("INSERT INTO followup_log (wa_user, kind, ts) "
-                         "VALUES (?, 'next_day', ?)", (user, nowts))
+        _log_followup(user, "next_day", nowts, topic)
         log.info("Sent next-day nudge to %s (%s)", user, topic)
+    else:
+        _log_followup(user, "next_day_skip", nowts, "send_failed")
 
 def followup_week_stats(days: int = 7) -> str:
-    """One line for the owner's report: nudges sent and bookings they preceded."""
+    """One line for the owner's report: real nudges only (a decision not to send is
+    not a send), how many were paid templates, how many customers answered within
+    48h, and how many booked within 48h."""
     nowts = time.time()
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT wa_user, kind, ts FROM followup_log WHERE ts > ?",
+            "SELECT wa_user, kind, ts FROM followup_log WHERE ts > ? AND kind IN "
+            "('same_day', 'next_day', 'chase_template')",
             (nowts - days * 86400,)).fetchall()
-        sent = len(rows)
-        won = 0
-        for u, kind, ts in rows:
-            tail = u[-9:]
-            hit = conn.execute(
-                "SELECT 1 FROM bookings WHERE created_ts BETWEEN ? AND ? AND "
-                "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
-                (ts, ts + 48 * 3600, "%" + tail)).fetchone()
-            if hit:
-                won += 1
-    if not sent:
-        return "Follow-ups: none sent this week"
-    return f"Follow-ups: {sent} sent → {won} became bookings"
+        # Rows dropped before any briefing showed them (the customer or a
+        # colleague wrote, or they booked) were never handed to anyone.
+        hand = conn.execute(
+            "SELECT COUNT(*) FROM followup_log WHERE ts > ? AND kind = 'hand_followup' "
+            "AND COALESCE(note, '') NOT LIKE '%|dropped'",
+            (nowts - days * 86400,)).fetchone()[0]
+        paid = sum(1 for _u, k, _t in rows if k in FOLLOWUP_PAID_KINDS)
+        replied = booked = 0
+        for u, _kind, ts in rows:
+            if conn.execute("SELECT 1 FROM messages WHERE wa_user = ? AND role = 'user' "
+                            "AND ts > ? AND ts <= ? LIMIT 1",
+                            (u, ts, ts + 48 * 3600)).fetchone():
+                replied += 1
+            if conn.execute(
+                    "SELECT 1 FROM bookings WHERE created_ts BETWEEN ? AND ? AND "
+                    "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? LIMIT 1",
+                    (ts, ts + 48 * 3600, "%" + u[-9:])).fetchone():
+                booked += 1
+    extra = f" · {hand} put on the morning briefing to follow up by hand" if hand else ""
+    if not rows:
+        return "Follow-ups: none sent this week" + extra
+    return (f"Follow-ups: {len(rows)} sent ({paid} paid) → {replied} replied → "
+            f"{booked} booked" + extra)
+
+def relabel_followup_skips() -> None:
+    """One-off (Stage 1d). Until now every SKIP was logged as a sent next_day
+    nudge - the report said 458 sent in 30 days. A next_day row with no template
+    text saved for that customer within the hour after it was a skip."""
+    if get_setting("followup_skips_relabelled") == "1":
+        return
+    # Read once, match in Python, then update by id: a correlated sub-query over
+    # the whole messages table per row would hold the write lock while the
+    # webhook backlog arrives after the deploy.
+    with closing(db()) as conn:
+        sent_at: dict = {}
+        for u, t in conn.execute("SELECT wa_user, ts FROM messages WHERE role = 'assistant' "
+                                 "AND content LIKE '%you were asking us yesterday%'"):
+            sent_at.setdefault(u, []).append(t or 0)
+        skips = [(i,) for i, u, t in conn.execute(
+            "SELECT id, wa_user, ts FROM followup_log WHERE kind = 'next_day'")
+            if not any((t or 0) - 60 <= s <= (t or 0) + 3600 for s in sent_at.get(u, ()))]
+    with closing(db()) as conn, conn:
+        conn.executemany("UPDATE followup_log SET kind = 'next_day_skip', note = 'relabelled' "
+                         "WHERE id = ?", skips)
+    set_setting("followup_skips_relabelled", "1")
+    log.info("Relabelled %d old follow-up skips as next_day_skip", len(skips))
+
+def hand_followup_lines() -> tuple:
+    """For the morning briefing: enquiries the bot did not nudge because a colleague
+    wrote to that customer in the last week, where the customer then asked about
+    something new. (lines, shown ids, dropped ids) - once the briefing is out the
+    shown rows are marked '|briefed' and the dropped ones '|dropped'."""
+    nowts = time.time()
+    done, live = [], []   # done: no longer needs anyone (marked dropped, not shown)
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, wa_user, COALESCE(note, ''), ts FROM followup_log "
+            "WHERE kind = 'hand_followup' AND ts >= ? "
+            "AND COALESCE(note, '') NOT LIKE '%|briefed' "
+            "AND COALESCE(note, '') NOT LIKE '%|dropped' ORDER BY ts",
+            (nowts - 7 * 86400,)).fetchall()
+        for rid, u, note, ts in rows:
+            # A colleague has written since, or the customer has (the bot is on
+            # it and a new cycle starts): nothing left to follow up. A sticker or
+            # reaction is not writing: the bot does not answer it, so no new
+            # cycle would ever start and the job would be lost.
+            if (_last_staff_ts(conn, u) > (ts or 0) or conn.execute(
+                    "SELECT 1 FROM messages WHERE wa_user = ? AND role = 'user' AND ts > ? "
+                    "AND content NOT LIKE '[Customer sent a sticker%' LIMIT 1",
+                    (u, ts or 0)).fetchone()):
+                done.append(rid)
+            else:
+                live.append((rid, u, note))
+    still = []
+    for rid, u, note in live:
+        # Booked since (the diary counts, a phone booking too) or a new alert (it
+        # is on the waiting list already): not a hand follow-up any more.
+        if set(nudge_blockers(u, nowts, paid=False, hand=True)) & {"booked", "alert"}:
+            done.append(rid)
+        else:
+            still.append((rid, u, note))
+    if not still:
+        return [], [], done
+    shown = still[:10]
+    lines = [f"📞 FOLLOW UP BY HAND ({len(still)}) — a colleague talked to these customers "
+             "this week, so the bot did not send its next-day reminder, but they then asked "
+             "about something new:"]
+    for _id, u, note in shown:
+        what = note.split("|", 1)[1] if "|" in note else ""
+        words = ""
+        if not what or what == "(see chat)":
+            # No topic to show: quote their longest real message instead (the
+            # newest is usually "On way" or "thanks").
+            msgs = [" ".join((x or "").split()) for x in _last_customer_messages(u, 4)]
+            msgs = [x for x in msgs if x and not x.startswith("[Customer sent")
+                    and not is_pure_ack(x) and not _THANKS_ONLY_RE.match(x)]
+            words = (max(msgs, key=len) if msgs else "")[:90]
+        lines.append(f"  • {customer_label(u)}" + (f" — {what}" if what else "")
+                     + (f" — “{words}”" if words else "") + f" — https://wa.me/{u}")
+    if len(still) > 10:
+        lines.append(f"  +{len(still) - 10} more — on tomorrow's briefing")
+    return lines, [r[0] for r in shown], done
 
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
@@ -9401,6 +9790,14 @@ def send_daily_briefing(force: bool = False) -> None:
     if _task_lines:
         parts.append("")
         parts.extend(_task_lines)
+    try:
+        _hand_lines, _hand_ids, _hand_dropped = hand_followup_lines()
+    except Exception:
+        log.exception("Could not list the follow-ups to do by hand")
+        _hand_lines, _hand_ids, _hand_dropped = [], [], []
+    if _hand_lines:
+        parts.append("")
+        parts.extend(_hand_lines)
     inv = outstanding_invoices()
     if inv:
         parts.append("")
@@ -9420,10 +9817,23 @@ def send_daily_briefing(force: bool = False) -> None:
                    OWNER_EMAIL or BOOKING_EMAIL_TO)
     except Exception:
         log.exception("Failed to email the daily briefing")
+    if (_hand_ids or _hand_dropped) and not force:
+        try:
+            with closing(db()) as conn, conn:
+                conn.executemany("UPDATE followup_log SET note = COALESCE(note, '') || '|briefed'"
+                                 " WHERE id = ?", [(i,) for i in _hand_ids])
+                conn.executemany("UPDATE followup_log SET note = COALESCE(note, '') || '|dropped'"
+                                 " WHERE id = ?", [(i,) for i in _hand_dropped])
+        except Exception:
+            log.exception("Could not mark the hand follow-ups as briefed")
     log.info("Daily briefing sent (%d in today, %d waiting)", len(today_rows), len(waiting))
 
 def reminder_loop() -> None:
     while True:
+        try:
+            relabel_followup_skips()
+        except Exception:
+            log.exception("Follow-up log relabel failed")
         try:
             send_due_followups()
         except Exception:
@@ -9585,6 +9995,7 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
+                     "nudgetest",
                      "waiting", "claimboard", "claimtest", "claimstatus", "claimname",
                      # Writes, but only ever adds the owner's OWN bookings to the
                      # owner's OWN calendar — it cannot delete or expose anything.
@@ -9911,12 +10322,20 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         num = "".join(ch for ch in date if ch.isdigit())
         if not num:
             return {"error": "provide date=<wa_number>"}
+        nowts = time.time()
         with closing(db()) as conn:
             alerted = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (num,)).fetchone()
-        gated = bool(alerted and time.time() - (alerted[0] or 0) < 24 * 3600)
-        if gated:
+            open_alert = (bool(alerted) and (alerted[0] or 0) >= nowts - WAITING_DAYS * 86400
+                          and not alert_resolved(conn, num, alerted[0] or 0))
+            last_in = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? "
+                                   "AND role = 'user'", (num,)).fetchone()[0]
+        if alerted and (nowts - (alerted[0] or 0) < 24 * 3600 or open_alert):
             return {"user": num, "would_send": False,
-                    "text": "(SKIP - a human was already alerted about this chat)"}
+                    "text": "(SKIP - a person was alerted about this chat recently, "
+                            "or that alert is still open)"}
+        if last_in and person_promised_since(num, last_in):
+            return {"user": num, "would_send": False,
+                    "text": "(SKIP - the customer was told a person would come back to them)"}
         text = _make_followup(num)
         return {"user": num, "would_send": bool(text), "text": text or "(SKIP - no follow-up)"}
     if action == "customers":
@@ -10400,16 +10819,62 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         ok = send_nextday_template(to, "Tadas", "a full service for your car", "en")
         return {"sent": ok, "to": to, "template": NEXTDAY_TEMPLATE}
     if action == "followupstats":
-        # ?date=30 — how many nudges went out over the last N days and how many
-        # customers booked within 48h of getting one.
+        # ?date=30 — the nudges over the last N days: real sends, paid templates,
+        # replies and bookings within 48h. next_day_skip rows are decisions NOT to
+        # send, with the reason in "note"; hand_followup rows went to the briefing.
         days = int(date) if (date or "").isdigit() else 7
         with closing(db()) as conn:
             recent = conn.execute(
-                "SELECT wa_user, kind, datetime(ts, 'unixepoch') FROM followup_log "
-                "WHERE ts > ? ORDER BY ts DESC LIMIT 100",
+                "SELECT wa_user, kind, datetime(ts, 'unixepoch'), COALESCE(note, '') "
+                "FROM followup_log WHERE ts > ? ORDER BY ts DESC LIMIT 100",
                 (time.time() - days * 86400,)).fetchall()
-        return {"summary": followup_week_stats(days),
-                "log": [{"user": u, "kind": k, "at": t} for u, k, t in recent]}
+        return {"summary": followup_week_stats(days), "rules": NUDGE_RULES_TEXT,
+                "log": [{"user": u, "kind": k, "at": t, "note": n} for u, k, t, n in recent]}
+    if action == "nudgetest":
+        # Read-only (Stage 1d). What would the follow-up nudges do for this customer
+        # right now? need=<number>. When nothing but a colleague's message blocks
+        # the paid nudge, the model is asked the nudge question too. Nothing is
+        # sent, saved or logged.
+        num = "".join(c for c in (need or phone or "") if c.isdigit())
+        if not num:
+            return {"error": "need=<number> required"}
+        nowts = time.time()
+        with closing(db()) as conn:
+            last = conn.execute("SELECT role, ts FROM messages WHERE wa_user = ? "
+                                "ORDER BY id DESC LIMIT 1", (num,)).fetchone()
+            last_in = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? "
+                                   "AND role = 'user'", (num,)).fetchone()[0] or 0
+            logged = conn.execute(
+                "SELECT kind, datetime(ts, 'unixepoch'), COALESCE(note, '') FROM followup_log "
+                "WHERE wa_user = ? ORDER BY ts DESC LIMIT 10", (num,)).fetchall()
+            staff_ts = _last_staff_ts(conn, num)
+        paid_blockers = nudge_blockers(num, nowts, paid=True)
+        hand_blockers = nudge_blockers(num, nowts, paid=False, hand=True)
+        quiet_h = round((nowts - last_in) / 3600, 1) if last_in else None
+        bot_last = bool(last and last[0] == "assistant")
+        # Which question the hourly pass would ask (the same order of checks),
+        # and the model's raw answer.
+        question, answer = "(none - something blocks it, or the customer spoke last)", ""
+        if bot_last and hand_blockers == ["staff"]:
+            if staff_ts >= last_in:
+                question = ("(none - a colleague wrote after the customer's last message: "
+                            "the pass skips it as 'staff', the model is not asked)")
+            else:
+                answer = _ask_lines(num, HAND_SYSTEM)
+                question, answer = "follow up by hand?", (
+                    "error" if answer == "error" else " / ".join(answer))
+        elif bot_last and not paid_blockers:
+            question, answer = "paid nudge?", _ask_one_line(num, NUDGE_SYSTEM)
+        return {"user": num, "last_message_by": last[0] if last else None,
+                "hours_since_customer_wrote": quiet_h,
+                "in_paid_band": bool(quiet_h is not None
+                                     and FOLLOWUP_WINDOW_HOURS + 1 <= quiet_h <= 48),
+                "paid_send_hours_now": nudge_send_hours(now_local()),
+                "paid_blockers": paid_blockers, "hand_blockers": hand_blockers,
+                "free_2h_nudge": f"see ?action=followuptest&date={num}",
+                "question": question, "model_answer": answer[:200],
+                "log": [{"kind": k, "at": t, "note": n} for k, t, n in logged],
+                "rules": NUDGE_RULES_TEXT}
     if action == "mkrecoverytemplate":
         # One-time setup: submit the recovery-pickup-request template on both
         # WABAs so send_recovery_request() can always reach Dublin Brothers (or
@@ -12262,6 +12727,7 @@ def handle_missed_call(caller: str, arrived_on: str = "") -> None:
         return  # a colleague owns this chat; they saw the call too
     send_whatsapp(digits, MISSED_CALL_TEXT)
     save_message(digits, "assistant", MISSED_CALL_TEXT)
+    mark_person_promised(digits, "missed_call")
     log.info("Missed WhatsApp call from %s — sent chat invitation", digits)
 
 REAL_ATTACHMENTS = {"document", "video", "audio", "voice"}
