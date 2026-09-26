@@ -2356,27 +2356,53 @@ def booking_already_in_diary(fields: dict) -> bool:
             (date_, reg, phone, "%" + phone[-9:] if phone else "\x00")).fetchone()
     return bool(dupe)
 
+# Opening hours (business_info.md): Mon-Fri 9:00-18:00, Saturday 9:00-14:00, Sunday
+# closed. weekday() -> (open hour, close hour).
+OPEN_HOURS = {0: (9, 18), 1: (9, 18), 2: (9, 18), 3: (9, 18), 4: (9, 18), 5: (9, 14)}
+_HOURS_SENTENCE = ("Opening hours: Monday to Friday 9am-6pm, Saturday 9am-2pm (14:00), "
+                   "Sunday closed.")
+
+
+def _hour_label(h: int) -> str:
+    return f"{h % 12 or 12}{'am' if h < 12 else 'pm'}"
+
+
 def clock_line() -> str:
-    """Tell the model what time it is and whether we are open — 3 Sep 2026 audit:
-    at 21:56 the bot told a breakdown customer 'the team is still looking into
-    whether we can squeeze you in today', and at 18:45 'call us right now'."""
+    """Tell the model what time it is, what day, and whether we are open — 3 Sep
+    2026 audit: at 21:56 the bot told a breakdown customer 'the team is still
+    looking into whether we can squeeze you in today', and at 18:45 'call us right
+    now'. 26 Sep: on a Saturday at 09:14 it told a customer "We're open until 6pm
+    today" (Saturday closes at 2pm) - the line said only "the workshop is OPEN", so
+    the model filled in the weekday hours. Now it says the day and today's close."""
     now = now_local()
     wd, hm = now.weekday(), now.hour + now.minute / 60
-    open_now = (wd < 5 and 9 <= hm < 18) or (wd == 5 and 9 <= hm < 14)
-    if open_now:
-        return f"It is now {now.strftime('%H:%M')} — the workshop is OPEN."
-    if wd == 6 or (wd == 5 and hm >= 14) or (wd == 4 and hm >= 18):
+    day = now.strftime("%A")
+    hours = OPEN_HOURS.get(wd)
+    if hours and hours[0] <= hm < hours[1]:
+        close = _hour_label(hours[1])
+        return (f"It is now {now.strftime('%H:%M')} on {day} — the workshop is OPEN "
+                f"until {close} today. {_HOURS_SENTENCE} If a customer asks when we "
+                f"close today, the answer is {close}.")
+    if wd == 6 or (wd == 5 and hm >= 14):
         when = "on Monday morning at 9am"
+    elif wd == 4 and hm >= 18:
+        # Saturday is a working day (9am-2pm) - the team answers chats then -
+        # unless the owner has closed it (?action=closeday).
+        try:
+            sat_closed = (now.date() + timedelta(days=1)).isoformat() in closed_dates()
+        except Exception:
+            sat_closed = False
+        when = "on Monday morning at 9am" if sat_closed else "tomorrow (Saturday) morning at 9am"
     elif hm >= 18:
         when = "tomorrow morning at 9am"
     else:
         when = "this morning at 9am"
-    return (f"It is now {now.strftime('%H:%M')} — the workshop is CLOSED. Nobody is "
-            f"in the building; the team will see this chat {when}. So: never say the "
+    return (f"It is now {now.strftime('%H:%M')} on {day} — the workshop is CLOSED. Nobody "
+            f"is in the building; the team will see this chat {when}. So: never say the "
             "team is 'looking into it now' or 'will call you shortly', never offer a "
             "drop-off or an answer 'today', never tell the customer to ring now — say "
             f"plainly that we are closed and the team will pick it up {when}. Bookings "
-            "for future days are still fine.")
+            f"for future days are still fine. {_HOURS_SENTENCE}")
 
 def normalize_phone(phone: str) -> str:
     """Digits only, Irish numbers in international form: '086 389 1825',
@@ -5041,13 +5067,59 @@ _AFTER_HOURS_SUBS = [
     (re.compile(r"\bas soon as possible\b", re.I), "{when}"),
 ]
 _CLOCK_WHEN_RE = re.compile(r"will see this chat (.+?)\. So:")
+# "We're open until 6pm today" said on a Saturday (26 Sep 2026, 09:14 - Saturday
+# closes at 2pm). The clock line is the real fix; this only catches the model
+# slipping, so it is deliberately narrow: WE (or the garage) being open, here or
+# closing at 6pm, in a sentence about TODAY. "You could collect at 6pm today",
+# "4 to 6 hours", "Monday to Friday 9am to 6pm", "usually open until 6pm, but
+# today we close at 2pm" and the hidden notes to staff are never touched.
+_SAT_SIX_TODAY_RE = re.compile(
+    r"(?P<pre>\b(?:we(?:'re|’re| are)?|the (?:garage|workshop)(?: is)?)\s+(?:(?:are|is)\s+)?"
+    r"(?:open|here|close|closes|closing|shut)\s+(?:today\s+)?(?:until|till|til|at)\s+)"
+    r"(?P<t>6(?:[:.]00)?\s*(?:pm|p\.m\.)|six(?:\s*(?:pm|p\.m\.))?|18[:.]00)(?![:.]?\d)(?!\w)",
+    re.IGNORECASE)
+# ...and a sentence that is about the week, already right, or not a statement.
+_SAT_SIX_KEEP_RE = re.compile(
+    r"\b(?:mon|tues|wednes|thurs|fri)days?\b|\b(?:mon|tue|wed|thu|fri)\b|\bweek|\busual|\bnormal"
+    r"|\b2\s*pm\b|\b14[:.]00\b|\btwo\b|\bnot\b|n['’]t\b|\?", re.IGNORECASE)
+
+
+def saturday_hours_wording(text: str) -> str:
+    """On a Saturday, a reply that says WE are open (or close) at 6pm TODAY is
+    wrong - Saturday is 9am-2pm. Put 2pm in. Hidden <<<...>>> notes are left
+    alone, and so is any sentence that is about the week or already says 2pm."""
+    try:
+        if now_local().weekday() != 5 or "6" not in text and "six" not in text.lower() \
+                and "18" not in text:
+            return text
+    except Exception:
+        return text
+
+    def fix_part(part: str) -> str:
+        def fix(m):
+            lo = max(part.rfind(c, 0, m.start()) for c in ".!?\n") + 1
+            hi = min([i for i in (part.find(c, m.end()) for c in ".!?\n") if i >= 0]
+                     or [len(part)])
+            sentence = part[lo:hi + 1]
+            if (not re.search(r"\b(?:today|this evening|tonight)\b", sentence, re.IGNORECASE)
+                    or _SAT_SIX_KEEP_RE.search(sentence)):
+                return m.group(0)
+            return m.group("pre") + ("14:00" if m.group("t").startswith("18") else "2pm")
+        return _SAT_SIX_TODAY_RE.sub(fix, part)
+
+    parts = re.split(r"(<<<.*?>>>)", text, flags=re.S)
+    return "".join(p if i % 2 else fix_part(p) for i, p in enumerate(parts))
+
 
 def after_hours_wording(text: str) -> str:
     """When the workshop is closed, swap the model's 'shortly' / 'right back to
     you' / 'straight away' for the honest time ('tomorrow morning at 9am').
     8 Sep 2026: a 23:50 handover still promised a colleague would 'come back to
     them shortly' despite the clock_line rule — the model slips, the regex does
-    not. Only runs outside opening hours; open-hours text is never touched."""
+    not. Only runs outside opening hours; open-hours text is never touched -
+    except "open until 6pm today" on a Saturday (saturday_hours_wording), which
+    every reply path gets through here."""
+    text = saturday_hours_wording(text)
     try:
         line = clock_line()
         if "is CLOSED" not in line:
