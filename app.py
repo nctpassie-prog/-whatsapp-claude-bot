@@ -1214,7 +1214,7 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
                     conn.execute("UPDATE waitlist SET status='done' WHERE id=?", (wid,))
                 continue
             send_whatsapp(digits, msg)
-            save_message(digits, "assistant", msg)
+            save_message(digits, "assistant", msg, kind="slot_offer")
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE waitlist SET status='offered', offered_date=?,"
                              " offered_ts=? WHERE id=?", (freed_date, time.time(), wid))
@@ -1865,6 +1865,12 @@ def db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # "Has a colleague really answered since...?" asks this on every alert, every minute.
+    # Only a speed-up: if it cannot be built right now (the database busy), carry on.
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_user_role_ts ON messages (wa_user, role, ts)")
+    except sqlite3.OperationalError:
+        log.warning("Could not create idx_msg_user_role_ts yet - will retry on the next connection")
     conn.execute("CREATE TABLE IF NOT EXISTS seen (msg_id TEXT PRIMARY KEY, ts REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS paused (wa_user TEXT PRIMARY KEY)")
     # Somebody asking about work, not about their car. Remembered so the owner is
@@ -3259,6 +3265,11 @@ def availability_block() -> str:
         "the day is already fully booked for that kind of work and offer the nearest day "
         "that suits — nothing about why.")
 
+def seen_before(msg_id: str) -> bool:
+    """Read-only twin of already_seen: has this id been recorded?"""
+    with closing(db()) as conn:
+        return conn.execute("SELECT 1 FROM seen WHERE msg_id = ?", (msg_id,)).fetchone() is not None
+
 def already_seen(msg_id: str) -> bool:
     with closing(db()) as conn, conn:
         cur = conn.execute("SELECT 1 FROM seen WHERE msg_id = ?", (msg_id,))
@@ -3461,10 +3472,10 @@ _GENERIC_REASON_RE = re.compile(
 # language the customers write in, and not a placeholder for a sticker or a video.
 _THANKS_ONLY_RE = re.compile(
     r"^\W*(?:ok(?:ay)?\W*)?(?:ок|окей|хорошо|харашо|ладно|mersi|mul[tț]umesc|multumesc|спасибо|благодарю|ačiū|aciu"
-    r"|dzi[eę]kuj[eę]|dzieki|thank(?:s| you)|cheers|grand)\b[\s,.!]*"
-    r"(?:(?:so|very) much|a million|a lot|mult|большое|labai|bardzo)?[\s,.!]*"
+    r"|dzi[eę]kuj[eę]|dzieki|thank(?:s| you)|cheers|grand)\b[\s,.!]*+"
+    r"(?:(?:so|very) much|a million|a lot|mult|большое|labai|bardzo)?[\s,.!]*+"
     r"(?:(?:i |really )?appreciate (?:it|your help|that)|much appreciated|god bless(?: you)?"
-    r"|have a (?:good|nice|great|lovely) (?:day|evening|night|weekend))?[\s,.!👍🙏😊]*$",
+    r"|have a (?:good|nice|great|lovely) (?:day|evening|night|weekend))?[\s,.!👍🙏😊]*+$",
     re.IGNORECASE)
 
 
@@ -3671,10 +3682,18 @@ def alerted_recently(user: str) -> bool:
     with closing(db()) as conn:
         row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, ''),"
                            " COALESCE(kind, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        staff_after = _first_staff_after(conn, user, row[0]) if row else 0
+        booked_after = _first_booking_after(conn, user, row[0]) if row else 0
+        took_after = _echo_after(conn, user, row[0]) if row else 0
     if not row or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600:
         return False
-    if (row[1] or 0) < (row[0] or 0):
-        return True  # still open
+    if ((row[1] or 0) < (row[0] or 0) and not staff_after and not booked_after
+            and not took_after):
+        return True  # still open: nobody has written to them or booked them in since
+    # Since Stage 2a a "Hi" or a 👍 from a colleague, or a booking on an alert that was
+    # not about booking, no longer closes an alert. Before, it did - and this then
+    # judged the chat afresh. Judge it exactly as then, so an alert kept open that way
+    # never mutes the unhappy check.
     # Dealt with. Some OTHER alert (a hand-over, say) being closed used to mute the
     # check for six hours, so a customer who turned unhappy an hour later was never
     # flagged. Now it runs - on what they said since (alert_dealt_with_at).
@@ -3686,10 +3705,50 @@ def alert_dealt_with_at(user: str) -> float:
     with closing(db()) as conn:
         row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(headline, ''),"
                            " COALESCE(kind, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
-    if (not row or (row[1] or 0) < (row[0] or 0) or _is_unhappy_alert(row[2], row[3])
+        staff_after = _first_staff_after(conn, user, row[0]) if row else 0
+        booked_after = _first_booking_after(conn, user, row[0]) if row else 0
+        took_after = _echo_after(conn, user, row[0]) if row else 0
+    if (not row or _is_unhappy_alert(row[2], row[3])
             or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600):
         return 0.0
-    return float(row[1])
+    # Before Stage 2a the FIRST colleague echo after the alert (a "Hi" or a 👍 too) or
+    # any booking closed it, and a later Done or real reply did not move that point
+    # ("Already closed"). Mark the same point: just before that echo, which was saved
+    # after the close.
+    points = [float(row[1])] if (row[1] or 0) >= (row[0] or 0) else []
+    if staff_after:
+        points.append(staff_after - 1e-3)
+    if booked_after:
+        points.append(booked_after)
+    if took_after and not staff_after:
+        points.append(took_after)   # an echo whose row was never saved
+    return min(points) if points else 0.0
+
+
+def _first_staff_after(conn, user: str, since: float) -> float:
+    """When a colleague first wrote to this customer after `since` (0 if not)."""
+    row = conn.execute("SELECT MIN(ts) FROM messages WHERE wa_user = ? AND role = 'staff' "
+                       "AND ts > ?", (user, since or 0)).fetchone()
+    return float((row[0] if row else 0) or 0)
+
+
+def _echo_after(conn, user: str, since: float) -> float:
+    """When a colleague last sent this customer anything from the app, if after `since`
+    (0 if not). Written for EVERY echo, even one whose save failed - what the rule
+    before Stage 2a closed on."""
+    row = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+    t = float((row[0] if row else 0) or 0)
+    return t if t > (since or 0) else 0.0
+
+
+def _first_booking_after(conn, user: str, since: float) -> float:
+    """When this customer was first booked in (any booking) at or after `since` - the
+    point where the rule before Stage 2a closed every alert (0 if not)."""
+    row = conn.execute(
+        "SELECT MIN(created_ts) FROM bookings WHERE created_ts >= ? AND "
+        "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+        (since or 0, "%" + user[-9:])).fetchone()
+    return float((row[0] if row else 0) or 0)
 
 ESCALATION_SYSTEM = (
     "You are quietly monitoring a WhatsApp conversation between a car garage and a "
@@ -3749,8 +3808,11 @@ def check_escalation(user: str) -> None:
         log.info("Escalation detected for %s: %s", user, reason)
         alert_owner(user, ESCALATION_HEADLINE, reason, kind="unhappy")
 
-def mark_human_reply(user: str) -> None:
-    """A colleague answered this customer from the WhatsApp Business app."""
+def mark_human_reply(user: str, content: str = None) -> None:
+    """A colleague sent something to this customer from the WhatsApp Business app. Any
+    echo keeps the bot quiet in that chat, as before. Only a REAL answer closes the alert
+    (Stage 2a, owner's decision 26 Sep): a 👍 reaction, a sticker, "Hi" or "give me 5
+    min" leave the customer still waiting. content=None (not an echo) closes as before."""
     user = "".join(ch for ch in str(user) if ch.isdigit())
     if not user:
         return
@@ -3760,6 +3822,10 @@ def mark_human_reply(user: str) -> None:
             "ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts", (user, time.time()))
     log.info("Human replied to %s from the app; bot will stay quiet for %sh",
              user, AUTO_RESUME_HOURS)
+    if content is not None and not is_real_staff_text(content):
+        log.info("Staff echo for %s is not an answer (%s) - the alert stays open",
+                 user, classify_staff(content))
+        return
     # A real reply is the best possible "Done" — close the claim alert for them.
     try:
         _toast, after = close_alert(user, "replied in WhatsApp", auto=True)
@@ -7203,12 +7269,30 @@ def sweep_stalled_staff_chats() -> None:
             # Skipping reminders: one landing on a chat a colleague has gone
             # quiet on would make the newest row an assistant one, and the
             # customer's question would never be swept back to the bot.
-            last = conn.execute(
+            recent = conn.execute(
                 "SELECT role, content, ts FROM messages WHERE wa_user = ? "
                 "AND COALESCE(kind,'') <> 'reminder' "
-                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+                "ORDER BY id DESC LIMIT 10", (user,)).fetchall()
+            # A colleague's 👍 reaction or "Hi" after the customer's question is not
+            # an answer (Stage 2a): look past it to what the customer is waiting on.
+            skipped, last = [], None
+            for r in recent:
+                # (An old "[colleague replied in the app]" row, saved before Stage 2a,
+                # may have been a photo or a voice-note answer: read as before.)
+                if (r[0] == "staff" and not is_real_staff_text(r[1])
+                        and (r[1] or "").strip() != STAFF_OLD_PLACEHOLDER):
+                    skipped.append(r)
+                    continue
+                last = r
+                break
             if not last or last[0] != "user":
                 continue  # nothing pending from the customer
+            # ...but a 👍 on a thank-you or a plain statement IS the reply. Only a
+            # question is left hanging by one.
+            if skipped and (is_filler_customer_text(last[1]) or (
+                    "?" not in (last[1] or "")
+                    and all(classify_staff(s[1]) in ("reaction", "placeholder") for s in skipped))):
+                continue
             if not (lo <= (last[2] or 0) < hi):
                 continue  # too fresh, or already swept in an earlier pass
             stalled.append((user, last[1] or ""))
@@ -7249,6 +7333,10 @@ def _chase_note(user: str, hours: int, outcome: str) -> None:
     except Exception:
         log.exception("Failed to notify owner about unanswered alert")
 
+# The chase goes out the moment it is decided, so it needs only a small margin inside
+# Meta's 24h window (FOLLOWUP_WINDOW_HOURS keeps its hour for the nudges).
+CHASE_WINDOW_SECONDS = 24 * 3600 - 15 * 60
+
 def chase_unresolved_alerts() -> None:
     """Chase alerts nobody has acted on.
 
@@ -7276,39 +7364,29 @@ def chase_unresolved_alerts() -> None:
             if is_blocked(user) or is_paused(user) or (
                     OWNER_WHATSAPP and user == OWNER_WHATSAPP):
                 continue
+            # ONE rule for "sorted" (alert_resolved: Done, a REAL colleague answer, a
+            # booking for a booking-type alert). And the bot only "moved on" when the
+            # customer's latest real message got a real answer after it (Callum, 30
+            # Aug: a hand-over on a turn the bot also answered well). A thank-you, a
+            # sticker, or the bot's own "a colleague will come back to you" is not an
+            # answer - before Stage 2a any bot line after any customer line counted.
             with closing(db()) as conn:
-                staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
-                                     (user,)).fetchone()
-                booked = conn.execute(
-                    "SELECT 1 FROM bookings WHERE created_ts >= ? AND phone LIKE ?",
-                    (alert_ts, "%" + user[-9:])).fetchone()
-            # Owner's finding 2026-08-30 (Callum): a HANDOVER can fire on the SAME
-            # turn the bot also gives the customer a perfectly good answer — the
-            # alert row gets created, but the conversation itself keeps flowing
-            # normally afterwards. Without this check the chase later sent Callum
-            # an unprompted "sorry for the wait, still on it" for something that
-            # was never actually left open, and he ended up asking if he was
-            # talking to a real person. If the bot has had at least one real
-            # customer message answered with a real (non-fallback) reply since
-            # the alert was raised, treat it as already handled by the bot itself.
-            with closing(db()) as conn:
-                # COALESCE(kind,'') <> 'reminder': a day-before reminder is the
-                # bot starting a conversation, not answering one. Counting it
-                # marked a customer waiting on a PERSON as handled, and this
-                # chase only ever runs once, so they were never chased again.
-                since_alert = conn.execute(
-                    "SELECT role, content FROM messages WHERE wa_user = ? AND ts > ? "
-                    "AND COALESCE(kind,'') <> 'reminder' "
-                    "ORDER BY id ASC", (user, alert_ts)).fetchall()
-            bot_moved_on = (
-                any(role == "user" for role, _ in since_alert)
-                and any(role == "assistant" and (content or "").strip()
-                        and content != BLANK_REPLY_FALLBACK for role, content in since_alert))
-            handled = (staff and (staff[0] or 0) > alert_ts) or booked or bot_moved_on
+                resolved = alert_resolved(conn, user, alert_ts)
+                moved = None if resolved else bot_really_moved_on(conn, user, alert_ts, nowts)
+            if not resolved and moved is None:
+                # Their newest message is minutes old: the next pass decides. Except on
+                # the day's last pass (this runs hourly, 9-20h) when the rule before
+                # Stage 2a would chase now - holding it until 09:00 would be quieter.
+                if not (now.hour == 19 or (now.hour == 18 and now.minute >= 50)):
+                    continue
+                with closing(db()) as conn:
+                    if _bot_spoke_since(conn, user, alert_ts):
+                        continue
+                moved = False
             with closing(db()) as conn, conn:  # mark either way; only chase once
-                conn.execute("UPDATE alerts SET chased_ts = ? WHERE wa_user = ?",
-                             (nowts, user))
-            if handled:
+                conn.execute("UPDATE alerts SET chased_ts = ? WHERE wa_user = ? AND ts = ?",
+                             (nowts, user, alert_ts))
+            if resolved or moved:
                 continue
             hours = int((nowts - alert_ts) / 3600)
             # WhatsApp's 24h wall: once the customer has been silent longer than the
@@ -7321,8 +7399,11 @@ def chase_unresolved_alerts() -> None:
             # whatever goes wrong below, staff still hear about it.
             try:
                 with closing(db()) as conn:
+                    # A phone message the voice agent took is saved as the customer's,
+                    # but a call does not open WhatsApp's 24-hour window.
                     last_in = conn.execute(
                         "SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                        "AND COALESCE(content, '') NOT LIKE '[phone message via the voice agent]%' "
                         "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
             except Exception:
                 log.exception("Chase: could not read the last message for %s", user)
@@ -7331,7 +7412,7 @@ def chase_unresolved_alerts() -> None:
                 _chase_note(user, hours, "They have only called and never typed, so the "
                                          "bot can't message them — please ring them back.")
                 continue
-            if last_in == ("?",) or nowts - last_in[0] > FOLLOWUP_WINDOW_HOURS * 3600:
+            if last_in == ("?",) or nowts - last_in[0] > CHASE_WINDOW_SECONDS:
                 _chase_note(user, hours, "WhatsApp's 24-hour window has closed, so the "
                                          "customer was NOT messaged — please ring them or "
                                          "reply from the WhatsApp app.")
@@ -7357,7 +7438,7 @@ def chase_unresolved_alerts() -> None:
             if text:
                 try:
                     send_whatsapp(user, text)
-                    save_message(user, "assistant", text)
+                    save_message(user, "assistant", text, kind="chase")
                     mark_person_promised(user, "chase")
                     sent = True
                     log.info("Chased unanswered alert for %s (%dh)", user, hours)
@@ -7414,7 +7495,7 @@ def _maybe_followup(user: str, nowts: float) -> None:
                          (user, last_in[0]))
         return
     send_whatsapp(user, text)
-    save_message(user, "assistant", text)
+    save_message(user, "assistant", text, kind="nudge")
     with closing(db()) as conn, conn:
         conn.execute("INSERT INTO followups (wa_user, inbound_ts) VALUES (?, ?) "
                      "ON CONFLICT(wa_user) DO UPDATE SET inbound_ts = excluded.inbound_ts",
@@ -7672,7 +7753,11 @@ def nudge_blockers(user: str, nowts: float, paid: bool, hand: bool = False) -> l
         # window - an older one is a dead row, not a reason to go silent for good.
         alert = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
         fresh = bool(alert) and nowts - (alert[0] or 0) < 48 * 3600
-        if hand and alert and staff_ts > (alert[0] or 0):
+        if hand and alert and any(is_real_staff_text(r[0])
+                                  or (r[0] or "").strip() == STAFF_OLD_PLACEHOLDER
+                                  for r in conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role = 'staff' AND ts > ?",
+                (user, alert[0] or 0))):
             fresh = False   # a colleague has answered it in WhatsApp since
         if alert and (fresh or ((alert[0] or 0) >= nowts - WAITING_DAYS * 86400
                                 and not alert_resolved(conn, user, alert[0] or 0))):
@@ -7784,7 +7869,7 @@ def _maybe_nextday(user: str, nowts: float, paid_hours: bool = True) -> None:
         save_message(user, "assistant",
                      f"Hi {name or 'there'}, you were asking us yesterday about "
                      f"{topic}. Would you like me to get you booked in? Just reply "
-                     "here and I'll sort it out for you.")
+                     "here and I'll sort it out for you.", kind="nudge")
         _log_followup(user, "next_day", nowts, topic)
         log.info("Sent next-day nudge to %s (%s)", user, topic)
     else:
@@ -7905,29 +7990,284 @@ def hand_followup_lines() -> tuple:
 
 DAILY_BRIEF_HOUR = int(os.environ.get("DAILY_BRIEF_HOUR", "8"))
 
+# Stage 2a (26 Sep 2026, owner's decision): only a REAL answer from a colleague closes an
+# alert - a typed reply, a photo, a voice note, a document. A reaction, a sticker, a bare
+# "Hi", "give me 5 min", "will update tomorrow", "seen" or "sorry" do not: the customer is
+# still waiting. (Any staff echo still silences the bot in that chat, as before.)
+STAFF_OLD_PLACEHOLDER = "[colleague replied in the app]"
+_STAFF_MEDIA_PREFIXES = ("[colleague sent a photo", "[colleague sent a voice note",
+                         "[colleague sent an audio", "[colleague sent a document",
+                         "[colleague sent a video", "[colleague sent a location",
+                         "[colleague sent a contact")
+_STAFF_NOT_REAL_PREFIXES = ("[colleague reacted", "[colleague sent a sticker",
+                            "[colleague removed a reaction", "[colleague sent something",
+                            "[colleague deleted", "[colleague edited",
+                            "[colleague sent an empty")
+_STAFF_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF☀-➿️‍\U0001F3FB-\U0001F3FF]")
+_STAFF_GREETING_RE = re.compile(
+    r"^(?i:hi+|hello|hey|hiya|howya|morning|good (?:morning|afternoon|evening)|dia dhuit)"
+    r"(?:[\s,!.]+(?i:there|mate|matr|man|lads|sir|madam|boss|bud|buddy|all|guys|folks))?"
+    r"(?:[\s,]+[A-Z][\w'-]*){0,2}[\s,!.]*$")
+_STAFF_GREETING_PREFIX_RE = re.compile(
+    r"^(?:hi+|hello|hey|hiya|howya|morning|good (?:morning|afternoon|evening))"
+    r"(?:[\s,!.]+(?:there|mate|man|lads|sir|madam|boss|bud|buddy|all|guys))?"
+    r"(?:[\s,]+[A-Z][\w'-]*)?[\s,!.]+", re.IGNORECASE)
+_STAFF_WHEN = (r"(?:now|later|shortly|soon|tomorrow|today|asap|back|again|first thing|anyway"
+               r"|in a (?:bit|min|minute|sec|second|while|few)"
+               r"|in (?:\d+|a few|few|five|ten|two)(?: (?:min|mins|minutes|m))?"
+               r"|this (?:morning|afternoon|evening)|on monday|on (?:mon|tues|wednes|thurs|fri|satur)day)")
+_STAFF_OBJ = (r"(?:it|that|this|you|u|with you|to you|for you|my ?self|myself"
+              r"|(?:with )?(?:the |my |a )?(?:lads|mechanic|boss|supplier|suppliers|guys|parts|customer|team)"
+              r"|(?:the |a )?(?:price|prices|quote|availability|diary)"
+              r"|an? update|(?:a |the )?details"
+              r"|and (?:let you know|come back|get back|update you)(?: to you)?)")
+_STAFF_WHO = r"(?:(?:dima|vlad|tadas|boris|someone|he|she|they|i|we|the mechanic|mechanic|the lads|lads)\s+)?"
+_STAFF_WILL = (r"(?:i'?ll|i will|will|let me|ill|i ll|we'?ll|we will|gonna|going to|i'?m going to"
+               r"|im going to|i'?m gonna|im gonna|i need to|need to)\s+")
+_STAFF_HOLD = (
+    r"(?:(?:give me|gimme|just|wait)\s*)?(?:a |one |1 |two |2 |five |5 |ten |10 |15 |few |a few |couple (?:of )?)?"
+    r"(?:sec|secs|second|seconds|min|mins|minute|minutes|moment|mo)"
+    r"|" + _STAFF_WHO + r"(?:" + _STAFF_WILL + r")?(?:just |now |also |quickly )?"
+    r"(?:check|double check|have a look|take a look|look|find out|see|ask|come back|get back|ring|call"
+    r"|revert|let you know|confirm|give you a (?:call|ring|shout|bell))"
+    r"(?:\s+(?:" + _STAFF_OBJ + r"|" + _STAFF_WHEN + r"))*"
+    # "will send / update / text" is only a holding line with the "will" in front:
+    # a bare "send it please" is the colleague asking the customer for something.
+    r"|" + _STAFF_WHO + _STAFF_WILL + r"(?:just |now |also |quickly )?(?:update|text|message|send)"
+    r"(?:\s+(?:" + _STAFF_OBJ + r"|" + _STAFF_WHEN + r"))*"
+    r"|checking(?:\s+(?:now|it|that|this|with (?:the |my )?(?:lads|mechanic|boss|supplier)))*"
+    r"|hold on|bear with me|on it|leave it with me|looking into it|wait(?: please| pls)?"
+    r"|driving(?: now)?|busy(?: now| atm| at the moment)?|talk (?:later|soon)"
+    r"|seen|received|just saw (?:this|that|it)|sorry(?: for (?:the )?(?:delay|late reply))?|apologies"
+)
+_STAFF_HOLDING_RE = re.compile(
+    r"^(?:(?:ok(?:ay)?|sure|yes|no problem|sorry|thanks|thank you)[\s,.!]+)?(?:" + _STAFF_HOLD + r")"
+    r"(?:[\s,.!]+(?:" + _STAFF_HOLD + r"|please|pls|thanks|thank you|mate|ok))*[\s,.!]*$",
+    re.IGNORECASE)
+_STAFF_ACK_RE = re.compile(
+    r"^(?:ok(?:ay|ey)?|k|kk|grand|perfect|sound|lovely|great|brilliant|cheers|thanks?(?: you| u)?"
+    r"|thx|ty|no (?:problem|worries|bother)|np|cool|nice|super|fab|will do|got it|noted|sure|good"
+    r"|all good|no bother|excellent|ok thanks|ok thank you)"
+    r"(?:[\s,.!]+(?:ok(?:ay)?|thanks?(?: you| u)?|thx|cheers|grand|perfect|great|mate"
+    r"|no (?:problem|worries)))*[\s.!]*$", re.IGNORECASE)
+_STAFF_YESNO_RE = re.compile(r"^(?:yes|yeah|yep|yea|ya|no|nope|not yet|yes please|no thanks)[\s.!]*$",
+                             re.IGNORECASE)
+STAFF_REPLY_COUNTS = {"real", "media", "yesno", "ack"}
+# The holding pattern backtracks exponentially on a long run-on chain of holding words
+# ("check now check now ... x"): 20 of them took 7 s. The longest real holding line is
+# 36 characters; anything longer counts as a real answer, which is the rule before 2a.
+# (Gaps of several spaces were a second way in - "mo   mo   mo ... x", 80 chars, 80 s:
+# the \s* after "give me/just/wait" now binds to that word, and the line is matched
+# with single spaces.)
+STAFF_HOLDING_MAX_LEN = 80
+
+
+def classify_staff(content: str) -> str:
+    """What a colleague's message from the WhatsApp app is: real, media, ack, yesno (these
+    count as an answer) or placeholder, reaction, greeting, holding, question_only, empty
+    (these do not). Whole-message matching, so "Hi, yes we can" is real."""
+    t = (content or "").strip()
+    if not t:
+        return "empty"
+    if t == STAFF_OLD_PLACEHOLDER:
+        return "placeholder"
+    if t.startswith(_STAFF_MEDIA_PREFIXES):
+        return "media"
+    if t.startswith(_STAFF_NOT_REAL_PREFIXES):
+        return "reaction"
+    bare = _STAFF_EMOJI_RE.sub("", t).strip()
+    if not bare:
+        return "ack"               # an emoji typed as a message (not a reaction)
+    if re.fullmatch(r"[?.!\s]+|(?:hello|hi|hey)\s*\?+", bare, re.IGNORECASE):
+        return "question_only"
+    if (_STAFF_GREETING_RE.match(bare) or _STAFF_GREETING_RE.match(bare.capitalize())
+            # "Dima here" - a NAME, not "Nothing here" / "Parts here", which answer.
+            or re.fullmatch(r"(?:it['’]?s |this is )?(?:dima|vlad|tadas|boris|mick)\s+here[\s.!]*",
+                            bare, re.IGNORECASE)):
+        return "greeting"
+    rest = _STAFF_GREETING_PREFIX_RE.sub("", bare, count=1)
+    # One space between words: a run of spaces, newlines or ,.! gives the pattern many
+    # ways to split it, and 80 characters of that took minutes (round-2 review).
+    flat = " ".join(re.sub(r"[,.!]+", " ", rest).split())
+    if len(flat) <= STAFF_HOLDING_MAX_LEN and _STAFF_HOLDING_RE.match(flat):
+        return "holding"
+    if _STAFF_YESNO_RE.match(rest):
+        return "yesno"
+    if _STAFF_ACK_RE.match(rest):
+        return "ack"
+    return "real"
+
+
+def is_real_staff_text(content: str) -> bool:
+    return classify_staff(content) in STAFF_REPLY_COUNTS
+
+
+def staff_echo_content(echo: dict) -> str:
+    """What a colleague sent from the WhatsApp Business app, as it is stored: the text
+    itself, or a placeholder naming what it was. Before Stage 2a every non-text echo was
+    '[colleague replied in the app]', so a photo of the invoice and a 👍 reaction looked
+    the same - and both closed the alert."""
+    kind = (echo.get("type") or "").lower()
+    if not kind:
+        kind = next((k for k in ("text", "image", "video", "document", "audio", "sticker",
+                                 "reaction", "location", "contacts") if echo.get(k)), "")
+
+    def part(k):
+        return echo.get(k) or {}
+
+    def cap(k):
+        c = (part(k).get("caption") or "").strip()
+        return (" " + c) if c else ""
+    if kind == "text":
+        return (part("text").get("body") or "").strip() or "[colleague sent an empty message]"
+    if kind == "image":
+        return "[colleague sent a photo]" + cap("image")
+    if kind == "video":
+        return "[colleague sent a video]" + cap("video")
+    if kind == "document":
+        fn = (part("document").get("filename") or "").strip()
+        return "[colleague sent a document]" + ((" " + fn) if fn else "") + cap("document")
+    if kind in ("audio", "voice"):
+        return ("[colleague sent a voice note]" if (kind == "voice" or part("audio").get("voice"))
+                else "[colleague sent an audio file]")
+    if kind == "location":
+        return "[colleague sent a location]"
+    if kind in ("contacts", "contact"):
+        return "[colleague sent a contact]"
+    if kind == "sticker":
+        return "[colleague sent a sticker]"
+    if kind == "reaction":
+        emoji = (part("reaction").get("emoji") or "").strip()
+        return f"[colleague reacted {emoji}]" if emoji else "[colleague removed a reaction]"
+    if kind in ("edit", "edited"):
+        return "[colleague edited a message]"
+    if kind in ("revoke", "deleted", "delete"):
+        return "[colleague deleted a message]"
+    log.info("Staff echo of an unknown type %r (keys %s)", kind, sorted(echo.keys()))
+    return f"[colleague sent something ({kind or 'unknown'})]"
+
+
+def staff_echo_words(echo: dict) -> str:
+    """The words a colleague typed: the text, or a photo/video/document caption."""
+    for k, f in (("text", "body"), ("image", "caption"), ("video", "caption"),
+                 ("document", "caption")):
+        w = ((echo.get(k) or {}).get(f) or "").strip()
+        if w:
+            return w
+    return ""
+
+
+def is_real_staff_reply(conn, user: str, after_ts: float, until_ts: float = 0) -> bool:
+    """Has a colleague REALLY answered this customer since after_ts (a typed reply, a
+    photo, a voice note - not a reaction, a "Hi" or "give me 5 min")? Any echo moves
+    human_takeover, so that is checked first: this can only ever say yes where the
+    rule before Stage 2a did."""
+    took = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+    if not took or (took[0] or 0) <= (after_ts or 0):
+        return False
+    sql = "SELECT content FROM messages WHERE wa_user = ? AND role = 'staff' AND ts > ?"
+    args = [user, after_ts or 0]
+    if until_ts:
+        sql += " AND ts <= ?"
+        args.append(until_ts)
+    return any(is_real_staff_text(r[0]) for r in conn.execute(sql, args))
+
+
+# Owner's decision, 26 Sep 2026: a booking closes an alert only when the alert was about
+# getting booked in. Last week 4 of 8 booking-closes were wrong: they had booked, but were
+# still waiting to hear whether they could wait on site, or for a quote, or for a call.
+BOOKING_CLOSES_KINDS = {"assist_booking", "not_open_date", "saturday_agreed"}
+BOOKING_CLOSES_TOPICS = {"wants_sooner"}
+
+
+def booking_closes_alert(conn, user: str, since: float, kind: str, topic: str) -> bool:
+    """Does a booking made since `since` settle this alert? Only for booking-type alerts.
+    An alert with no kind (raised before 24 Sep) keeps the old any-booking rule, so no old
+    row comes back onto the waiting lists."""
+    if kind and kind not in BOOKING_CLOSES_KINDS and topic not in BOOKING_CLOSES_TOPICS:
+        return False
+    return bool(conn.execute(
+        "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
+        "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? LIMIT 1",
+        (since, "%" + user[-9:])).fetchone())
+
+
+# Bot-started messages. They are the bot speaking, never the bot ANSWERING the customer.
+NOT_AN_ANSWER_KINDS = {"reminder", "ack", "chase", "claim", "textback", "nudge", "slot_offer"}
+
+
+def is_filler_customer_text(t: str) -> bool:
+    """A customer message that asks nothing: ok, thanks, a thumbs-up, a sticker."""
+    t = (t or "").strip()
+    if not t or t.startswith("[Customer sent a sticker"):
+        return True
+    flat = " ".join(t.split())
+    # _THANKS_ONLY_RE backtracks in cubic time on a long run of spaces/.,! after a thank-
+    # you word (4 kB = minutes, holding up the webhook too). A real thank-you is short;
+    # a long line counting as a real message is the louder side.
+    if len(flat) > 80:
+        return False
+    return (is_pure_ack(flat) or bool(_THANKS_ONLY_RE.match(flat))
+            or flat.strip(" .!").lower() in ("oki", "okk", "okey", "okie", "ta"))
+
+
+def is_promise_text(t: str) -> bool:
+    """A bot line that promises a person will come back - which is not an answer."""
+    return bool(_CLAIMS_A_PERSON_RE.search(t or "") or _CLAIMS_A_PERSON_MORE_RE.search(t or ""))
+
+
+def bot_really_moved_on(conn, user: str, since: float, now: float):
+    """Did the bot really deal with this chat after the alert? True when the customer's
+    LATEST real message since `since` got a real answer after it. False when it did not
+    (a chase is due): a thank-you exchange, a sticker, or the bot's own "a colleague
+    will come back to you" are not an answer. None when that message is under 3 minutes
+    old and still unanswered - the bot may be mid-reply."""
+    rows = conn.execute(
+        "SELECT role, content, COALESCE(kind, ''), ts FROM messages WHERE wa_user = ? "
+        "AND ts > ? AND role IN ('user', 'assistant') ORDER BY id", (user, since)).fetchall()
+    last = None
+    for i, (role, content, _kind, _ts) in enumerate(rows):
+        if role == "user" and not is_filler_customer_text(content):
+            last = i
+    if last is None:
+        return False
+    for role, content, kind, _ts in rows[last + 1:]:
+        c = (content or "").strip()
+        if (role != "assistant" or kind in NOT_AN_ANSWER_KINDS or not c
+                or c == BLANK_REPLY_FALLBACK or c.startswith(UNDELIVERED_PREFIX)
+                or c.startswith("[Template") or is_promise_text(c)):
+            continue
+        return True
+    return None if now - (rows[last][3] or 0) < 180 else False
+
+
+def _bot_spoke_since(conn, user: str, since: float) -> bool:
+    """Has the bot said anything real (not a reminder, not the blank fallback) since
+    `since`? Before Stage 2a the chase took that as 'the bot moved on'."""
+    return conn.execute(
+        "SELECT 1 FROM messages WHERE wa_user = ? AND ts > ? AND role = 'assistant' "
+        "AND COALESCE(kind, '') <> 'reminder' AND TRIM(COALESCE(content, '')) <> '' "
+        "AND content <> ? LIMIT 1", (user, since, BLANK_REPLY_FALLBACK)).fetchone() is not None
+
+
 def alert_resolved(conn, user: str, alert_ts: float) -> bool:
-    """An alert counts as sorted once somebody pressed Done, a colleague replied,
-    OR the customer ended up with a booking - the owner's rule: 'she has a
-    booking already, means sorted'."""
+    """An alert counts as sorted once somebody pressed Done, a colleague REALLY replied
+    (Stage 2a, owner's decision 26 Sep: a typed answer, a photo, a voice note - not a
+    reaction, a sticker, "Hi" or "give me 5 min"), or - for an alert about getting
+    booked in - the customer booked (a booking does not answer a quote or a call-back)."""
     # Somebody pressed the Telegram "Done" button. That is the most explicit
     # answer there is, and it was the one thing this never looked at - so a
     # customer who had been ticked off stayed on the waiting list, in the
     # evening digest and in the morning briefing. It is why that list never
     # seemed to go down.
-    closed = conn.execute("SELECT closed_ts FROM alerts WHERE wa_user = ?",
-                          (user,)).fetchone()
-    if closed and (closed[0] or 0) >= alert_ts:
+    row = conn.execute("SELECT closed_ts, COALESCE(kind, ''), COALESCE(topic, '') FROM alerts "
+                       "WHERE wa_user = ?", (user,)).fetchone()
+    if row and (row[0] or 0) >= alert_ts:
         return True
-    staff = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?",
-                         (user,)).fetchone()
-    if staff and (staff[0] or 0) > alert_ts:
+    if is_real_staff_reply(conn, user, alert_ts):
         return True
-    tail = user[-9:]
-    booked = conn.execute(
-        "SELECT 1 FROM bookings WHERE created_ts >= ? AND "
-        "REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
-        (alert_ts, "%" + tail)).fetchone()
-    return bool(booked)
+    kind, topic = (row[1], row[2]) if row else ("", "")
+    return booking_closes_alert(conn, user, alert_ts, kind, topic)
 
 # ---------------------------------------------------------------- staff claim buttons
 # Every alert that needs a person carries two Telegram buttons. "I've got this"
@@ -7989,7 +8329,7 @@ def tell_customer_claimed(user: str, who: str) -> None:
     text = CLAIMED_CUSTOMER_TEXT.get(lang, CLAIMED_CUSTOMER_TEXT["en"]).format(
         name=f" {first}" if first else "", who=who, biz=CLAIM_BUSINESS_NAME)
     send_whatsapp(user, text)
-    save_message(user, "assistant", text)
+    save_message(user, "assistant", text, kind="claim")
 
 def claim_alert(user: str, who: str) -> tuple:
     """Staff tapped 'I've got this'. Returns (toast, follow-up callable or None) —
@@ -8843,7 +9183,7 @@ def _gap_context_messages(user: str, hours: int = 24, limit: int = 6) -> list:
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT content, ts FROM messages WHERE wa_user = ? AND COALESCE(ts, 0) >= ?"
-            " AND COALESCE(content, '') <> '[colleague replied in the app]'"
+            " AND COALESCE(content, '') NOT LIKE '[colleague %'"
             " ORDER BY id DESC LIMIT ?", (user, time.time() - hours * 3600, limit)).fetchall()
     return [(r[0] or "", r[1] or 0) for r in rows]
 
@@ -9536,7 +9876,7 @@ def send_unresolved_digest() -> None:
         what = f" — {headline[:60]}" if headline else ""
         lines.append(f"• {_alert_label(user, label)} — waiting {waited}{what} — wa.me/{user}")
     if len(waiting) > 15:
-        lines.append(f"+{len(waiting) - 15} more")
+        lines.append(more_waiting_line(waiting[15:]))
     if older:
         lines.append(older_waiting_line(older))
     lines.append("The bot has alerted and chased each one; they need a human reply.")
@@ -9589,6 +9929,23 @@ def older_waiting_line(older: list, most: int = 5) -> str:
             + (f", +{rest} more" if rest else ""))
 
 
+def more_waiting_line(rest: list, most: int = 10) -> str:
+    """"+14 more waiting: Volvo XC60 +353872605247 (12h), +353892170024 (13h), +4 more".
+    A capped list names the longest waits; this names the next ones in the same
+    order, so an older alert kept open never pushes a waiting customer out of sight."""
+    if not rest:
+        return ""
+    now_ = time.time()
+    names = []
+    for u, ts, label, _h in rest[:most]:
+        hrs = int((now_ - ts) // 3600)
+        names.append(f"{_alert_label(u, label)} ({hrs}h)" if hrs < 48
+                     else f"{_alert_label(u, label)} ({hrs // 24}d)")
+    left = len(rest) - len(names)
+    return (f"+{len(rest)} more waiting: " + ", ".join(names)
+            + (f", +{left} more" if left else ""))
+
+
 def send_waiting_conversations(limit: int = 10) -> int:
     """Send each still-waiting customer to Telegram as its OWN message.
 
@@ -9614,7 +9971,7 @@ def send_waiting_conversations(limit: int = 10) -> int:
             log.exception("Could not send waiting conversation for %s", user)
     rest = len(waiting) - min(len(waiting), limit)
     if rest or older:
-        more = [f"+{rest} more waiting (oldest shown first)"] if rest else []
+        more = [more_waiting_line(waiting[limit:])] if rest else []
         if older:
             more.append(older_waiting_line(older))
         try:
@@ -9842,7 +10199,8 @@ def send_daily_briefing(force: bool = False) -> None:
             what = f" — {headline[:70]}" if headline else ""
             parts.append(f"  • {_alert_label(u, label)} — waiting {when}{what}")
         if len(waiting) > 12:
-            parts.append(f"  +{len(waiting) - 12} more")
+            # (5 names: send_telegram cuts the whole briefing at 4000 characters)
+            parts.append("  " + more_waiting_line(waiting[12:], most=5))
         if older:
             parts.append("  " + older_waiting_line(older))
         parts.append("")
@@ -10171,6 +10529,7 @@ READ_ONLY_ACTIONS.add("promisetest")
 READ_ONLY_ACTIONS.add("version")
 READ_ONLY_ACTIONS.add("tasks")
 READ_ONLY_ACTIONS.add("gaptest")
+READ_ONLY_ACTIONS.add("stafftest")
 
 
 def review_link_token() -> str:
@@ -11761,6 +12120,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "courtesy cars, cars already in, and parts brought in alone are "
                         "skipped. It posts after TASK_GRACE_MIN minutes, 8am-8pm, unless "
                         "a row appears first."}
+    if action == "stafftest":
+        # Read-only (Stage 2a). Would this message from a colleague close an alert?
+        return {"text": (need or "")[:200], "class": classify_staff(need or ""),
+                "closes_alert": is_real_staff_text(need or "")}
     if action == "version":
         # Read-only: which commit this build was deployed from (Railway sets it on
         # every GitHub deploy), so a deploy can be confirmed by comparing it with
@@ -12798,7 +13161,7 @@ def handle_missed_call(caller: str, arrived_on: str = "") -> None:
     if human_handling(digits):
         return  # a colleague owns this chat; they saw the call too
     send_whatsapp(digits, MISSED_CALL_TEXT)
-    save_message(digits, "assistant", MISSED_CALL_TEXT)
+    save_message(digits, "assistant", MISSED_CALL_TEXT, kind="textback")
     mark_person_promised(digits, "missed_call")
     log.info("Missed WhatsApp call from %s — sent chat invitation", digits)
 
@@ -13544,14 +13907,38 @@ async def receive(request: Request, background: BackgroundTasks):
                         log.info("Ignoring group echo")
                         continue
                     if customer:
-                        mark_human_reply(customer)
-                        body = (echo.get("text") or {}).get("body", "")
+                        digits = "".join(c for c in customer if c.isdigit())
+                        # Meta re-delivers echoes after a blackout: store each once.
+                        # Looked up here, RECORDED only once it is safely stored: a
+                        # failure below leaves it for Meta's retry to do again.
+                        eid = str(echo.get("id") or "")
+                        if eid and seen_before("echo-" + eid):
+                            continue
                         # Stored as "staff", not "assistant", so the chat viewer can
                         # show who really said it — otherwise a colleague's words look
-                        # like the bot's and reviewing the bot becomes guesswork.
-                        digits = "".join(c for c in customer if c.isdigit())
-                        save_message(digits,
-                                     "staff", body or "[colleague replied in the app]")
+                        # like the bot's and reviewing the bot becomes guesswork. Saved
+                        # FIRST, and named by what it was (Stage 2a): mark_human_reply
+                        # closes the alert only for a real answer.
+                        try:
+                            content = staff_echo_content(echo)
+                        except Exception:
+                            log.exception("Unreadable staff echo for %s", digits)
+                            content = "[colleague sent something (unreadable)]"  # not an answer
+                        try:
+                            save_message(digits, "staff", content)
+                        finally:
+                            # Any echo keeps the bot quiet, even if the save failed.
+                            mark_human_reply(customer, content)
+                        if eid:
+                            try:   # at worst a re-delivery is stored twice
+                                already_seen("echo-" + eid)
+                            except Exception:
+                                log.exception("Could not record echo %s as seen", eid)
+                        try:
+                            body = staff_echo_words(echo)
+                        except Exception:
+                            log.exception("Staff echo words for %s", digits)
+                            body = ""
                         # ...and a colleague naming a day ("Bring over Saturday
                         # morning") the diary does not hold becomes a task.
                         if body:
