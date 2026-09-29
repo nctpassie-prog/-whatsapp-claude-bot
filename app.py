@@ -2392,13 +2392,10 @@ def clock_line() -> str:
     if wd == 6 or (wd == 5 and hm >= 14):
         when = "on Monday morning at 9am"
     elif wd == 4 and hm >= 18:
-        # Saturday is a working day (9am-2pm) - the team answers chats then -
-        # unless the owner has closed it (?action=closeday).
-        try:
-            sat_closed = (now.date() + timedelta(days=1)).isoformat() in closed_dates()
-        except Exception:
-            sat_closed = False
-        when = "on Monday morning at 9am" if sat_closed else "tomorrow (Saturday) morning at 9am"
+        # Saturday is a working day (9am-2pm) - the team answers chats then. A Saturday
+        # closed with ?action=closeday is only fully booked (owner, 28 Sep 2026): the
+        # team is still in.
+        when = "tomorrow (Saturday) morning at 9am"
     elif hm >= 18:
         when = "tomorrow morning at 9am"
     else:
@@ -2407,7 +2404,8 @@ def clock_line() -> str:
             f"is in the building; the team will see this chat {when}. So: never say the "
             "team is 'looking into it now' or 'will call you shortly', never offer a "
             "drop-off or an answer 'today', never tell the customer to ring now — say "
-            f"plainly that we are closed and the team will pick it up {when}. Bookings "
+            f"plainly that we are closed and the team will pick it up {when}. If they "
+            "ask whether we are open, the answer is NO - say when we open again. Bookings "
             f"for future days are still fine. {_HOURS_SENTENCE}")
 
 def normalize_phone(phone: str) -> str:
@@ -5125,6 +5123,10 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
     return _call_claude(messages, retry, user)
 
 _AFTER_HOURS_SUBS = [
+    # "right back to you on this shortly" (10 Sep 19:11 chase): both halves would get
+    # the time, apart, so the "{when} {when}" collapse cannot catch it.
+    (re.compile(r"\bright back to you\b(?P<mid>(?:\s+[\w'’]+){0,3}?)"
+                r"\s+(?:very\s+)?shortly\b", re.I), r"back to you {when}\g<mid>"),
     (re.compile(r"\bright back to you\b", re.I), "back to you {when}"),
     (re.compile(r"\b(?:very )?shortly\b", re.I), "{when}"),
     (re.compile(r"\bin a (?:few|couple of) minutes\b", re.I), "{when}"),
@@ -5142,12 +5144,55 @@ _CLOCK_WHEN_RE = re.compile(r"will see this chat (.+?)\. So:")
 _SAT_SIX_TODAY_RE = re.compile(
     r"(?P<pre>\b(?:we(?:'re|’re| are)?|the (?:garage|workshop)(?: is)?)\s+(?:(?:are|is)\s+)?"
     r"(?:open|here|close|closes|closing|shut)\s+(?:today\s+)?(?:until|till|til|at)\s+)"
-    r"(?P<t>6(?:[:.]00)?\s*(?:pm|p\.m\.)|six(?:\s*(?:pm|p\.m\.))?|18[:.]00)(?![:.]?\d)(?!\w)",
+    r"(?P<t>6(?:[:.]00)?\s*(?:pm|p\.m\.)|6\s*o\s*(?:['’]\s*)?clock"
+    r"|six(?:\s*(?:pm|p\.m\.|o\s*(?:['’]\s*)?clock)"
+    # A bare "six thirty" / "six-fifteen" / "six 30" is another time, not 6pm (it used to
+    # come out as "2pm thirty"). "six-ish" / "6pm-ish" is still 6pm, so it becomes "2pm-ish",
+    # an explicit "6pm - 10 minutes from town" is always 6pm, and "6pm this evening" becomes
+    # "2pm today".
+    r"|(?![\s-]*(?:thirty|fifteen|forty|fifty|twenty|ten|five|and a half|half|\d\d)\b))"
+    r"|18[:.]00)(?![:.]?\d)(?!\w)"
+    r"(?P<eve>\s+(?:this evening|tonight|in the evening)(?:\s+today)?\b)?",
     re.IGNORECASE)
 # ...and a sentence that is about the week, already right, or not a statement.
 _SAT_SIX_KEEP_RE = re.compile(
     r"\b(?:mon|tues|wednes|thurs|fri)days?\b|\b(?:mon|tue|wed|thu|fri)\b|\bweek|\busual|\bnormal"
     r"|\b2\s*pm\b|\b14[:.]00\b|\btwo\b|\bnot\b|n['’]t\b|\?", re.IGNORECASE)
+# ...or a 6pm with a DIFFERENT day written right next to it: "pop in on the 5th - we're open
+# until 6pm", "any other day we're open until 6pm", "we're open until 6pm on 5 October / that
+# day". Today's own date ("today, the 3rd") is not a different day, nor is an ordinal that is
+# not a date ("the 2nd car"). A day anywhere else in the sentence does not count: "Today
+# (Saturday 3 October) we're open until 6pm, and closed tomorrow (Sunday 4 October)" is fixed.
+_SAT_SIX_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+                  r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b")
+_SAT_SIX_OTHER_DAY_RE = re.compile(
+    r"\b(?:any\s+other|another|that|(?:the\s+)?(?:following|next)(?:\s+(?:working|business|open))?)"
+    r"\s+day\b|\bday\s+after\b"
+    r"|\bthe\s+(?P<d1>\d{1,2})(?:st|nd|rd|th)\b(?!\s+(?:time|gear|car|van|hand|one|floor|owner"
+    r"|year|week|day|month|place|line|attempt|test|reg|service|thing|gen|generation|cylinder|slot"
+    r"|headlight|headlamp|lens|light|bulb|job|booking|customer|appointment|visit|side|pair)s?\b)"
+    r"|\b(?P<d2>\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<m2>" + _SAT_SIX_MONTH + ")"
+    r"|\b(?P<m3>" + _SAT_SIX_MONTH + r")\.?\s+(?P<d3>\d{1,2})(?:st|nd|rd|th)?\b",
+    re.IGNORECASE)
+_SAT_SIX_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _sat_six_is_other(m, today) -> bool:
+    d = m.group("d1") or m.group("d2") or m.group("d3")
+    mon = m.group("m2") or m.group("m3")
+    return d is None or int(d) != today.day or bool(
+        mon and mon[:3].lower() != _SAT_SIX_MONTHS[today.month - 1])
+
+
+def _sat_six_attached_other_day(part: str, lo: int, hi: int, m, today) -> bool:
+    # A different day written right after the 6pm ("until 6pm on the 5th", "6pm that day")
+    # or right before its clause ("on the 5th - we're open until 6pm").
+    after = re.match(r"[ \t]*(?:on[ \t]+)?", part[m.end():hi])
+    nxt = _SAT_SIX_OTHER_DAY_RE.match(part, m.end() + after.end(), hi + 1)
+    if nxt and _sat_six_is_other(nxt, today):
+        return True
+    return any(_sat_six_is_other(od, today) and re.fullmatch(r"[\s,;:—–-]*", part[od.end():m.start()])
+               for od in _SAT_SIX_OTHER_DAY_RE.finditer(part, lo, m.start()))
 
 
 def saturday_hours_wording(text: str) -> str:
@@ -5155,26 +5200,130 @@ def saturday_hours_wording(text: str) -> str:
     wrong - Saturday is 9am-2pm. Put 2pm in. Hidden <<<...>>> notes are left
     alone, and so is any sentence that is about the week or already says 2pm."""
     try:
-        if now_local().weekday() != 5 or "6" not in text and "six" not in text.lower() \
+        today = now_local()
+        if today.weekday() != 5 or "6" not in text and "six" not in text.lower() \
                 and "18" not in text:
             return text
     except Exception:
         return text
 
     def fix_part(part: str) -> str:
+        keep = {}   # one verdict per sentence
+
         def fix(m):
             lo = max(part.rfind(c, 0, m.start()) for c in ".!?\n") + 1
             hi = min([i for i in (part.find(c, m.end()) for c in ".!?\n") if i >= 0]
                      or [len(part)])
-            sentence = part[lo:hi + 1]
-            if (not re.search(r"\b(?:today|this evening|tonight)\b", sentence, re.IGNORECASE)
-                    or _SAT_SIX_KEEP_RE.search(sentence)):
+            if (lo, hi) not in keep:
+                sentence = part[lo:hi + 1]
+                # A wrong "today (Friday)" next to the 6pm made this read the sentence as
+                # being about the week: judge it with that weekday corrected.
+                keep[(lo, hi)] = bool(
+                    not re.search(r"\b(?:today|this evening|tonight)\b", sentence, re.IGNORECASE)
+                    # (runs of whitespace squeezed first: _TODAY_WEEKDAY_RE is slow on them)
+                    or _SAT_SIX_KEEP_RE.search(
+                        _fix_today_weekday_claims(re.sub(r"\s+", " ", sentence))))
+            if keep[(lo, hi)]:
                 return m.group(0)
-            return m.group("pre") + ("14:00" if m.group("t").startswith("18") else "2pm")
+            # A 6pm whose own clause says today ("until 6pm today", "open today until 6pm",
+            # "6pm tonight") is today's, whatever day is written next to it.
+            if not (m.group("eve") or re.search(r"\btoday\b", m.group("pre"), re.IGNORECASE)
+                    or re.match(r"[ \t]*(?:today|tonight|this evening)\b", part[m.end():],
+                                re.IGNORECASE)) \
+                    and _sat_six_attached_other_day(part, lo, hi, m, today):
+                return m.group(0)
+            return (m.group("pre") + ("14:00" if m.group("t").startswith("18") else "2pm")
+                    + (" today" if m.group("eve") else ""))
         return _SAT_SIX_TODAY_RE.sub(fix, part)
 
     parts = re.split(r"(<<<.*?>>>)", text, flags=re.S)
     return "".join(p if i % 2 else fix_part(p) for i, p in enumerate(parts))
+
+
+# "Yes, we're open! The team is here and ready for you 👍" went out on Sunday 27 Sep
+# 2026 at 08:41 (headlights, to a customer about to drive over) while the clock line said
+# CLOSED. Only a sentence that is NOTHING BUT that claim is replaced. Anything with more
+# in it - a price, "but we're full", a booking, a question - is left alone: rewriting
+# those garbled replies in review, and the closed clock line already tells the model the
+# answer to "are you open?" is no.
+_OPEN_CLAIM_ONLY_RE = re.compile(
+    r"(?:(?:hi|hiya|hello|hey|good (?:morning|afternoon|evening)|morning|afternoon|evening)"
+    r"(?:\s+[a-z][\w'’-]*)?[\s,!.—–-]*)?"
+    r"(?:(?:no problem(?: at all)?|no worries|sure thing|great)[\s,!.—–-]*)?"
+    r"(?:(?:yes|yep|yeah|yup|sure|absolutely|of course)[\s,!.—–-]*)?"
+    r"(?:we(?:'re|’re| are)\s+(?:open|here|in)(?:\s+(?:right\s+)?now|\s+today)?"
+    r"(?:\s+and the (?:team|lads) (?:is|are) (?:here|in)(?:\s+and ready(?:\s+for you)?)?)?"
+    r"|(?:the|our) (?:team|lads)(?:['’]s| is| are) (?:here|in)(?:\s+(?:right\s+)?now|\s+today)?"
+    r"(?:\s+and (?:ready|waiting)(?:\s+(?:for you|to help))?)?"
+    r"|(?:come|pop|drop|swing|call|head) (?:in|down|over|by)\s+(?:right\s+)?now)"
+    r"(?:[\s,!.—–-]+(?:so\s+)?(?:just\s+)?"
+    r"(?:(?:come|pop|drop|swing|call|head) (?:in|down|over|by)|come on (?:in|down))"
+    r"(?:\s+(?:right\s+)?now|\s+whenever (?:you(?:'re|’re| are) ready|suits(?: you)?|you like|you want)"
+    r"|\s+any ?time)?)?"
+    r"(?:[\s,!.—–-]+see you soon)?[\s!.,—–-]*",
+    re.IGNORECASE)
+# Once the closed line is in, an invitation on its own ("Come on down", "Feel free to pop
+# in.") would contradict it, so it goes too - but only a sentence that is nothing else.
+_OPEN_CLAIM_THEN_RE = re.compile(
+    r"(?:(?:so|just|feel free to)\s+)*(?:come|pop|drop|swing|call|head)\s+(?:on\s+)?"
+    r"(?:in|down|over|by)(?:\s+(?:right\s+)?now|\s+any ?time"
+    r"|\s+whenever (?:you(?:'re|’re| are) ready|suits|you like))?"
+    r"(?:[\s,!.—–-]+see you soon)?[\s!.,—–-]*",
+    re.IGNORECASE)
+# "Yes! We're open" splits into two sentences: a bare "Yes!" before the claim goes with it.
+_OPEN_CLAIM_YES_RE = re.compile(
+    r"(?:(?:no problem(?: at all)?|no worries|sure thing|great|yes|yep|yeah|yup|sure"
+    r"|absolutely|of course)[\s!.,—–-]*){1,3}", re.IGNORECASE)
+_OPEN_CLAIM_EMOJI_RE = re.compile("[☀-➿️‍\U0001F300-\U0001FAFF\U0001F3FB-\U0001F3FF]")
+
+
+def open_now_wording(text: str, when: str) -> str:
+    """While the workshop is CLOSED (after_hours_wording calls this only then): a
+    sentence that is nothing but "we're open" becomes "We're closed right now - we open
+    again <when>." once; any further such sentence is dropped. Nothing else changes."""
+    out, done = [], False
+    for i, part in enumerate(re.split(r"(<<<.*?>>>)", text, flags=re.S)):
+        if i % 2:
+            out.append(part)
+            continue
+        # A sentence ends at . ! ? followed by a space or the end, or at a line break -
+        # never at the "." in "2.0 TDI", "6.30" or "www.x.ie".
+        start, dropped = len(out), False
+        for sentence in re.split(r"(?<=[.!?])(?=\s|$)|(?<=\n)", part):
+            core = _OPEN_CLAIM_EMOJI_RE.sub("", sentence).strip()
+            # "2. Drop in" after a bare list number: replace it, but never drop it.
+            listed = bool(out) and re.fullmatch(r"\s*\d+[.)]", out[-1])
+            if not core or len(core) > 160 or (done and listed) or not (
+                    _OPEN_CLAIM_ONLY_RE.fullmatch(core)
+                    or done and _OPEN_CLAIM_THEN_RE.fullmatch(core)):
+                out.append(sentence)
+                continue
+            lead = sentence[:len(sentence) - len(sentence.lstrip())]
+            tail = sentence[len(sentence.rstrip()):]
+            if not done:
+                # A bare "Yes!" (up to three: "Yes! Absolutely!") just before the claim goes
+                # with it, past any line break between them.
+                j, first, n = len(out), None, 0
+                while j > start:
+                    p = out[j - 1]
+                    if not p.strip():          # a line break between them
+                        j -= 1
+                        continue
+                    if n == 3 or not _OPEN_CLAIM_YES_RE.fullmatch(_OPEN_CLAIM_EMOJI_RE.sub("", p).strip()):
+                        break
+                    first, n, j = j - 1, n + 1, j - 1
+                if first is not None:
+                    lead = out[first][:len(out[first]) - len(out[first].lstrip())]
+                    del out[first:]
+                out.append(f"{lead}We're closed right now — we open again {when}.{tail}")
+                done = True
+            else:
+                dropped = True
+                if "\n" in tail and not "".join(out).endswith("\n"):
+                    out.append("\n")
+        if dropped:   # a dropped sentence must not leave a gap of blank lines behind
+            out[start:] = [re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", "".join(out[start:]))]
+    return "".join(out)
 
 
 def after_hours_wording(text: str) -> str:
@@ -5196,7 +5345,17 @@ def after_hours_wording(text: str) -> str:
         return text
     for rx, rep in _AFTER_HOURS_SUBS:
         text = rx.sub(rep.format(when=when), text)
-    return text
+    # "right back to you shortly" is two substitutions: say the time once.
+    # (Never across a line break: the next line is a sentence of its own.)
+    text = re.sub(re.escape(when) + r"[, \t]+" + re.escape(when), lambda _m: when, text)
+    # "real update coming shortly today" came out "... tomorrow morning at 9am today".
+    text = re.sub(re.escape(when) + r"[ \t]+(?:today|tonight|this evening)\b(?![’'])",
+                  lambda _m: when, text, flags=re.IGNORECASE)
+    try:
+        return open_now_wording(text, when)
+    except Exception:
+        log.exception("open_now_wording failed")
+        return text
 
 # Words that make a sentence about BOOKING rather than just mentioning a date.
 # Listing every way the model can phrase an offer is hopeless — 9 Sep 2026 it used
@@ -7214,7 +7373,8 @@ def _make_followup(user: str) -> str:
     if (not text or re.search(r"\bSKIP\b", text)
             or (text.startswith("(") and text.endswith(")"))):
         return ""
-    return fix_weekday_mentions(strip_phone_readback(text))
+    # It runs 9-20h every day, so often while we are closed (28 Sep review).
+    return fix_weekday_mentions(after_hours_wording(strip_phone_readback(text)))
 
 ALERT_CHASE_HOURS = float(os.environ.get("ALERT_CHASE_HOURS", "3"))
 
@@ -10530,6 +10690,7 @@ READ_ONLY_ACTIONS.add("version")
 READ_ONLY_ACTIONS.add("tasks")
 READ_ONLY_ACTIONS.add("gaptest")
 READ_ONLY_ACTIONS.add("stafftest")
+READ_ONLY_ACTIONS.add("wordingtest")
 
 
 def review_link_token() -> str:
@@ -12120,6 +12281,12 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "courtesy cars, cars already in, and parts brought in alone are "
                         "skipped. It posts after TASK_GRACE_MIN minutes, 8am-8pm, unless "
                         "a row appears first."}
+    if action == "wordingtest":
+        # Read-only (29 Sep). What the reply fixers make of a text at this moment:
+        # the Saturday hours net, the closed-now wording and the weekday guard.
+        t = (need or "")[:2000]
+        return {"text": t, "clock": clock_line(),
+                "fixed": fix_weekday_mentions(after_hours_wording(t))}
     if action == "stafftest":
         # Read-only (Stage 2a). Would this message from a colleague close an alert?
         return {"text": (need or "")[:200], "class": classify_staff(need or ""),
