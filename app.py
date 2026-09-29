@@ -6958,11 +6958,20 @@ def already_confirmed_since(phone: str, since_ts: float) -> bool:
     try:
         with closing(db()) as conn:
             return bool(conn.execute(
-                "SELECT 1 FROM messages WHERE wa_user LIKE ? AND role = 'assistant'"
-                # The owner's Telegram message about something else is not the date
-                # (29 Sep 2026); his booking confirmation (kind 'owner_book') is.
-                " AND COALESCE(kind, '') <> 'owner_tg'"
-                " AND COALESCE(ts, 0) >= ? LIMIT 1",
+                "SELECT 1 FROM messages m WHERE m.wa_user LIKE ? AND m.role = 'assistant'"
+                # Only a message that told them the date: a normal reply or the owner's
+                # Telegram booking confirmation ('owner_book'). Not his Telegram message
+                # about something else ('owner_tg'), and never the bot's own reminder,
+                # chase or nudge - a failed reminder must not count as "told" (29 Sep 2026).
+                " AND COALESCE(m.kind, '') IN ('', 'owner_book')"
+                " AND COALESCE(m.ts, 0) >= ?"
+                " AND COALESCE(m.content, '') NOT LIKE '[NOT DELIVERED%'"
+                # ...and only if WhatsApp would have delivered it: the customer wrote in the
+                # 24 hours before. A phone caller who never WhatsApp'd us gets the free-form
+                # confirmation refused (131047) - the reminder template is what reaches them.
+                " AND EXISTS (SELECT 1 FROM messages u WHERE u.wa_user = m.wa_user"
+                " AND u.role = 'user' AND u.ts <= m.ts AND u.ts >= m.ts - 86400)"
+                " LIMIT 1",
                 ("%" + digits[-9:], since_ts)).fetchone())
     except Exception:
         log.exception("Could not check whether %s was already told", digits[-9:])
@@ -6992,7 +7001,17 @@ def send_due_reminders() -> None:
         # nothing at all - for those the reminder is the ONLY message they ever
         # get, and watch_staff_booking's Telegram note promises it will go out.
         # So the question is whether we have actually written to them since.
-        if made_ts and already_confirmed_since(phone, made_ts):
+        # ...and only for a booking made today, Irish time (owner, 29 Sep 2026): "booked
+        # today" ALONE was the wrong test, but so is "written to since" alone - somebody
+        # who booked a week ago was written to since, by the bot's own confirmation that
+        # day, and skipping them stopped nearly every reminder from 23 Sep (garage
+        # bookings 24-30 Sep: 2 of 40 reminded). Booked on an earlier day: remind.
+        try:
+            booked_today = bool(made_ts) and (
+                datetime.fromtimestamp(made_ts, now.tzinfo).date() == now.date())
+        except Exception:
+            booked_today = False
+        if booked_today and already_confirmed_since(phone, made_ts):
             log.info("Reminder for booking %s skipped - they were told when they booked", bid)
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
