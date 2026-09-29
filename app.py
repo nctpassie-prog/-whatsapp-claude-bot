@@ -195,6 +195,19 @@ TELEGRAM_CHAT_IDS = [c for c in (x.strip() for x in
 CLAIM_ESCALATE_MIN = int(os.environ.get("CLAIM_ESCALATE_MIN", "30"))
 CLAIM_OWNER_MIN = int(os.environ.get("CLAIM_OWNER_MIN", "120"))
 CLAIM_MANAGER_MENTION = os.environ.get("CLAIM_MANAGER_MENTION", "@Tadasdiesel")
+# The owner's notes from his private Telegram chat, drafted into WhatsApp messages he
+# approves with a button (29 Sep 2026). OWNER_TG_CMD=0 switches the whole thing off.
+# OWNER_TG_BOOK=1 lets a "book ..." note put them in the diary - off until it has had
+# its own review (owner, 29 Sep 2026); while off, a "book ..." note is refused.
+OWNER_TG_CMD = os.environ.get("OWNER_TG_CMD", "1") == "1"
+OWNER_TG_BOOK = os.environ.get("OWNER_TG_BOOK", "0") == "1"
+OWNER_DRAFT_TTL_MIN = int(os.environ.get("OWNER_DRAFT_TTL_MIN", "120"))
+OWNER_DRAFT_MAX_CHARS = 1000
+# Named on every draft, so a note typed into the other bot's chat is seen for what it is.
+OWNER_TG_BUSINESS = "NCTPass garage"
+# The business's own numbers: one at the start of a note is not a customer to refuse.
+OWNER_TG_OWN_NUMBERS = ("0857777888", "0866677666", "012659310")
+OWNER_TG_MOBILE = "0858182839"   # the owner's own mobile (on the block list)
 
 # Last delivery receipts from WhatsApp, so ?action=delivery can show whether an
 # alert actually landed without digging through the platform logs.
@@ -2028,6 +2041,21 @@ def db() -> sqlite3.Connection:
                  " said_ts REAL DEFAULT 0)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_key "
                  "ON tasks (kind, wa_user, date)")
+    # The owner's Telegram notes to customers (29 Sep 2026): one row per note he typed.
+    # The draft he approves is the text that is sent, byte for byte; the buttons carry
+    # only id + created_ts. The unique (src_chat, src_mid) makes a note Telegram
+    # delivers twice (after a restart) a no-op.
+    conn.execute("CREATE TABLE IF NOT EXISTS owner_drafts ("
+                 " id INTEGER PRIMARY KEY AUTOINCREMENT, wa_user TEXT DEFAULT '',"
+                 " kind TEXT DEFAULT '', owner_text TEXT DEFAULT '', draft_text TEXT DEFAULT '',"
+                 " draft_en TEXT DEFAULT '', booking_json TEXT DEFAULT '',"
+                 " src_chat TEXT, src_mid INTEGER, preview_chat TEXT DEFAULT '',"
+                 " preview_mid INTEGER DEFAULT 0, preview_text TEXT DEFAULT '',"
+                 " alert_ts REAL DEFAULT 0, built_ts REAL DEFAULT 0, created_ts REAL,"
+                 " status TEXT DEFAULT 'drafting', done_ts REAL DEFAULT 0,"
+                 " wamid TEXT DEFAULT '', result TEXT DEFAULT '', parent_id INTEGER DEFAULT 0)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_draft_src "
+                 "ON owner_drafts (src_chat, src_mid)")
     # Tidy (2026-09-03): bookings stored with a phone like '0863891825',
     # '085 811 9977' or '+353…' never received their reminder / review texts.
     try:
@@ -3058,14 +3086,26 @@ def _colleague_named_saturday(user: str, date_str: str) -> bool:
     try:
         with closing(db()) as conn:
             rows = conn.execute(
-                "SELECT role, content, COALESCE(ts, 0) FROM messages WHERE wa_user = ?"
-                " AND role IN ('staff', 'assistant') AND COALESCE(ts, 0) >= ? ORDER BY id",
-                (user, now_local().timestamp() - 7 * 86400)).fetchall()
+                "SELECT role, content, COALESCE(ts, 0), COALESCE(kind, '') FROM messages"
+                " WHERE wa_user = ? AND role IN ('staff', 'assistant') AND COALESCE(ts, 0) >= ?"
+                " ORDER BY id", (user, now_local().timestamp() - 7 * 86400)).fetchall()
     except Exception:
         return False
-    for role, content, ts in rows:
+    try:
+        # ...and in English: the saved text is in the customer's language (a Russian or
+        # Lithuanian draft names no "Saturday" these tests can read).
+        with closing(db()) as conn:
+            rows += [("staff", en, done, "owner_en") for en, done in conn.execute(
+                "SELECT COALESCE(draft_en, ''), COALESCE(done_ts, 0) FROM owner_drafts"
+                " WHERE wa_user = ? AND status = 'sent' AND COALESCE(done_ts, 0) >= ?",
+                (user, now_local().timestamp() - 7 * 86400)).fetchall() if en]
+    except Exception:
+        pass
+    for role, content, ts, kind in rows:
         text = content or ""
-        if text.lstrip().startswith("[") or (role == "assistant"
+        # The owner's words sent from Telegram (kind 'owner_...', 29 Sep 2026) are a
+        # person's, as a colleague's are.
+        if text.lstrip().startswith("[") or (role == "assistant" and not kind.startswith("owner_")
                                              and not _SAT_OWNER_TEXT_RE.search(text)):
             continue
         if dated.search(text):
@@ -5781,6 +5821,62 @@ def no_false_checking(text: str) -> str:
         text = rx.sub(rep, text)
     return text
 
+def after_new_booking(user: str, booking: dict, source: str, regcheck: bool = True) -> None:
+    """Everything that follows a NEW diary row: the booking note and calendar entry,
+    the email, the register check, the two-bookings alert and this bot's own extras.
+    Moved out of _finish_reply unchanged (29 Sep 2026) so the owner's Telegram bookings
+    run the very same code as a chat booking; `source` names the path in the
+    register-check note (it was the literal "chat booking"). regcheck=False only for
+    the owner's "✅ Book (no message)": the register check would text a customer he
+    chose not to message, and its saved Bot row would cancel their day-before reminder."""
+    try:
+        notify_owner_booking(booking)
+    except Exception:
+        log.exception("Failed to notify owner of booking")
+    try:
+        email_booking(booking)
+    except Exception:
+        log.exception("Failed to email booking")
+    try:
+        wl = dict(booking)
+        wl["phone"] = wl.get("phone") or user
+        add_to_waitlist(wl)             # wanted= field -> cancellation list
+        settle_waitlist_after_booking(wl)  # accepted an earlier slot -> move
+    except Exception:
+        log.exception("Waitlist bookkeeping failed")
+    bf = dict(booking)
+    bf["phone"] = bf.get("phone") or user
+    if regcheck:
+        threading.Thread(target=_register_check_followup,
+                          args=(bf, source), daemon=True).start()
+    # A second future booking for the same car usually means the customer
+    # asked to move and the old row was never cancelled. Deliberately NOT
+    # auto-cancelled: a customer CAN legitimately hold two bookings (one
+    # did on 16 Sep - a comeback that day and a diagnosis the next week),
+    # and cancel_booking matched on reg alone would delete both. Name both
+    # rows and let a person decide.
+    try:
+        # Floored at yesterday, so this means "date >= today". It used
+        # to pass 1900-01-01, which made a function called
+        # later_booking_exists return the EARLIEST row of all time —
+        # every past visit included — so the alert fired on history and
+        # missed a genuine second future booking.
+        other = later_booking_exists(
+            0, bf.get("phone", ""), bf.get("reg", ""),
+            (now_local().date() - timedelta(days=1)).isoformat())
+        if other and other[1] != bf.get("date"):
+            send_telegram(
+                "⚠️ THIS CAR NOW HAS TWO BOOKINGS\n"
+                f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
+                f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
+                f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
+                "If they moved, cancel the one they are not coming to:\n"
+                f"{PUBLIC_URL}/admin?token={review_link_token()}"
+                f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
+                f"&need={other[1]}")
+    except Exception:
+        log.exception("Double-booking check failed for %s", bf.get("phone"))
+
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
@@ -5938,52 +6034,7 @@ def _finish_reply(user: str, answer: str) -> str:
         # A repeat of a booking we already hold must not alert, email or make a
         # second calendar entry — that is what filled the diary with doubles.
         if is_new:
-            try:
-                notify_owner_booking(booking)
-            except Exception:
-                log.exception("Failed to notify owner of booking")
-            try:
-                email_booking(booking)
-            except Exception:
-                log.exception("Failed to email booking")
-            try:
-                wl = dict(booking)
-                wl["phone"] = wl.get("phone") or user
-                add_to_waitlist(wl)             # wanted= field -> cancellation list
-                settle_waitlist_after_booking(wl)  # accepted an earlier slot -> move
-            except Exception:
-                log.exception("Waitlist bookkeeping failed")
-            bf = dict(booking)
-            bf["phone"] = bf.get("phone") or user
-            threading.Thread(target=_register_check_followup,
-                              args=(bf, "chat booking"), daemon=True).start()
-            # A second future booking for the same car usually means the customer
-            # asked to move and the old row was never cancelled. Deliberately NOT
-            # auto-cancelled: a customer CAN legitimately hold two bookings (one
-            # did on 16 Sep - a comeback that day and a diagnosis the next week),
-            # and cancel_booking matched on reg alone would delete both. Name both
-            # rows and let a person decide.
-            try:
-                # Floored at yesterday, so this means "date >= today". It used
-                # to pass 1900-01-01, which made a function called
-                # later_booking_exists return the EARLIEST row of all time —
-                # every past visit included — so the alert fired on history and
-                # missed a genuine second future booking.
-                other = later_booking_exists(
-                    0, bf.get("phone", ""), bf.get("reg", ""),
-                    (now_local().date() - timedelta(days=1)).isoformat())
-                if other and other[1] != bf.get("date"):
-                    send_telegram(
-                        "⚠️ THIS CAR NOW HAS TWO BOOKINGS\n"
-                        f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
-                        f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
-                        f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
-                        "If they moved, cancel the one they are not coming to:\n"
-                        f"{PUBLIC_URL}/admin?token={review_link_token()}"
-                        f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
-                        f"&need={other[1]}")
-            except Exception:
-                log.exception("Double-booking check failed for %s", bf.get("phone"))
+            after_new_booking(user, booking, "chat booking")
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -6484,6 +6535,62 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
     except Exception:
         log.exception("Failed to send WhatsApp message to %s", to)
 
+def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
+    """send_whatsapp for a message the owner approved in Telegram: the same checks and
+    the same business line, but it says whether WhatsApp took it - (wamid, "") or
+    ("", why). Chakra can answer 200 with an error body (the 24-hour window), so that
+    counts as refused, as for the reminders. The caller saves the message only once it
+    is accepted, so a refused one never shows as a Bot bubble. since = when the draft
+    was built: the same words from 15 minutes before that on are not sent again, as its
+    preview promised (F-2)."""
+    if not (text and text.strip()):
+        return "", "the message is empty"
+    text = fix_mojibake(text)
+    try:
+        with closing(db()) as conn:
+            dup = conn.execute(
+                "SELECT ts FROM messages WHERE wa_user = ? AND role IN ('assistant','staff') "
+                "AND content = ? AND ts > ? ORDER BY id DESC LIMIT 1",
+                (to, text.strip(), min(time.time(), since or time.time()) - 15 * 60)).fetchone()
+        if dup:   # not WhatsApp refusing: they already have exactly this
+            return "", "dup: " + datetime.fromtimestamp(dup[0] or 0, now_local().tzinfo).strftime("%H:%M")
+    except Exception:
+        pass  # the dedupe check must never stop a real send
+    # No webhook context here (a Telegram thread): the line this customer last used.
+    from_phone_id = "" if _ctx_phone_id.get() else phone_id_for_customer(to)
+    url, token = send_endpoint(from_phone_id)
+    try:
+        r = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            json={"messaging_product": "whatsapp", "to": to, "type": "text",
+                  "text": {"body": text[:4096]}},
+            timeout=30,
+        )
+        body = r.text or ""
+        if r.status_code >= 300 or '"error"' in body:
+            log.warning("Owner's message to %s refused: HTTP %s %s", to, r.status_code, body[:400])
+            try:
+                e = r.json().get("error")
+                err = (e.get("message") if isinstance(e, dict) else str(e or "")) or ""
+            except Exception:
+                err = ""
+            why = f"HTTP {r.status_code}" + (f": {err[:120]}" if err else "")
+            # A gateway error (5xx) can come after WhatsApp already took the message.
+            return "", ("unsure: " + why) if r.status_code >= 500 else why
+        try:
+            wamid = ((r.json().get("messages") or [{}])[0].get("id") or "")
+        except Exception:
+            wamid = ""
+        return wamid or "sent", ""
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        log.exception("Owner's message to %s failed", to)
+        return "", type(exc).__name__           # it never reached Chakra
+    except Exception as exc:
+        # A read timeout or a dropped connection: the request may already be with WhatsApp.
+        log.exception("Owner's message to %s failed", to)
+        return "", "unsure: " + type(exc).__name__
+
 # ---------------------------------------------------------------- reminders
 def _send_reminder_in(to: str, params: list, lang_code: str) -> str:
     """The WhatsApp message id on success, "" when the send was refused."""
@@ -6829,6 +6936,9 @@ def already_confirmed_since(phone: str, since_ts: float) -> bool:
         with closing(db()) as conn:
             return bool(conn.execute(
                 "SELECT 1 FROM messages WHERE wa_user LIKE ? AND role = 'assistant'"
+                # The owner's Telegram message about something else is not the date
+                # (29 Sep 2026); his booking confirmation (kind 'owner_book') is.
+                " AND COALESCE(kind, '') <> 'owner_tg'"
                 " AND COALESCE(ts, 0) >= ? LIMIT 1",
                 ("%" + digits[-9:], since_ts)).fetchone())
     except Exception:
@@ -8613,6 +8723,8 @@ def handle_claim_callback(cq: dict) -> None:
             toast, after = close_alert(user, who, tapped_ts=_tag)
         elif kind == "task" and user:
             toast, after = close_task(int(user), who, tapped_ts=_tag)
+        elif kind in ("osend", "ocancel") and user:
+            toast, after = owner_draft_tap(kind, int(user), _tag, cq)
     except Exception:
         log.exception("Claim button failed: %s", data)
         toast = "Something went wrong — try again."
@@ -8746,6 +8858,1839 @@ def tg_seen_chats() -> dict:
         return dict(json.loads(get_setting("tg_seen_chats") or "{}"))
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------- owner's Telegram notes
+# Tadas swipe-replies in his private Telegram chat to an alert about a customer and
+# types what to tell them ("car ready Friday from 9"). The bot drafts the WhatsApp
+# message in the customer's language and shows it with ✅ Send / ❌ Cancel; nothing
+# goes to a customer until he taps ✅. A note starting BOOK also puts them in the
+# diary, through the chat path's own rules. Owner's decisions, 29 Sep 2026: no "book
+# anyway" button; a BOOK note for someone the bot can't message books them with no
+# message (he rings them); car/reg optional on headlights, as in chat; the bot is NOT
+# silenced afterwards; "0871234567: text" works without an alert; drafts last 2 hours.
+_OWNER_MODEL_FAILED = "Sorry, I couldn't process your message right now"   # _call_claude's apology
+_OWNER_BOOK_RE = re.compile(r"^\s*(?:please\s+|pls\s+)?book(?:ing)?\b[\s:,-]*", re.I)
+# Our own Telegram messages name their customer on a line of its own: "💬 Reply in
+# WhatsApp: …", "Reply: … — then press Done", "Open chat: …", "Chat: …", "Message
+# them: …", "💬 https://wa.me/…" (booking refused), "📜 …&user=…" (history link, NOT
+# DELIVERED), "From: <label> +353…" and "Phone: …" (booking note, job enquiry). A
+# conversation excerpt line always starts "Customer:", "Bot:" or "Your team:", so a
+# number a customer typed can never match; lists of customers use "•" lines.
+_OWNER_LINK_RES = (
+    re.compile(r"^(?:\U0001F4AC\s*)?(?:(?:Reply in WhatsApp|Reply|Open chat|Chat|Message them):\s*)?"
+               r"https://wa\.me/(\d{7,15})\b", re.M),
+    re.compile(r"^\U0001F4DC[^\n]*[?&]user=(\d{7,15})\b", re.M),
+    re.compile(r"^From:[^\n]*\+(\d{7,15})\s*$", re.M),
+    re.compile(r"^Phone:\s*\+?(\d[\d \-]{6,18}\d)\s*$", re.M),
+)
+_OWNER_ANY_LINK_RE = re.compile(r"wa\.me/(\d{7,15})")
+_OWNER_NUMBER_PREFIX_RE = re.compile(r"^\s*\+?(\d[\d ]{7,16}\d)\s*[:\-–]\s*(\S[\s\S]*)$")
+# A phone number in any of the ways it gets typed or pasted: "087-111-0003", "(087) 111
+# 0003", "+353 87 111 0003", with the invisible marks a phone's contacts app adds.
+_OWNER_MARKS_RE = re.compile("[  -‏‪- ⁠⁦-⁩﻿]")
+_OWNER_ANY_NUMBER_RE = re.compile(r"(?<!\d)\(?\+?(\d(?:[\s\-.()]{0,3}\d){8,14})(?!\d)")
+# "yes", "send it", "ok 👍", "gerai", "да" typed under a draft: he means ✅, which typing
+# cannot do (owner, 29 Sep 2026). Only a short message of nothing but these words.
+_OWNER_TYPED_OK_RE = re.compile(
+    r"^\s*(?:(?:yes|yeah|yep|yup|ya|ok(?:ay|ey|ie|i)?|k|sure|grand|perfect|great|good|fine|lovely"
+    r"|please|pls|plz|thanks|thank\s+you|thx|thnx|cheers|go(?:\s+ahead|\s+for\s+it)?|send(?:\s+it)?(?:\s+now)?"
+    r"|approved?|looks?\s+(?:good|grand|fine)|all\s+good|👍|✅|✔|☑|👌|🙏"
+    r"|taip|gerai|si[uų]sk|a[cč]i[uū]|да|ок|давай|отправ(?:ь|ляй)|хорошо|tak|wy[sś]lij|da|trimite)"
+    r"[\s.,!]*)+\Z", re.I)
+_OWNER_EMOJI_MODS_RE = re.compile("[\U0001F3FB-\U0001F3FF️]")   # skin tones, the emoji mark
+_OWNER_ALBUMS: dict = {}   # media_group_id -> first seen: one refusal per album
+# What an attachment is called in the refusal.
+_OWNER_MEDIA_NAMES = {"photo": "the photo", "animation": "the GIF", "video": "the video",
+                      "video_note": "the video", "document": "the file", "audio": "the audio",
+                      "sticker": "the sticker", "location": "the location", "venue": "the location",
+                      "contact": "the contact", "poll": "the poll", "dice": "it"}
+_OWNER_NUM_RE = re.compile(r"\d+(?:[.:,]\d+)?")
+# Weekday names in a BOOK note, to cross-check the model's date. Not "sat", "sun",
+# "mon" or "wed": "sat nav", "sun roof" would stop a real booking.
+_OWNER_WEEKDAY_NAME_RE = re.compile(
+    r"\b(monday|tuesday|tues|tue|wednesday|weds|thursday|thurs|thur|thu|friday|fri"
+    r"|saturday|sunday)\b", re.I)
+_OWNER_WEEKDAY_NUM = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+# A day of the month in a BOOK note ("9 Oct", "Oct 9", "9/10", "the 9th"), to cross-check
+# the model's date as the weekday names are. Not "9am", "9-11", "2 bulbs", "2nd time".
+_OWNER_MONTH_PAT = (r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|june?|july?"
+                    r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b")
+_OWNER_DOM_PAT = (
+    r"(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _OWNER_MONTH_PAT
+    + r"|" + _OWNER_MONTH_PAT + r"\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\b"
+    + r"(?!\s*(?:am|pm|[:.\-–]\s*\d))"
+    + r"|(?<![\d/.])(\d{1,2})/(\d{1,2})(?:/\d{2,4})?(?![\d/])"
+    + r"|(\d{1,2})(?:st|nd|rd|th)\b(?!\s+(?:gear|times?|attempt|go|owner|hand|bulb|car"
+    + r"|visit|one|floor)\b)")
+_OWNER_DOM_RE = re.compile(r"\b(?:" + _OWNER_DOM_PAT + r")", re.I)
+# With a weekday named, only a number attached to it counts ("Fri 9 Oct", "friday 9th"):
+# "book Friday service, parts in on the 30th" is a Friday booking.
+_OWNER_WD_DOM_RE = re.compile(
+    r"\b(?:monday|mon|tuesday|tues|tue|wednesday|weds|wed|thursday|thurs|thur|thu|friday"
+    r"|fri|saturday|sat|sunday|sun)\s+(?:the\s+)?(?:" + _OWNER_DOM_PAT + r")", re.I)
+_OWNER_MON3 = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+# A reply to a live booking draft that names a day, a date or a time changes the
+# BOOKING, not only its wording: it is read again, with the note it answers.
+_OWNER_WHEN_RE = re.compile(
+    r"\d|\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun|(?:mon|tues|wednes|thurs|fri"
+    r"|satur|sun)day|today|tomorrow|tonight|day|days|week|weeks|weekend|month|next|jan|feb"
+    r"|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july"
+    r"|august|september|october|november|december)\b|dien|rytoj|poryt|savait", re.I)
+# The booked date as a confirmation writes it, the day beside its month: "Friday 2
+# October", "October 2nd", "2 октября", "2 octombrie", "spalio 2 d.". A bare number
+# never counts - the 9-11am drop-off time passed for the date on the 9th and the 11th.
+_OWNER_MONTH_WORDS = (
+    r"jan(?:uary)?|январ\w*|ianuarie|saus\w*", r"feb(?:ruary)?|феврал\w*|februarie|vasar\w*",
+    r"mar(?:ch)?|март\w*|martie|kov\w*", r"apr(?:il)?|апрел\w*|aprilie|baland\w*",
+    r"may|ма[йяю]|mai|gegu[žz]\w*", r"june?|июн\w*|iunie|bir[žz]el\w*",
+    r"july?|июл\w*|iulie|liep\w*", r"aug(?:ust)?|август\w*|rugpj[ūu]t\w*",
+    r"sep(?:t(?:ember)?)?|сентябр\w*|septembrie|rugs[ėe]j\w*",
+    r"oct(?:ober)?|октябр\w*|octombrie|spal\w*",
+    r"nov(?:ember)?|ноябр\w*|noiembrie|lapkri[čc]\w*",
+    r"dec(?:ember)?|декабр\w*|decembrie|gruod\w*")
+# send_reminder_template's own test: {{4}} carries a bare window ("2-3pm"); anything
+# else goes out as "9 and 11am".
+_OWNER_REMINDER_WINDOW_RE = re.compile(
+    r"[\d:.\s]+(?:am|pm)?\s*(?:-|to|and|–)\s*[\d:.\s]+(?:am|pm)?", re.I)
+# A weekday a non-English draft names, to compare with the days in his note.
+_OWNER_FOREIGN_DAY_RES = [re.compile(r"\b(?:" + w + r")\b", re.I) for w in (
+    r"понедельник\w*|pirmadien\w*|(?<!\d )luni|poniedzia[łl]\w*",
+    r"вторник\w*|antradien\w*|mar[țţt]i|wtor(?:ek|ku|kiem)",
+    r"сред[ауы]|tre[čc]iadien\w*|miercuri|[śs]rod(?:a|ę|e|y|zie)",
+    r"четверг\w*|ketvirtadien\w*|joi|czwart(?:ek|ku|kiem)",
+    r"пятниц\w*|penktadien\w*|vineri|pi[ąa]t(?:ek|ku|kiem)",
+    r"суббот\w*|[šs]e[šs]tadien\w*|s[âa]mb[ăa]t\w*|sobot\w*",
+    r"воскресень\w*|sekmadien\w*|duminic\w*|niedziel\w*")]
+# The owner path's own "passed it on / someone will ring you" test (R3-1): the shared
+# _CLAIMS_A_PERSON_RE also counts "your car passed its NCT" and "let the team know at
+# reception" - real answers - so it is not used here. Live alerting keeps using it.
+_OWNER_HOLD_RE = re.compile(
+    r"\bflagged (?:this|it|that)\b|the team will (?:come back|be in touch|reply|call|ring)"
+    r"|a colleague will (?:come back|be in touch|reply|call|ring)|someone will (?:come back|call|ring|be in touch)"
+    r"|they.ll (?:come back|be in touch|call you|ring you)|will (?:come|get) back to you"
+    r"|\bpassed (?:this|it|that|these|your (?:message|details|query|question|enquiry|request|number))"
+    r"(?: straight| over| along)? (?:on|to|along|over)\b"
+    r"|\b(?:we.ve|i.ve|we have|i have) (?:let the team know|told the team|told a colleague)",
+    re.IGNORECASE)
+_OWNER_ENGLISH_DAY_RE = re.compile(
+    r"\b(mon|tue|wed|thu|fri|sat|sun)(?:day|s|sday|nesday|nes|rsday|rs|r|urday)?\b", re.I)
+# A message with any of these carries something we cannot pass on (only text goes).
+_OWNER_MEDIA_KEYS = ("photo", "document", "video", "animation", "audio", "sticker", "location",
+                     "venue", "contact", "video_note", "poll", "dice")
+# Words of a car description that name its make, not its model.
+_OWNER_MAKE_WORDS = {w for mk in _REGISTER_MAKES for w in mk.split()} | {"vw", "merc", "benz"}
+# Beside a number these make it money, a time or a date - never car text (R3-13).
+_OWNER_MONEY_WORDS = {"price", "cost", "costs", "total", "eur", "euro", "euros", "vat", "plus",
+                      "cash", "quid", "grand"}
+_OWNER_UNIT_WORDS = {"am", "pm", "st", "nd", "rd", "th", "h", "hr", "hrs", "hour", "hours", "min",
+                     "mins", "minute", "minutes", "day", "days", "week", "weeks", "k", "e", "x",
+                     "km", "kms", "kg", "oclock", "ish"}
+# A year-shaped number is car text only beside a make or one of these models ("2016
+# Focus"), never beside any word the customer happened to use ("do 2000", F-4).
+_OWNER_MODEL_WORDS = {"golf", "focus", "corolla", "yaris", "qashqai", "octavia", "polo", "fiesta",
+                      "passat", "civic", "avensis", "auris", "astra", "corsa", "clio", "megane",
+                      "leaf", "mondeo", "kuga", "tucson", "sportage", "superb", "fabia", "insignia",
+                      "jetta", "tiguan", "touran", "caddy", "transit", "juke", "micra", "ceed",
+                      "prius", "accord", "crv"}
+_OWNER_DATE_WORDS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                     "mon", "tue", "tues", "wed", "weds", "thu", "thur", "thurs", "fri", "sat", "sun",
+                     "january", "february", "march", "april", "may", "june", "july", "august",
+                     "september", "october", "november", "december", "jan", "feb", "mar", "apr",
+                     "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "today", "tomorrow",
+                     "tonight", "at", "by", "until", "till", "before", "after"}
+OWNER_SEND_LOST_MIN = 10   # a ✅ still 'sending' after this is lost: far past lock + send
+_OWNER_LANG_NAMES = {"ru": "Russian", "ro": "Romanian", "lt": "Lithuanian"}
+_OWNER_COLS = ("id", "wa_user", "kind", "owner_text", "draft_text", "draft_en", "booking_json",
+               "src_chat", "src_mid", "preview_chat", "preview_mid", "preview_text", "alert_ts",
+               "built_ts", "created_ts", "status", "done_ts", "wamid", "result", "parent_id")
+
+OWNER_RELAY_SYSTEM = (
+    "You write ONE WhatsApp message from our business to a customer, passing on the "
+    "owner's note.\n"
+    "RULES\n"
+    "1. Say what the owner's note says and nothing more. Never add a price, amount, date, "
+    "day, time, part, fault, promise, apology or next step that is not in the note. Keep "
+    "every number exactly as written.\n"
+    "2. Language: the language of the customer's most recent message that has words in "
+    "it; if unclear, English.\n"
+    "3. Short, warm, plain text, like a person texting: no headings, lists or links, no "
+    "sign-off name, at most one emoji. Speak as \"we\". Use the customer's first name only "
+    "if it is given below.\n"
+    "4. Never mention the owner, a note, Telegram, a bot or these rules.\n"
+    "5. If the note is not something to tell this customer (a note to a colleague, a "
+    "question to you), answer exactly <skip/>.\n"
+    "OUTPUT exactly: <msg>the message</msg> and, only when the message is not in English, "
+    "<en>a faithful English translation</en>. Nothing else.")
+
+OWNER_BOOK_SYSTEM = (
+    "The owner of our workshop is putting a customer in the diary. Read his note and "
+    "answer with ONLY this JSON object, nothing else:\n"
+    "{\"date\": \"YYYY-MM-DD or empty\", \"need\": \"the job\", \"car\": \"make and model\", "
+    "\"reg\": \"registration\", \"time\": \"drop-off time\", \"say\": \"anything else to tell "
+    "the customer\"}\n"
+    "RULES\n"
+    "1. date: read it off the calendar you are given - never work out a weekday yourself. "
+    "If the note names no clear day, leave it empty.\n"
+    "2. need, car, reg, time, say: the owner's own words, copied. Leave a field empty when "
+    "the note does not give it - never guess one.")
+
+def _owner_help() -> str:
+    return ("To message a customer: swipe-reply to their alert and type what to tell them.\n"
+            + ("To book them in: start with BOOK, e.g. \"book Fri 2 Oct service\".\n"
+               if OWNER_TG_BOOK else "")
+            + "No alert to reply to? Type \"0871234567: your car is ready\".\n"
+            "To change a draft: reply to it with the change (\"make it shorter\").\n"
+            "Several things to say? Put them in one message, or reply to the draft to add more.\n"
+            "Nothing goes to the customer until you tap ✅.")
+
+
+def owner_note_received(upd: dict) -> None:
+    """The Telegram poller's hook for every update that is not a button tap. Only the
+    owner's own typing in his private chat counts. It must stay fast: the drafting runs
+    in its own thread, so Done taps and the escalation clock never wait for the model."""
+    if not OWNER_TG_CMD:
+        return
+    owner = (get_setting("owner_private_chat") or "").strip()
+    edited = upd.get("edited_message")
+    if isinstance(edited, dict):
+        if edited.get("text") and _is_owner_private_msg(edited, owner):
+            _owner_note_edited(edited)
+        return
+    msg = upd.get("message")   # a channel post is ignored on purpose
+    if not isinstance(msg, dict):
+        return
+    if not _is_owner_private_msg(msg, owner):
+        return
+    if not (msg.get("text") or msg.get("caption") or "voice" in msg
+            or any(k in msg for k in _OWNER_MEDIA_KEYS)):
+        return   # a service message (a pin, the auto-delete timer): nothing he typed
+    gid = msg.get("media_group_id")
+    if gid:   # an album: one answer, not one per photo (this thread only: no race)
+        now = time.time()
+        for k in [k for k, t in _OWNER_ALBUMS.items() if now - t > 3600]:
+            _OWNER_ALBUMS.pop(k, None)
+        if gid in _OWNER_ALBUMS:
+            return
+        _OWNER_ALBUMS[gid] = now
+    threading.Thread(target=_owner_note_worker, args=(msg,), daemon=True).start()
+
+
+def _owner_note_edited(msg: dict) -> None:
+    """He edited a note (owner, 29 Sep 2026). Edits are not read again, so say so, and
+    take that note's draft off the table: a draft built from the old words must not go
+    out - nor a redraft he made from it by replying to it (R3-4). Database work only
+    here (the poller's thread); Telegram in a thread."""
+    chat = str((msg.get("chat") or {}).get("id") or "")
+    mid = int(msg.get("message_id") or 0)
+    now = time.time()
+    drop = ("UPDATE owner_drafts SET status = 'superseded', done_ts = ?, result = 'edited'"
+            " WHERE id = ? AND status IN ('drafting', 'pending')")
+    kids = []
+    with closing(db()) as conn, conn:
+        # The note and its edit can come in one batch, before the note's own thread has
+        # claimed it: claim it here, as 'superseded' - that thread's INSERT OR IGNORE then
+        # stops it, as for a note Telegram sends twice. Only a recent note: an edit of an
+        # old message has no draft to cancel.
+        first = (now - float(msg.get("date") or 0) < OWNER_DRAFT_TTL_MIN * 60
+                 and conn.execute("INSERT OR IGNORE INTO owner_drafts (src_chat, src_mid, owner_text,"
+                                  " created_ts, status, done_ts, result) VALUES (?, ?, '', ?,"
+                                  " 'superseded', ?, 'edited')", (chat, mid, now, now)).rowcount == 1)
+        row = None if first else conn.execute(
+            "SELECT id, status, preview_chat, preview_mid, preview_text"
+            " FROM owner_drafts WHERE src_chat = ? AND src_mid = ?", (chat, mid)).fetchone()
+        dropped = first or (bool(row) and conn.execute(drop, (now, row[0])).rowcount == 1)
+        # Down the chain: a redraft carries its parent's words (parent_id is set only
+        # then), whatever became of the parent since.
+        ids = [row[0]] if row else []
+        for _ in range(20):
+            if not ids:
+                break
+            found = conn.execute("SELECT id, status, preview_chat, preview_mid, preview_text"
+                                 f" FROM owner_drafts WHERE parent_id IN ({', '.join('?' * len(ids))})",
+                                 ids).fetchall()
+            ids = [k[0] for k in found]
+            kids += [k for k in found if conn.execute(drop, (now, k[0])).rowcount == 1]
+    gone = bool(row) and not dropped and row[1] in ("sending", "sent", "booked", "undelivered", "unknown")
+    reply = ("I don't pick up edits — " + ("that note has already gone through; see the draft under it."
+                                           if gone else "send it again as a new message.")
+             + (" The draft from the first version is cancelled; nothing was sent." if dropped else "")
+             + (" The newer draft you built from it is cancelled too; nothing was sent from it."
+                if kids else ""))
+
+    def tell() -> None:
+        for k in ([row] if dropped and row else []) + kids:
+            if k[1] == "pending":
+                _owner_tg_edit(k[2], int(k[3] or 0),
+                               f"{k[4] or ''}\n\n↪️ Cancelled — you edited your note. Nothing sent.")
+        _owner_tg_reply(chat, mid, reply)
+    threading.Thread(target=tell, daemon=True).start()
+
+
+def _is_owner_private_msg(msg: dict, owner: str) -> bool:
+    """The owner himself, typing in his own chat with the bot. The garage's staff alert
+    chats are private chats too, so the chat TYPE is not enough - the id must be the
+    linked owner_private_chat. Unset there = the feature is off on that bot."""
+    chat, frm = msg.get("chat") or {}, msg.get("from") or {}
+    return (bool(owner) and chat.get("type") == "private"
+            and str(chat.get("id")) == owner and str(frm.get("id")) == owner
+            and not frm.get("is_bot")
+            and not (msg.get("forward_origin") or msg.get("forward_from")
+                     or msg.get("forward_date")))
+
+
+def _tg_bot_id() -> int:
+    try:
+        return int((TELEGRAM_BOT_TOKEN or "").split(":")[0])
+    except ValueError:
+        return 0
+
+
+def owner_numbers_in_text(text: str) -> list:
+    """The customer numbers one of our Telegram messages names on its link lines, each
+    once, in order."""
+    found = []
+    for rx in _OWNER_LINK_RES:
+        for m in rx.finditer(text or ""):
+            n = normalize_phone(m.group(1))
+            if len(n) >= 9 and n not in found:
+                found.append(n)
+    return found
+
+
+def _owner_known_chat(number: str) -> str:
+    """The chat this number belongs to on this bot ("" = none). A typed 087… finds its
+    chat by a last-9-digit match, but only when exactly one chat matches."""
+    n = normalize_phone(number)
+    if len(n) < 9:
+        return ""
+    with closing(db()) as conn:
+        if conn.execute("SELECT 1 FROM messages WHERE wa_user = ? LIMIT 1", (n,)).fetchone():
+            return n
+        rows = conn.execute("SELECT DISTINCT wa_user FROM messages WHERE wa_user LIKE ? LIMIT 2",
+                            ("%" + n[-9:],)).fetchall()
+    return rows[0][0] if len(rows) == 1 else ""
+
+
+def owner_customer_from_reply(rt: dict, chat: str) -> dict:
+    """Who the bot message he replied to is about: {"user", "alert_ts", "prev"}, or
+    {"reason"} when it is about several customers, or {} when it names nobody. In
+    order: one of our draft previews (he is changing it), the Done button still on it,
+    its stored handle, then its link lines."""
+    mid = int(rt.get("message_id") or 0)
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT wa_user, kind, draft_text, booking_json, alert_ts, status, owner_text, id,"
+            " created_ts, done_ts FROM owner_drafts WHERE preview_chat = ? AND preview_mid = ?"
+            " AND COALESCE(wa_user, '') <> '' ORDER BY id DESC LIMIT 1", (chat, mid)).fetchone()
+    if row:
+        said = _OWNER_NUMBER_PREFIX_RE.match(row[6] or "")
+        return {"user": row[0], "alert_ts": row[4] or 0,
+                "prev": {"kind": row[1] or "msg", "text": row[2] or "",
+                         "booking_json": row[3] or "", "status": row[5] or "",
+                         "owner_text": said.group(2) if said else (row[6] or ""),
+                         "id": int(row[7] or 0), "created_ts": float(row[8] or 0),
+                         "done_ts": float(row[9] or 0)}}
+    for line in ((rt.get("reply_markup") or {}).get("inline_keyboard") or []):
+        for button in line or []:
+            kind, val, tag = (str((button or {}).get("callback_data") or "").split(":")
+                              + ["", ""])[:3]
+            if kind == "done" and val.isdigit():
+                return {"user": val, "alert_ts": int(tag) if tag.isdigit() else 0}
+            if kind == "task" and val.isdigit():
+                with closing(db()) as conn:
+                    t = conn.execute("SELECT wa_user FROM tasks WHERE id = ?",
+                                     (int(val),)).fetchone()
+                if t and t[0]:
+                    return {"user": t[0], "alert_ts": 0}
+    # The Done button is gone once pressed; the handle stays (until the next alert).
+    handle = f"%,{chat}:{mid},%"
+    with closing(db()) as conn:
+        a = conn.execute("SELECT wa_user, ts FROM alerts WHERE ',' || COALESCE(tg_msgs, '')"
+                         " || ',' LIKE ? ORDER BY ts DESC LIMIT 1", (handle,)).fetchone()
+        t = conn.execute("SELECT wa_user FROM tasks WHERE ',' || COALESCE(tg_msgs, '')"
+                         " || ',' LIKE ? ORDER BY id DESC LIMIT 1", (handle,)).fetchone()
+    if a:
+        return {"user": a[0], "alert_ts": int(a[1] or 0)}
+    if t:
+        return {"user": t[0], "alert_ts": 0}
+    text = rt.get("text") or rt.get("caption") or ""
+    nums = owner_numbers_in_text(text)
+    if len(nums) == 1:
+        return {"user": nums[0], "alert_ts": 0}
+    listed = list(dict.fromkeys(nums + [normalize_phone(n) for n in _OWNER_ANY_LINK_RE.findall(text)]))
+    if len(listed) > 1:
+        # A number he types may pick any customer the list names, linked or not: a
+        # STILL WAITING line in the briefing has no link (R3-8). Still links only for
+        # deciding that it IS a list.
+        named = [normalize_phone(r) for c in _OWNER_ANY_NUMBER_RE.finditer(_OWNER_MARKS_RE.sub(" ", text))
+                 for r in _owner_digit_runs(c.group(1))]
+        return {"reason": "That message is about several customers — reply to that customer's "
+                          "own alert, or start your note with their number "
+                          "(0871234567: your message).",
+                "listed": listed + [n for n in dict.fromkeys(named) if n not in listed]}
+    return {}
+
+
+def _owner_digit_runs(number: str) -> list:
+    """Every run of a typed number's digit groups that is phone-length: "0871110003 250"
+    is read as one 13-digit candidate, but "0871110003" is in it (R3-0)."""
+    groups = re.findall(r"\d+", number or "")
+    runs = ["".join(groups[i:j]) for i in range(len(groups)) for j in range(i + 1, len(groups) + 1)]
+    return list(dict.fromkeys(r for r in runs if 9 <= len(r) <= 15))
+
+
+def _owner_our_number(number: str, dealt_with: bool = False) -> bool:
+    """One of the business's own lines or the owner's own mobile: never anyone to
+    address (R3-2). dealt_with=True also counts a number we deal with (the block list,
+    staff, the accountant, the tow company) - only for a number INSIDE the note ("ring
+    Dima on 085..."): at its start it says who the note is for, and that is refused (F-0)."""
+    def core(n: str) -> str:
+        d = re.sub(r"\D", "", n or "")
+        for p in ("00353", "353", "0"):
+            if d.startswith(p):
+                return d[len(p):]
+        return d
+    mine = core(number)
+    if len(mine) < 7:
+        return False
+    ours = list(OWNER_TG_OWN_NUMBERS) + list(PHONE_LABELS.values()) + [OWNER_WHATSAPP, OWNER_TG_MOBILE]
+    return (any(core(o) == mine for o in ours if o)
+            or (dealt_with and (is_blocked(number) or _is_internal_number(number))))
+
+
+def _owner_pick_customer(msg: dict, chat: str, text: str) -> dict:
+    """{"user", "note", "alert_ts", "prev"}; {"reason"} to refuse; {} = show the help.
+    A "0871234567: text" note names its customer itself, with or without a reply."""
+    got = {}
+    rt = msg.get("reply_to_message")
+    if isinstance(rt, dict):
+        frm = rt.get("from") or {}
+        if frm.get("is_bot") and _tg_bot_id() and int(frm.get("id") or 0) == _tg_bot_id():
+            got = owner_customer_from_reply(rt, chat)
+            if got.get("reason"):
+                # A list of customers: a number he typed picks one of THEM (owner, 29 Sep).
+                pick = _OWNER_NUMBER_PREFIX_RE.match(text)
+                if not (pick and got.get("listed")):
+                    return {"reason": got["reason"]}
+                typed = _owner_known_chat(pick.group(1))
+                if not typed or not any(typed[-9:] == n[-9:] for n in got["listed"]):
+                    return {"reason": f"+{normalize_phone(pick.group(1))} isn't one of the "
+                                      "customers in that message — nothing drafted."}
+                return {"user": typed, "note": pick.group(2).strip(), "alert_ts": 0, "prev": None}
+    note = text
+    m = _OWNER_NUMBER_PREFIX_RE.match(text)
+    if m and got.get("user") and _owner_our_number(m.group(1)):
+        m = None   # "086 667 7666 - text us here" in a reply: our own number is part of it (R3-2)
+    if got.get("user") and not m:
+        # A reply naming another customer's number in any other form ("087-111-0003:",
+        # a pasted contact, no colon) must not go to the customer replied to (R2-0).
+        # Dates, prices and part numbers are not known chats, so they draft as before.
+        plain = _OWNER_MARKS_RE.sub(" ", text)
+        mine = _owner_known_chat(got["user"])
+        for cand in _OWNER_ANY_NUMBER_RE.finditer(plain):
+            # A price or a time straight after the number ("0871110003 250 plus vat") is
+            # read into it: try each run of its digit groups too (R3-0).
+            runs = _owner_digit_runs(cand.group(1))
+            inside = bool(plain[:cand.start()].strip())
+            other = (next((o for o in (_owner_known_chat(r) for r in runs)
+                           if o and o != mine and not _owner_our_number(o, inside)), "")
+                     or _owner_known_chat(cand.group(1)))
+            if other and other != mine and not _owner_our_number(other, inside):
+                return {"reason": f"Your note has the number of another customer (+{other}), but "
+                                  f"you replied to a message about +{got['user']} — nothing "
+                                  "drafted. Send it again with only one of them."}
+            digits = re.sub(r"\D", "", cand.group(1))
+            # A mobile typed at the very start, then a price or a time ("087 000 0009 250"):
+            # phone-shaped only, so "08.30 - 09.30 - 10.30" and dates are not read as one (F-3).
+            _pm = re.match(r"\s*\(?\+?((?:00353|353|0)[\s\-()]{0,2}8[35679](?:[\s\-()]{0,2}\d){7})"
+                           r"(?!\d|[.:]\d)", plain)
+            if _pm and not re.search(r"\d\d\d$|^(?:00353|353|0)[\s\-()]{0,2}8[35679][\s\-()]",
+                                     _pm.group(1)):
+                _pm = None   # "0830 0930 10 30" is a time list, not 083 0093010 (L-1)
+            _hit = re.sub(r"\D", "", _pm.group(1)) if _pm and not inside else ""
+            if _hit and (_hit[-9:] == mine[-9:] or _owner_our_number(_hit)):
+                _hit = ""
+            if (not other and not inside
+                    and not any(r[-9:] == mine[-9:] for r in runs)
+                    and not any(_owner_our_number(r) for r in [digits] + runs)
+                    and (plain.lstrip().startswith("+")
+                         # typed as a mobile (087..., 353 87...): not "08.10.2026 09:30", "800 850" (R3-2)
+                         or re.fullmatch(r"(?:0|353|00353)8[35679]\d{7}", digits) or _hit)):
+                return {"reason": f"Your note starts with +{normalize_phone(_hit or cand.group(1))} — "
+                                  "there's no WhatsApp chat with that number on this bot (please "
+                                  f"ring them). You replied to a message about +{got['user']}: to "
+                                  f"message +{got['user']}, send it again without the number."}
+    if m:
+        typed = _owner_known_chat(m.group(1))
+        if got.get("user"):
+            # A reply that starts with a number: the same customer's is dropped; any other
+            # number - another customer's, or one we have no chat with - is refused. The
+            # same words with no reply would never reach the customer replied to.
+            if not typed:
+                return {"reason": f"Your note starts with +{normalize_phone(m.group(1))} — there's "
+                                  "no WhatsApp chat with that number on this bot (please ring "
+                                  f"them). You replied to a message about +{got['user']}: to "
+                                  f"message +{got['user']}, send it again without the number."}
+            if typed != _owner_known_chat(got["user"]):
+                return {"reason": f"Your note names +{typed}, but you replied to a message "
+                                  f"about +{got['user']} — send it again with only one of them."}
+            note = m.group(2).strip()
+        elif not typed:
+            return {"reason": f"No WhatsApp chat with +{normalize_phone(m.group(1))} on this "
+                              "bot — please ring them."}
+        else:
+            got, note = {"user": typed, "alert_ts": 0}, m.group(2).strip()
+    if not got.get("user"):
+        return {}
+    user = _owner_known_chat(got["user"])
+    if not user:
+        return {"reason": f"No WhatsApp chat with +{got['user']} on this bot — please ring them."}
+    return {"user": user, "note": note, "alert_ts": got.get("alert_ts") or 0,
+            "prev": got.get("prev")}
+
+
+def _owner_last_typed(user: str):
+    """When the customer last typed to us on WhatsApp: a ts; None if never (a phone
+    message the voice agent took does not open WhatsApp's window); -1 if unreadable."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT ts FROM messages WHERE wa_user = ? AND role = 'user' "
+                "AND COALESCE(content, '') NOT LIKE '[phone message via the voice agent]%' "
+                "ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+    except Exception:
+        log.exception("Owner note: could not read the last message of %s", user)
+        return -1
+    return float(row[0] or 0) if row else None
+
+
+def _owner_window_problem(user: str) -> str:
+    """Why the bot can't message this customer now ("" = it can): WhatsApp's 24-hour
+    window since they last typed, judged exactly as the chase judges it."""
+    last = _owner_last_typed(user)
+    if last is None:
+        return "they've only phoned — they have never written to us on WhatsApp"
+    if last < 0:
+        return "I couldn't check when they last wrote"
+    if time.time() - last > CHASE_WINDOW_SECONDS:
+        # No "23h ago" here: the bot stops 15 minutes short of the 24 hours, to be safe.
+        return ("WhatsApp only lets us message them within 24 hours of their last message, "
+                "and that has run out (they last wrote "
+                + datetime.fromtimestamp(last, now_local().tzinfo).strftime("%a %d %b %H:%M") + ")")
+    return ""
+
+
+def _owner_cant_message(user: str, why: str) -> str:
+    return f"The bot can't message them — {why}. Please ring them: +{user}"
+
+
+def _owner_when(ts: float) -> str:
+    """'Mon 28 Sep 14:02, 30h ago'."""
+    try:
+        hrs = max(0.0, (time.time() - ts) / 3600)
+        ago = f"{int(hrs)}h ago" if hrs < 48 else f"{int(hrs // 24)} days ago"
+        return (datetime.fromtimestamp(ts, now_local().tzinfo).strftime("%a %d %b %H:%M")
+                + f", {ago}")
+    except Exception:
+        return "?"
+
+
+def _owner_stamp(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts or 0), now_local().tzinfo).strftime("%a %H:%M")
+    except Exception:
+        return "?"
+
+
+def _owner_hhmm(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts or 0), now_local().tzinfo).strftime("%H:%M")
+    except Exception:
+        return "?"
+
+
+def _owner_day(iso: str, fmt: str = "%A %d %B %Y") -> str:
+    try:
+        return date.fromisoformat(iso).strftime(fmt)
+    except (TypeError, ValueError):
+        return iso or "?"
+
+
+def owner_draft_build(user: str, note: str, prev: dict | None = None, alert_ts: float = 0,
+                      expires_ts: float = 0) -> dict:
+    """Everything one owner note turns into: the message, the booking, the warnings and
+    the preview he approves. It reads and asks the model - it writes and sends nothing
+    (the tgcmdtest probe runs it as it is). Every fixer runs here, so the preview is
+    byte for byte what is sent."""
+    prev = prev or {}
+    note = (note or "").strip()
+    res = {"ok": False, "reason": "", "kind": "msg", "text": "", "en": "", "fields": {},
+           "warnings": [], "no_message": False, "why": "", "label": customer_label(user),
+           "built_ts": time.time(), "preview": ""}
+    if is_blocked(user):
+        res["reason"] = "That number is on the block list — nothing sent."
+        return res
+    is_book = bool(_OWNER_BOOK_RE.match(note))
+    if is_book and not OWNER_TG_BOOK:
+        # Off until its own review (owner, 29 Sep 2026). Drafted as a plain message it
+        # would tell the customer they are booked while the diary has nothing.
+        res["reason"] = ("Booking from Telegram isn't switched on yet — put them in the diary as "
+                         "usual. To message them, send the note without the word BOOK.")
+        return res
+    if prev.get("kind") == "book" and not OWNER_TG_BOOK:
+        # Booking was switched off after this booking draft was made (29 Sep 2026: any
+        # reply to it is refused). Reworded as a plain message it could tell them they
+        # are booked while the diary has nothing.
+        res["reason"] = ("Booking from Telegram is switched off, so I won't work from that booking "
+                         "draft — check the diary for them as usual. To message them, reply to "
+                         "their alert instead, or send a new note starting with their number.")
+        return res
+    why = _owner_window_problem(user)
+    facts, earlier = note, prev.get("text", "")
+    if prev.get("status") in ("sending", "sent", "unknown"):
+        earlier = ""   # that one has gone: this note is a new message, not an edit of it
+    # A reply to one of his booking drafts is about that booking - unless it is in the
+    # diary already. Then another day would leave the old one there: refuse; anything
+    # else is just a message.
+    booked_prev = (prev.get("kind") == "book"
+                   and prev.get("status") in ("sent", "booked", "undelivered"))
+    if booked_prev and (is_book or _owner_names_a_day(note)):
+        was = json.loads(prev.get("booking_json") or "{}").get("date", "")
+        res["reason"] = (f"They're already in the diary for {_owner_day(was, '%A %d %b')}. To move "
+                         "them, change the diary first, then send them a message — nothing drafted.")
+        return res
+    prev_book = prev.get("kind") == "book" and not booked_prev
+    if OWNER_TG_BOOK and (is_book or prev_book):
+        res["kind"] = "book"
+        change = ""
+        if (prev_book and not is_book and prev.get("booking_json") and prev.get("status") != "refused"
+                and not _OWNER_WHEN_RE.search(note)):
+            f, reason = json.loads(prev["booking_json"]), ""   # a wording change: the same booking
+            change = f"\nOwner's change: {note}"
+        else:
+            # A new day or time ("make it the 16th"), or "Monday then" after a refusal, is
+            # read again together with the note it answers.
+            said = (f"{prev['owner_text']}\nThen he wrote: {note}"
+                    if prev_book and prev.get("owner_text") else note)
+            f, reason = _owner_extract_booking(said)
+            reason = reason or _owner_fill_customer(user, f)
+            earlier = ""   # a new booking: its confirmation is written afresh
+        if not reason:
+            gate = owner_booking_gate(f)
+            reason = f"Not booked: {gate}" if gate else ""
+            if is_book and not gate and owner_booking_gate(dict(f, need=note)):
+                # The model may shorten his job ("service and clutch" -> "service"): on his
+                # own words the day would say no. A warning only - he sees the job.
+                res["warnings"].append(f"⚠️ Check the job: this books \"{f['need']}\" — your "
+                                       "note may be for more than that.")
+        if reason:
+            res["reason"] = reason
+            return res
+        res["fields"] = f
+        facts = (f"They are booked in for {_owner_day(f['date'], '%A %d %B')}, drop-off "
+                 f"{f.get('time') or '9-11am'}; car: {f.get('car') or '-'} {f.get('reg') or ''}; "
+                 f"job: {f['need']}." + (f" Also tell them: {f['say']}" if f.get("say") else "")
+                 + change)
+        if why:   # owner, 29 Sep 2026: book them anyway, with no message
+            res["no_message"], res["why"] = True, why
+    elif why:
+        res["reason"] = _owner_cant_message(user, why)
+        return res
+    if not res["no_message"]:
+        text, en, reason = _owner_draft_message(user, facts, earlier)
+        if not reason:
+            text, notes, reason = _owner_fixed(text, res["fields"].get("date", ""))
+            res["warnings"] += notes
+        if (not reason and res["kind"] == "book" and change
+                and _owner_numbers(text) - _owner_numbers(f"{facts} {earlier}")):
+            # A wording change may not bring in a new day or time: the diary keeps its own.
+            reason = ("That would change the day or time — reply to the draft with the new "
+                      "date, e.g. \"make it Friday 16 October\".")
+        if reason:
+            res["reason"] = reason
+            return res
+        res["text"], res["en"] = text, en
+        # Numbers are checked against his own words, the booking and the car/reg on file
+        # (R3-13), never an earlier draft: a number the model invented must not lose its
+        # warning on a redraft.
+        booked_on = (_owner_day(res["fields"]["date"], "%d %B %Y") if res["fields"] else "")
+        res["warnings"] += _owner_warnings(user, res["kind"], text,
+                                           " ".join((note, _owner_recent_notes(user), facts,
+                                                     booked_on, res["label"])),
+                                           note, alert_ts)
+    if res["kind"] == "book":
+        other = _other_booking_date(user, res["fields"]["date"])
+        if other:
+            res["warnings"].append(f"ℹ️ They're also booked on {_owner_day(other, '%A %d %b')}.")
+        res["warnings"] += _owner_booking_extra_warnings(user, res["fields"])
+    res["ok"] = True
+    expires_ts = expires_ts or time.time() + OWNER_DRAFT_TTL_MIN * 60
+    # WhatsApp's window may close before the draft expires: say when, and expire it then
+    # (R3-12). The tap's own window check stays the one that decides.
+    last = None if res["no_message"] else _owner_last_typed(user)
+    if last and last > 0 and last + CHASE_WINDOW_SECONDS < expires_ts:
+        expires_ts = last + CHASE_WINDOW_SECONDS
+        res["warnings"].append("⏳ Send before "
+                               + datetime.fromtimestamp(expires_ts, now_local().tzinfo).strftime("%H:%M")
+                               + " — their WhatsApp window closes then")
+    res["preview"] = _owner_preview_text(user, res, expires_ts)
+    return res
+
+
+def _owner_names_a_day(note: str) -> bool:
+    """Does a note name a day or a date ("Friday", "sat", "the 16th", "9/10", "tomorrow")?"""
+    return bool(_OWNER_WEEKDAY_NAME_RE.search(note or "") or _OWNER_DOM_RE.search(note or "")
+                or re.search(r"\b(?:mon|wed|sat|sun|today|tomorrow|next week)\b", note or "", re.I))
+
+
+def _owner_recent_notes(user: str) -> str:
+    """His own notes about this customer in the last day - what a redraft's numbers are
+    checked against, never an earlier draft (a number the model invented would lose its
+    warning on the second draft)."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT COALESCE(owner_text, '') FROM owner_drafts"
+                                " WHERE wa_user = ? AND created_ts > ?",
+                                (user, time.time() - 86400)).fetchall()
+    except Exception:
+        log.exception("Owner note: could not read the earlier notes about %s", user)
+        return ""
+    return " ".join(r[0] for r in rows)
+
+
+def _owner_days_named(text: str, today) -> set:
+    """The dates in the next 90 days that a day of the month in his words can mean
+    (empty when he wrote none)."""
+    text = text or ""
+    wd = bool(_OWNER_WEEKDAY_NAME_RE.search(text)
+              or re.search(r"\b(?:mon|wed|sat|sun)\s+(?:the\s+)?\d", text, re.I))
+    want = set()
+    for m in (_OWNER_WD_DOM_RE if wd else _OWNER_DOM_RE).finditer(text):
+        g = m.groups()
+        day, mon = ((g[0], g[1]) if g[0] else (g[3], g[2]) if g[3] else
+                    (g[4], g[5]) if g[4] else (g[6], ""))
+        want.add((int(day), (int(mon) if mon.isdigit() else
+                             _OWNER_MON3.index(mon[:3].lower()) + 1) if mon else 0))
+    window = (today + timedelta(days=i) for i in range(91))
+    return {x for x in window if any(x.day == dd and mm in (0, x.month) for dd, mm in want)}
+
+
+def _owner_date_named(text: str, iso: str) -> bool:
+    """Does a confirmation name the booked date: its day beside its month ("Friday 2
+    October", "2 октября", "spalio 2 d.")? A bare number never counts."""
+    d = date.fromisoformat(iso)
+    mon = _OWNER_MONTH_WORDS[d.month - 1]
+    day = r"0?%d(?:st|nd|rd|th|-?го|-?[aą]j[aą]|\s*d\.)?" % d.day
+    return bool(re.search(r"(?<!\d)%s\s+(?:of\s+)?(?:%s)\b|\b(?:%s)\s+(?:the\s+)?%s(?!\d)"
+                          % (day, mon, mon, day), text or "", re.I))
+
+
+def _owner_weekdays_in(s: str, english: bool = False) -> set:
+    """The weekdays (0 = Monday) a text names in Russian, Romanian or Lithuanian, and in
+    English too if asked."""
+    out = {i for i, rx in enumerate(_OWNER_FOREIGN_DAY_RES) if rx.search(s or "")}
+    if english:
+        out |= {("mon", "tue", "wed", "thu", "fri", "sat", "sun").index(w.lower())
+                for w in _OWNER_ENGLISH_DAY_RE.findall(s or "")}
+    return out
+
+
+def _owner_draft_message(user: str, note: str, prev_text: str = "") -> tuple:
+    """One model call: the owner's note as a WhatsApp message in the customer's
+    language. (text, english, "") or ("", "", reason). The internal past charges in
+    customer_context() are deliberately not given to it."""
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT role, content, ts FROM messages WHERE wa_user = ?"
+                            " ORDER BY id DESC LIMIT 14", (user,)).fetchall()
+    lines = []
+    for role, content, ts in reversed(rows):
+        said = " ".join((content or "").split())[:300]
+        if said:
+            lines.append(f"{'Customer' if role == 'user' else 'Us'} ({_owner_stamp(ts)}): {said}")
+    first = _customer_first_name(user)
+    content = (f"Today: {now_local().strftime('%A %d %B %Y, %H:%M')}\n"
+               + (f"Customer's first name: {first}\n" if first else "")
+               + "Conversation, oldest first:\n" + ("\n".join(lines) or "(none)") + "\n"
+               + (f"Owner's earlier draft (change it as his new note says): {prev_text}\n"
+                  if prev_text else "")
+               + f"Owner's note for the customer: «{note[:1500]}»")
+    raw = (_call_claude([{"role": "user", "content": content}], OWNER_RELAY_SYSTEM) or "").strip()
+    failed = "I couldn't write that just now — reply again in a minute."
+    # _call_claude never raises: on failure it RETURNS an apology, which must never be
+    # offered to him as the message.
+    if raw.startswith(_OWNER_MODEL_FAILED):
+        return "", "", failed
+    if re.search(r"<skip\s*/?>", raw):
+        return "", "", "That reads like a note for a colleague, not the customer — nothing drafted."
+    m = re.search(r"<msg>(.*?)</msg>", raw, re.S)
+    text = m.group(1).strip() if m else ""
+    en = re.search(r"<en>(.*?)</en>", raw, re.S)
+    en = en.group(1).strip() if en else ""
+    # A tag left inside the message would be sent as it is ("... <en>Your car is
+    # ready</en>"), and a runaway translation would push the warnings out of the preview.
+    if (not text or text.startswith(_OWNER_MODEL_FAILED)
+            or re.search(r"</?\s*(?:msg|en|skip)\b", text, re.I)
+            or len(en) > OWNER_DRAFT_MAX_CHARS + 300):
+        return "", "", failed
+    return text, en, ""
+
+
+def _owner_fixed(text: str, iso: str = "") -> tuple:
+    """The reply fixers that suit the owner's words, run BEFORE the preview:
+    (text, notes, reason). Not the closed-hours, "we checked it" or day-offer rewrites
+    of the bot's own replies: "I'll ring you in 5 minutes" at 9pm is true when he says it."""
+    notes = []
+    base = strip_marker_leftovers(text)
+    out = strip_phone_readback(base)
+    if out != base:
+        notes.append("ℹ️ I removed a \"we'll call you on <number>\" line.")
+    fixed = fix_weekday_mentions(out)
+    if fixed != out:
+        notes.append("⚠️ The weekday didn't match the date — I corrected it; check the day.")
+    for _ in range(5):   # the send and the history run fix_mojibake again: settle it now
+        again = fix_mojibake(fixed)
+        if again == fixed:
+            break
+        fixed = again
+    if not any(c.isprintable() and not c.isspace() for c in fixed):   # "​" alone too
+        return "", notes, "I couldn't write that just now — reply again in a minute."
+    if len(fixed) > OWNER_DRAFT_MAX_CHARS:
+        return "", notes, "That came out too long — make the note shorter."
+    if iso and not _owner_date_named(fixed, iso):
+        return "", notes, ("The draft didn't give the date as day and month (e.g. \"Friday 2 "
+                           "October\") — reply to this to redo it.")
+    return fixed, notes, ""
+
+
+def _owner_numbers(s: str) -> set:
+    """The numbers in a text: 9, 9:00 and 9.00 are one; 9:30 is not 9."""
+    out = set()
+    for tok in _OWNER_NUM_RE.findall(s or ""):
+        whole, _, frac = re.sub(r"[.:,]", ".", tok).partition(".")
+        out.add(str(int(whole)) + ("." + frac if frac.strip("0") else ""))
+    return out
+
+
+def _owner_spec_number(text: str, num, words=frozenset()) -> bool:
+    """Is this number in the draft clearly car or spec text: glued to Latin letters
+    ("X5", "A4", "320d", "2.0TDI"), an engine size ("1.6", "2.0"), or a year beside a
+    make, or a model the customer typed themselves ("2016 Focus")? Never beside money, a
+    time or a date. words: the customer's own words; none given = no model counts."""
+    tok, before, after = num.group(0), text[:num.start()], text[num.end():]
+    prev_w = (re.findall(r"[^\W\d_]+", before[-30:]) or [""])[-1].lower()
+    next_w = (re.findall(r"[^\W\d_]+", after[:30]) or [""])[0].lower()
+    if (re.search(r"[€£$]\s*$", before) or re.match(r"\s*[€£$%]", after) or ":" in tok
+            or prev_w in _OWNER_MONEY_WORDS or next_w in _OWNER_MONEY_WORDS
+            or next_w in _OWNER_UNIT_WORDS or prev_w in _OWNER_DATE_WORDS
+            or next_w in _OWNER_DATE_WORDS):
+        return False
+    # Latin letters only: "в 10ч" is a time (F-4).
+    glued_pre = re.search(r"[A-Za-z]+$", before)
+    if (glued_pre and glued_pre.group(0).lower() not in _OWNER_MONEY_WORDS) or re.match(r"[A-Za-z]", after):
+        return True   # a unit glued on ("9am", "3rd", "2x", "90e", "10ish") has returned above
+    if re.fullmatch(r"\d\.\d", tok):
+        return True
+    if re.fullmatch(r"(?:19|20)\d\d", tok):
+        # A model word only if the customer typed it too: "For the Golf, 2000 is fine"
+        # (the Golf from the file) or "Superb, 2000 it is" must stay ⚠️ (L-0).
+        return any(w in _OWNER_MAKE_WORDS or (w in _OWNER_MODEL_WORDS and w in words)
+                   for w in (prev_w, next_w) if w)
+    return False
+
+
+def _owner_warnings(user: str, kind: str, text: str, allowed: str, note: str,
+                    alert_ts: float) -> list:
+    """Things to look at before tapping ✅. They never block it."""
+    out = []
+    extra = sorted(_owner_numbers(text) - _owner_numbers(allowed), key=float)
+    spec = set()
+    if extra:
+        # Repeated from the customer's message AND clearly car or spec text ("BMW X5",
+        # "Passat 2.0 TDI", "2016 Focus") gets a softer line. Anything else stays ⚠️: a
+        # draft that changes his price - "Yes, 200 is fine" against his "250 is the
+        # lowest" - must not be softened (R3-13, 29 Sep 2026). Every place it appears in
+        # the draft must be car text. The last 14 rows, as the model saw.
+        with closing(db()) as conn:
+            said = conn.execute("SELECT role, content FROM messages WHERE wa_user = ?"
+                                " ORDER BY id DESC LIMIT 14", (user,)).fetchall()
+        theirs_text = " ".join(c or "" for r, c in said if r == "user")
+        theirs = _owner_numbers(theirs_text)
+        words = set(re.findall(r"[^\W\d_]+", theirs_text.lower()))
+        car = {}
+        for num in _OWNER_NUM_RE.finditer(text or ""):
+            n = next(iter(_owner_numbers(num.group(0))))
+            car[n] = car.get(n, True) and _owner_spec_number(text, num, words)
+        spec = {x for x in extra if x in theirs and car.get(x)}
+    hard = [x for x in extra if x not in spec]
+    soft = [x for x in extra if x in spec]
+    if hard:
+        one = len(hard) == 1
+        out.append(f"⚠️ It mentions {', '.join(hard[:5])}, which {'is' if one else 'are'}n't "
+                   f"in your note — check {'it' if one else 'them'}.")
+    if soft:
+        out.append(f"ℹ️ It repeats {', '.join(soft[:5])} from their message — check that's what you meant.")
+    # A weekday in a Russian, Romanian or Lithuanian draft that his note never named.
+    new_days = _owner_weekdays_in(text) - _owner_weekdays_in(allowed, english=True)
+    if new_days:
+        out.append(f"⚠️ It names {', '.join(_WEEKDAYS[i] for i in sorted(new_days))}, which "
+                   "isn't in your note — check the day.")
+    if kind == "msg":
+        # A day named in a plain message: are they in the diary for it? (Stage 1c's
+        # diary_gap_from_text also runs after the send.)
+        today = now_local().date()
+        for d in sorted({x for x in (weekday_asked_for(note, today),
+                                     weekday_asked_for(text, today)) if x}):
+            if not booking_already_in_diary({"date": d, "phone": user}):
+                out.append(f"⚠️ They're not in the diary for {_owner_day(d, '%A %d %b')} — "
+                           + ("start your note with BOOK to put them in." if OWNER_TG_BOOK
+                              else "put them in the diary if this is a booking."))
+    if is_paused(user):
+        out.append("ℹ️ They paused the bot (#stop); your message will still go.")
+    if not bot_enabled():
+        out.append("ℹ️ The bot is switched off; your message will still go.")
+    if human_handling(user):
+        out.append("ℹ️ A colleague is chatting with them right now.")
+    # Something of his already went to them: a lost "✅ Sent" must not become a second
+    # copy (R3-7), and the 15-minute guard's refusal should not come as a surprise (R3-18).
+    # Neither quote goes into `allowed`.
+    with closing(db()) as conn:
+        dup = conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role IN ('assistant', 'staff')"
+                           " AND content = ? AND ts > ? ORDER BY id DESC LIMIT 1",
+                           (user, (text or "").strip(), time.time() - 15 * 60)).fetchone()
+        mine = conn.execute("SELECT ts, content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                            " AND kind IN ('owner_tg', 'owner_book') AND ts > ? ORDER BY id DESC LIMIT 1",
+                            (user, time.time() - 2 * 3600)).fetchone()
+    if dup:
+        out.append(f"ℹ️ They got exactly this at {_owner_hhmm(dup[0])} — ✅ won't send it twice; "
+                   "reply with different words.")
+    elif mine:
+        said = " ".join((mine[1] or "").split())
+        out.append(f"ℹ️ You already sent them a message at {_owner_hhmm(mine[0])}: "
+                   f"«{said[:100]}{'…' if len(said) > 100 else ''}»")
+    if alert_ts:
+        with closing(db()) as conn:
+            a = conn.execute("SELECT ts, COALESCE(closed_ts, 0) FROM alerts WHERE wa_user = ?",
+                             (user,)).fetchone()
+        if a and int(a[0] or 0) > int(alert_ts) and (a[1] or 0) < (a[0] or 0):
+            out.append("ℹ️ They have a newer alert than the one you replied to.")
+    return out
+
+
+def _owner_extract_booking(note: str) -> tuple:
+    """One model call: the booking in the owner's note, as fields. (fields, "") or
+    ({}, reason). The date is read off a printed calendar - the model never counts
+    weekdays - and must agree with any weekday the note names."""
+    today = now_local().date()
+    cal = "\n".join(f"{(today + timedelta(days=i)).strftime('%a %d %b %Y')} = "
+                    f"{(today + timedelta(days=i)).isoformat()}" + (" (today)" if not i else "")
+                    for i in range(21))
+    raw = _call_claude([{"role": "user", "content": f"Calendar:\n{cal}\n\nOwner's note: "
+                                                    f"«{note[:1500]}»"}], OWNER_BOOK_SYSTEM) or ""
+    try:
+        data = json.loads(re.search(r"\{[^{}]*\}", raw).group(0))
+        f = {k: " ".join(str(data.get(k) or "").split())[:300 if k == "say" else 120]
+             for k in ("date", "need", "car", "reg", "time", "say")}
+    except Exception:
+        return {}, "I couldn't read that booking — try \"book Fri 2 Oct service\"."
+    try:
+        d = date.fromisoformat(f["date"])
+    except ValueError:
+        return {}, "Which day? I couldn't read a date — try \"book Fri 2 Oct service\"."
+    if not today <= d <= today + timedelta(days=90):
+        return {}, (f"{_owner_day(f['date'])} is "
+                    f"{'in the past' if d < today else 'more than 90 days away'} — check the date.")
+    # After a refusal his reply is joined on ("...\nThen he wrote: Monday then"): check
+    # his latest words when they name a day, else the whole note.
+    latest = note.rsplit("\nThen he wrote: ", 1)[-1]
+    day_words = (latest if _OWNER_WEEKDAY_NAME_RE.search(latest) or _owner_days_named(latest, today)
+                 else note)
+    named = {_OWNER_WEEKDAY_NUM[w.lower()[:3]] for w in _OWNER_WEEKDAY_NAME_RE.findall(day_words)}
+    said = weekday_asked_for(day_words, today)
+    days = _owner_days_named(day_words, today)
+    if ((named and d.weekday() not in named) or (said and said != f["date"])
+            or (days and d not in days)):
+        return {}, (f"I read two different days in that ({_owner_day(f['date'])} doesn't "
+                    "match your words) — write the date, e.g. \"book Fri 2 Oct service\".")
+    # The job decides the Saturday rule (garage) and the slot kind (headlights), so it
+    # must be his words, not the model's guess.
+    words = re.findall(r"[^\W\d_]{3,}", f["need"].lower())
+    if not words or not any(w in note.lower() for w in words):
+        return {}, "What's the job? e.g. \"book Friday service\"."
+    f["reg"] = clean_reg(f["reg"])
+    return f, ""
+
+
+def _owner_same_car(typed: str, filed: str) -> bool:
+    """False only when the car he typed is clearly not the car on file: another make
+    ("Toyota Yaris" vs "VW Golf 2015") or a model word it lacks ("Toyota Yaris" vs
+    "Toyota Corolla"). A make alone, or no words to go on, counts as the same car."""
+    a, b = _register_make(typed), _register_make(filed)
+    if a and b and a != b:
+        return False
+    words = [w for w in re.findall(r"[a-z]+", (typed or "").lower())
+             if len(w) >= 3 and w not in _OWNER_MAKE_WORDS]
+    return not words or any(w in (filed or "").lower() for w in words)
+
+
+def _owner_fill_customer(user: str, f: dict) -> str:
+    """Complete the booking from what we know about this customer. The phone is always
+    the chat's own number, never typed. Returns a reason to stop, or ""."""
+    f["phone"] = user
+    with closing(db()) as conn:
+        cust = conn.execute("SELECT COALESCE(name, ''), COALESCE(reg, '') FROM customers"
+                            " WHERE wa_number = ?", (user,)).fetchone()
+        rows = conn.execute(
+            "SELECT COALESCE(name, ''), COALESCE(car, ''), COALESCE(reg, ''), COALESCE(lang, '')"
+            " FROM bookings WHERE REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+            " ORDER BY id DESC", ("%" + user[-9:],)).fetchall()
+        said = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
+                            " ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+    name = (cust[0] if cust else "").strip() or next((r[0].strip() for r in rows if r[0].strip()), "")
+    f["name"] = "" if bad_customer_name(name) else name
+    if not f.get("reg"):
+        regs = list(dict.fromkeys(r for r in [clean_reg(cust[1]) if cust else ""]
+                                  + [clean_reg(r[2]) for r in rows] if r))
+        if len(regs) > 1:
+            return (f"They have more than one car on file ({', '.join(regs[:4])}) — put the reg "
+                    "in your note.")
+        f["reg"] = regs[0] if regs else ""
+        # He named a car and the only reg on file belongs to another car ("his new
+        # Yaris", the Golf's reg): never pair them - the diary, the parts order and the
+        # reminder would carry the wrong reg. The garage's gate then asks for the reg.
+        filed = next((r[1].strip() for r in rows if r[1].strip()
+                      and clean_reg(r[2]) == f["reg"]), "")
+        if f["reg"] and filed and not _owner_same_car(clean_car(f.get("car", "")), filed):
+            f["reg"] = ""
+    if not f.get("car"):
+        f["car"] = next((r[1].strip() for r in rows if r[1].strip()
+                         and (not f["reg"] or clean_reg(r[2]) == f["reg"])), "")
+    f["time"] = f.get("time") or "9-11am"
+    booked_lang = next((r[3] for r in rows if r[3]), "")
+    f["lang"] = reminder_lang_code(booked_lang or _guess_lang_code(said[0] if said else ""))
+    return ""
+
+
+def _owner_gate_basics(f: dict) -> str:
+    """The booking rules both bots share (owner_booking_gate adds its own): a real
+    date, today or later, an open day, a job, not already in the diary."""
+    iso = (f.get("date") or "").strip()
+    try:
+        d = date.fromisoformat(iso)
+    except ValueError:
+        return "Which day? I couldn't read a date."
+    if d < now_local().date():   # save_booking would roll a past date a year on
+        return f"{_owner_day(iso)} is in the past."
+    need = (f.get("need") or "").strip()
+    if day_capacity(d) == 0:
+        return (f"We're closed on {_owner_day(iso, '%A %d %b')}. "
+                f"Next free day for this job: {_owner_next_free_day(need)}.")
+    if not need:   # on the garage an empty job would skip the Saturday rule
+        return "What's the job? e.g. \"book Friday service\"."
+    if booking_already_in_diary(f):
+        return f"They're already in the diary on {_owner_day(iso, '%A %d %b')} — nothing to do."
+    return ""
+
+
+def _owner_next_free_day(need: str) -> str:
+    """The nearest day in the next four weeks that takes this job."""
+    today = now_local().date()
+    for i in range(1, 29):
+        d = today + timedelta(days=i)
+        iso = d.isoformat()
+        if day_capacity(d) == 0 or before_open_date(iso) or day_is_full(iso, need):
+            continue
+        return d.strftime("%A %d %B")
+    return "none in the next four weeks — ask the team"
+
+
+def _owner_reminder_note(iso: str, user: str = "", slack_min: float = 0, when: str = "") -> str:
+    """Will the usual day-before reminder reach them, and say his time? send_due_reminders
+    runs once an hour from 9am and its last run of a day can be any time after 7pm, so
+    only a booking in by 7pm the day before is sure of it. slack_min: how much later the
+    booking may still go in (a preview can be tapped up to OWNER_DRAFT_TTL_MIN later).
+    A landline never gets it."""
+    try:
+        before = date.fromisoformat(iso) - timedelta(days=1)
+    except (TypeError, ValueError):
+        return ""
+    if user and not is_mobile(user):
+        return ("They're on a landline, so there's no WhatsApp reminder either — ringing "
+                "them is the only way they'll know.")
+    by = now_local() + timedelta(minutes=slack_min)   # the latest the booking can go in
+    if not (REMINDER_ENABLED and (before > by.date() or (before == by.date() and by.hour < 19))):
+        return ("It may be too late for the usual day-before reminder, so ringing them is "
+                "the only way to be sure they know.")
+    when = (when or "").strip()
+    if when and not _OWNER_REMINDER_WINDOW_RE.fullmatch(when):
+        return (f"The usual reminder the day before will tell them to drop the car in between "
+                f"9 and 11am, not \"{when}\" — tell them the right time when you ring.")
+    return "They'll get the usual reminder the day before."
+
+
+def _owner_preview_text(user: str, res: dict, expires_ts: float) -> str:
+    """What the owner sees under his note (plain text: nothing to escape)."""
+    with closing(db()) as conn:
+        last = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'user'"
+                            " ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+    # Which business, and which of its numbers, sends it - the same line choice as the
+    # send: two bots share some customers, and his notes look alike in both chats.
+    line = PHONE_LABELS.get(phone_id_for_customer(user) or default_send_phone_id(), "")
+    parts = [f"🏢 {OWNER_TG_BUSINESS} WhatsApp{f' {line}' if line else ''}",
+             f"✉️ To: {res['label']}"]
+    if last:
+        said = " ".join((last[0] or "").split())
+        parts.append(f"Their last message ({_owner_stamp(last[1])}): "
+                     f"\"{said[:200]}{'…' if len(said) > 200 else ''}\"")
+    f = res.get("fields") or {}
+    if res["kind"] == "book":
+        parts.append(f"📅 BOOKING: {_owner_day(f.get('date', ''))}, drop-off {f.get('time')}\n"
+                     f"Car: {f.get('car') or '-'} ({f.get('reg') or 'no reg'})\n"
+                     f"Job: {f.get('need')}\nName: {f.get('name') or '-'}")
+    if res["no_message"]:
+        parts.append(f"⚠️ They can't be messaged: {res['why']}. The booking goes in the diary "
+                     "only; please ring them. "
+                     + _owner_reminder_note(f.get("date", ""), user, OWNER_DRAFT_TTL_MIN,
+                                            f.get("time", "")))
+    else:
+        code = _guess_lang_code(res["text"])
+        if code == "lt" and not re.search(r"[čėįšųūž]", res["text"], re.I):
+            code = ""   # ą and ę alone are Polish too: never call Polish "Lithuanian" (R3-14)
+        lang = _OWNER_LANG_NAMES.get(code) or ("not English" if res["en"] else "")
+        parts.append(f"—— Message{f' ({lang})' if lang else ''} ——\n{res['text']}")
+        if res["en"]:
+            parts.append(f"—— In English ——\n{res['en']}")
+    parts += res["warnings"]
+    until = datetime.fromtimestamp(expires_ts, now_local().tzinfo).strftime("%H:%M")
+    if res["no_message"]:
+        parts.append(f"✅ books it (no message) · ❌ drops it · expires {until}")
+    else:
+        parts.append(f"✅ {'books it and sends the message' if res['kind'] == 'book' else 'sends it'}"
+                     f" as the bot · ❌ drops it · reply to this to change it · expires {until}")
+    return "\n".join(parts)[:3800]
+
+
+def _owner_note_worker(msg: dict) -> None:
+    """One note from the owner, in its own thread: which customer, then the draft with
+    its buttons. Sends nothing to a customer."""
+    chat = str((msg.get("chat") or {}).get("id") or "")
+    mid = int(msg.get("message_id") or 0)
+    # Typed text only. A caption rides on a photo or file we cannot pass on, and "here
+    # is the invoice" sent without it would be untrue.
+    text = (msg.get("text") or "").strip()
+    now = time.time()
+    did = 0
+    try:
+        with closing(db()) as conn, conn:
+            cur = conn.execute("INSERT OR IGNORE INTO owner_drafts (src_chat, src_mid, owner_text,"
+                               " created_ts, status) VALUES (?, ?, ?, ?, 'drafting')",
+                               (chat, mid, text[:2000], now))
+            did = cur.lastrowid if cur.rowcount == 1 else 0
+        if not did:
+            return   # Telegram delivered this note again (after a restart): handled already
+        sent_at = float(msg.get("date") or now)
+        if now - sent_at > OWNER_DRAFT_TTL_MIN * 60:
+            _owner_set(did, status="expired")
+            _owner_tg_reply(chat, mid, "I only saw this now (sent "
+                            + datetime.fromtimestamp(sent_at, now_local().tzinfo).strftime("%H:%M")
+                            + ") — reply again if it still needs sending.")
+            return
+        kind_of = next((k for k in _OWNER_MEDIA_KEYS if k in msg), "")
+        if kind_of:   # owner, 29 Sep 2026: text only
+            _owner_set(did, status="refused", result="not text")
+            _owner_tg_reply(chat, mid, f"I can only send text — send {_OWNER_MEDIA_NAMES.get(kind_of, 'it')}"
+                                       " from the WhatsApp app.")
+            return
+        if not text:
+            _owner_set(did, status="refused")
+            _owner_tg_reply(chat, mid, "Please type it — I can't read voice notes yet.")
+            return
+        who = {} if text.startswith("/") else _owner_pick_customer(msg, chat, text)
+        if not who.get("user"):
+            _owner_set(did, status="refused", result=(who.get("reason") or "help")[:300])
+            _owner_tg_reply(chat, mid, who.get("reason") or _owner_help())
+            return
+        prev = who.get("prev") or {}
+        bare = _OWNER_EMOJI_MODS_RE.sub("", who["note"])
+        # Up to 60 characters of nothing but approval and politeness words ("Yes please send
+        # it now thanks", F-1): anything with a number, a day or other words has no match.
+        if (prev and _OWNER_TYPED_OK_RE.match(bare) and len(re.sub(r"[^\w\s]", "", bare).strip()) <= 60
+                and not (prev.get("kind") == "book" and not OWNER_TG_BOOK)):
+            # "yes" / "send it" / "gerai" / 👍🏻 under one of his drafts: typing can't send,
+            # and it is no change either - it never drafts, whatever became of that draft
+            # (owner, 29 Sep 2026). A reply to an ALERT has no prev: that "ok" is his answer.
+            # Under a booking draft with booking off, the build's own refusal says why (R2-8).
+            st, at = prev.get("status") or "", _owner_hhmm(prev.get("done_ts") or prev.get("created_ts"))
+            if st in ("pending", "drafting") and now - (prev.get("created_ts") or now) <= OWNER_DRAFT_TTL_MIN * 60:
+                say = "Tap ✅ Send on the draft above to send it."
+            elif st in ("pending", "expired"):
+                say = "That draft has expired — send your note again and I'll redo it."
+            elif st in ("sending", "sent"):
+                say = f"That one has already gone ({at}) — nothing new drafted."
+            elif st == "undelivered":   # never "already gone" after a refusal (F-7)
+                say = (f"That one was NOT sent ({at}) — WhatsApp refused it and they never saw it. "
+                       f"Nothing new drafted; please ring them: +{who['user']}")
+            elif st in ("refused", "failed"):
+                say = (f"That one was NOT sent ({at}) — nothing new drafted. Send your note again "
+                       "if it still needs to go.")
+            elif st == "unknown":
+                say = f"That one may already have gone ({at}) — nothing new drafted."
+            else:   # superseded, cancelled, stale, booked with no message
+                say = "That draft isn't live any more — nothing was sent from it."
+            _owner_set(did, status="refused", result="typed approval")
+            _owner_tg_reply(chat, mid, say)
+            return
+        user = who["user"]
+        label = customer_label(user)
+        pmid = _owner_tg_reply(chat, mid, f"✍️ {OWNER_TG_BUSINESS}: writing to {label}…")
+        # A redraft carries its parent's words: an edit of the parent's note drops it too
+        # (R3-4). Only when it does - not after a send (a new message: earlier = "") nor
+        # after a refused message draft (no text to carry); a booking carries his note.
+        carries = (prev.get("status") not in ("sending", "sent", "unknown")
+                   and (prev.get("text") or prev.get("kind") == "book"))
+        parent = prev.get("id") if carries else 0
+        _owner_set(did, wa_user=user, preview_chat=chat, preview_mid=pmid, alert_ts=who["alert_ts"],
+                   parent_id=int(parent or 0))
+        res = owner_draft_build(user, who["note"], who.get("prev"), who["alert_ts"],
+                                now + OWNER_DRAFT_TTL_MIN * 60)
+        booking_json = json.dumps(res["fields"]) if res["fields"] else ""
+        if not res["ok"]:
+            _owner_set(did, kind=res["kind"], booking_json=booking_json, status="refused",
+                       result=res["reason"][:300])
+            _owner_show(did, chat, mid, pmid, f"❌ {label}\n{res['reason']}", None)
+            return
+        # One live draft per customer: this one replaces his older ones - unless a newer
+        # one got there first (two notes drafting at once).
+        with closing(db()) as conn, conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")   # no tap can slip between these reads and writes
+            newer = conn.execute(
+                "SELECT 1 FROM owner_drafts WHERE wa_user = ? AND id > ? AND status IN"
+                " ('pending', 'sending', 'sent', 'booked') LIMIT 1", (user, did)).fetchone()
+            # Only while still 'drafting': an edit of his note meanwhile has dropped it.
+            live = conn.execute(
+                "UPDATE owner_drafts SET kind = ?, draft_text = ?, draft_en = ?, booking_json = ?,"
+                " built_ts = ?, preview_text = ?, status = ? WHERE id = ? AND status = 'drafting'",
+                (res["kind"], res["text"], res["en"], booking_json, res["built_ts"],
+                 res["preview"], "superseded" if newer else "pending", did)).rowcount == 1
+            old = []
+            if live and not newer:
+                old = conn.execute("SELECT id, preview_chat, preview_mid, preview_text FROM owner_drafts"
+                                   " WHERE wa_user = ? AND id < ? AND status = 'pending'",
+                                   (user, did)).fetchall()
+                conn.execute("UPDATE owner_drafts SET status = 'superseded', done_ts = ?"
+                             " WHERE wa_user = ? AND id < ? AND status = 'pending'", (now, user, did))
+        for oid, c, m, t in old:
+            # Built on that draft, or on a note of its own? Say which: three quick replies
+            # to an alert leave only the last one's words (R3-11).
+            tail = ("" if parent and oid == parent else " It has only your newer note, not this "
+                    "one's words — to add to a draft, reply to the draft itself.")
+            _owner_tg_edit(c, m, f"{t}\n\n↪️ Replaced by a newer draft.{tail}")
+        if not live or newer:
+            gone = ("↪️ Replaced by a newer draft." if live
+                    else "↪️ Cancelled — you edited your note. Nothing sent."
+                    if _owner_row(did).get("status") == "superseded"
+                    else "↪️ Dropped — nothing sent.")
+            _owner_show(did, chat, mid, pmid, f"{res['preview']}\n\n{gone}", None)
+            return
+        _owner_show(did, chat, mid, pmid, res["preview"],
+                    _owner_keyboard(did, now, res["kind"], res["no_message"]))
+    except Exception:
+        log.exception("Owner note failed: %s", text[:80])
+        try:
+            if did:
+                _owner_set(did, status="failed", result="error while drafting")
+            _owner_tg_reply(chat, mid, "Something went wrong writing that — nothing was sent.")
+        except Exception:
+            log.exception("Could not tell the owner his note failed")
+
+
+def _owner_keyboard(did: int, created_ts: float, kind: str, no_message: bool) -> dict:
+    """✅ / ❌ under a draft. The created_ts in the tag stops an old button from acting
+    on a new row that reused the id after a database reset."""
+    tag = f"{did}:{int(created_ts or 0)}"
+    label = ("✅ Book (no message)" if no_message
+             else "✅ Book + send" if kind == "book" else "✅ Send")
+    return {"inline_keyboard": [[{"text": label, "callback_data": f"osend:{tag}"},
+                                 {"text": "❌ Cancel", "callback_data": f"ocancel:{tag}"}]]}
+
+
+def _owner_row(did: int) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute(f"SELECT {', '.join(_OWNER_COLS)} FROM owner_drafts WHERE id = ?",
+                           (did,)).fetchone()
+    return dict(zip(_OWNER_COLS, row)) if row else {}
+
+
+def _owner_set(did: int, **cols) -> None:
+    with closing(db()) as conn, conn:
+        conn.execute("UPDATE owner_drafts SET " + ", ".join(f"{k} = ?" for k in cols)
+                     + " WHERE id = ?", (*cols.values(), did))
+
+
+def _owner_flip(did: int, old: str, new: str) -> bool:
+    """Move a draft on - only if it is still in the status it had. This is the
+    one-tap-only rule: of two taps (or a tap Telegram replays), exactly one wins."""
+    with closing(db()) as conn, conn:
+        cur = conn.execute("UPDATE owner_drafts SET status = ?, done_ts = ? WHERE id = ?"
+                           " AND status = ?", (new, time.time(), did, old))
+    return cur.rowcount == 1
+
+
+def _owner_tg_reply(chat: str, reply_to: int, text: str, keyboard: dict | None = None) -> int:
+    """Answer under his message in the private chat. Plain text: a customer's words
+    need no escaping. Returns the new message id (0 if Telegram refused)."""
+    payload = {"chat_id": chat, "text": (text or "")[:4000], "disable_web_page_preview": True}
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": int(reply_to),
+                                       "allow_sending_without_reply": True}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    res = tg_api("sendMessage", **payload) or {}
+    return int((res.get("result") or {}).get("message_id") or 0)
+
+
+def _owner_tg_edit(chat: str, mid: int, text: str, keyboard: dict | None = None) -> bool:
+    """Rewrite one of our private-chat messages; no keyboard = its buttons go."""
+    if not (chat and mid):
+        return False
+    payload = {"chat_id": chat, "message_id": int(mid), "text": (text or "")[:4000],
+               "disable_web_page_preview": True}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    res = tg_api("editMessageText", **payload) or {}
+    # An edit that landed but whose answer was lost comes back "not modified" on the retry:
+    # it is on his screen, so no second copy below it (F-5).
+    return bool(res.get("ok")) or "message is not modified" in str(res.get("description") or "")
+
+
+def _owner_show(did: int, chat: str, reply_to: int, pmid: int, text: str, keyboard) -> None:
+    """Turn the "Writing…" placeholder into this; if Telegram won't edit it, send it as
+    a new message and remember that one (the buttons are checked against it)."""
+    if pmid and _owner_tg_edit(chat, pmid, text, keyboard):
+        return
+    new = _owner_tg_reply(chat, reply_to, text, keyboard)
+    if new:
+        _owner_set(did, preview_mid=new)
+
+
+def owner_draft_tap(kind: str, did: int, tag: str, cq: dict) -> tuple:
+    """✅ / ❌ under a draft (from handle_claim_callback). Database work only, so the
+    button answers at once; the sending runs in its own thread. A tap Telegram
+    delivers twice, or again after a restart, finds the draft no longer pending."""
+    owner = (get_setting("owner_private_chat") or "").strip()
+    msg = cq.get("message") or {}
+    chat = str((msg.get("chat") or {}).get("id") or "")
+    if not owner or str((cq.get("from") or {}).get("id") or "") != owner or chat != owner:
+        return "Only the owner can use this button.", None
+    row = _owner_row(did)
+    pmid = int(msg.get("message_id") or 0)
+    if (not row or str(int(row["created_ts"] or 0)) != str(tag) or row["preview_chat"] != chat
+            or int(row["preview_mid"] or 0) != pmid):
+        return "That draft is no longer live.", None
+    base = row["preview_text"] or ""
+    stamp = now_local().strftime("%H:%M")
+    if kind == "ocancel":
+        if not _owner_flip(did, "pending", "cancelled"):
+            return _owner_gone_toast(did, cancel=True), None
+        return "Cancelled — nothing sent.", lambda: _owner_tg_edit(
+            chat, pmid, f"{base}\n\n❌ Cancelled {stamp} — nothing sent.")
+    if not OWNER_TG_CMD or (row["kind"] == "book" and not OWNER_TG_BOOK):
+        # The switch was thrown after this draft was made: its buttons are still in his
+        # chat, but nothing may go out or into the diary any more.
+        if not _owner_flip(did, "pending", "cancelled"):
+            return _owner_gone_toast(did), None
+        return "Switched off — nothing sent.", lambda: _owner_tg_edit(
+            chat, pmid, f"{base}\n\n❌ This is switched off — nothing sent or booked.")
+    if time.time() - (row["created_ts"] or 0) > OWNER_DRAFT_TTL_MIN * 60:
+        if not _owner_flip(did, "pending", "expired"):
+            return _owner_gone_toast(did), None
+        return "Too old — nothing sent.", lambda: _owner_tg_edit(
+            chat, pmid, f"{base}\n\n⌛ Too old — nothing sent. Reply to the alert again.")
+    if not _owner_flip(did, "pending", "sending"):
+        return _owner_gone_toast(did), None
+
+    def after() -> None:
+        _owner_tg_edit(chat, pmid, f"{base}\n\n⏳ Working on it…")   # the buttons go at once
+        threading.Thread(target=_owner_draft_execute, args=(did,), daemon=True).start()
+    return "Working on it…", after
+
+
+def _owner_gone_toast(did: int, cancel: bool = False) -> str:
+    """A tap on a draft that is no longer pending: what did happen to it. Read afresh -
+    the send thread may have moved it since the tap read it (R3-10, R3-16). Never a
+    sending -> cancelled flip: once ✅ has it, ❌ cannot stop it."""
+    row = _owner_row(did)
+    st = row.get("status") or ""
+    if st == "sending":
+        return "Too late — it's already being sent." if cancel else "Still on it — the draft will say how it went."
+    if st == "sent":
+        return "Too late — it already went." if cancel else "Already sent."
+    if st == "undelivered":   # F-7
+        return "WhatsApp refused it — they never saw it. Please ring them."
+    if st == "unknown":
+        return "Too late — it may already have gone." if cancel else "Already dealt with."
+    if st == "booked":
+        return "Too late — it's already in the diary." if cancel else "Already dealt with."
+    if st == "expired":
+        return "Too old — nothing sent."
+    if st == "superseded":
+        return ("Cancelled — you edited your note. Nothing sent." if row.get("result") == "edited"
+                else "Replaced by a newer draft — nothing sent from this one. Use the newest draft.")
+    return "Already dealt with."
+
+
+def _owner_draft_execute(did: int) -> None:
+    """The ✅ tap, in its own thread. Everything is checked again (the draft can be two
+    hours old), the booking goes in first, then the message - the text he approved.
+    The customer's lock keeps a chat reply from running at the same moment. Never
+    raises."""
+    row = _owner_row(did)
+    if not row:
+        return
+    user, chat, pmid = row["wa_user"], row["preview_chat"], int(row["preview_mid"] or 0)
+    no_msg = row["kind"] == "book" and not row["draft_text"]
+    base = row["preview_text"] or ""
+    lock = _get_user_lock(user)
+    if not lock.acquire(timeout=150):
+        _owner_flip(did, "sending", "pending")
+        _owner_tg_edit(chat, pmid, f"{base}\n\n⏳ The bot is busy with this customer — tap ✅ "
+                                   "again in a minute.",
+                       _owner_keyboard(did, row["created_ts"], row["kind"], no_msg))
+        return
+    done = {"booked": "", "sent": False, "wamid": "", "saved": False}   # what really happened
+    status, line = "failed", "❌ Something went wrong — nothing was sent."
+    try:
+        status, line = _owner_carry_out(row, no_msg, done)
+    except Exception:
+        log.exception("Owner draft %s failed", did)
+        if done["sent"]:
+            status, line = "sent", "⚠️ Sent, but something went wrong afterwards — check the chat."
+            # The message is out. Record it as best we can - a second database error must
+            # not kill this thread: the preview below has to change.
+            try:
+                _owner_db_retry(_owner_set, did, wamid=done["wamid"])
+                _owner_flip(did, "sending", "sent") or _owner_flip(did, "unknown", "sent")
+            except Exception:
+                log.exception("Owner draft %s: could not mark it sent", did)
+            if not done["saved"]:
+                try:
+                    _owner_db_retry(save_message, user, "assistant", row["draft_text"],
+                                    kind=_owner_saved_kind(row))
+                except Exception:
+                    log.exception("Owner draft %s: could not save it to the chat", did)
+                    line = ("⚠️ Sent (WhatsApp took it), but I couldn't save it to their chat "
+                            "history — don't send it again.")
+        elif done["booked"]:
+            status, line = "booked", (f"⚠️ Booked {done['booked']}, but something went wrong "
+                                      f"before the message — nothing was sent; please ring them: +{user}")
+    finally:
+        lock.release()
+    try:
+        if status == "sent":
+            # The status is already 'sent' - or 'undelivered', if WhatsApp was that quick.
+            line += _owner_after_send(row)
+            _owner_db_retry(_owner_set, did, result=line[:300])
+        else:
+            _owner_db_retry(_owner_set, did, status=status, done_ts=time.time(), result=line[:300])
+    except Exception:
+        log.exception("Owner draft %s: tidy-up failed", did)
+    # He must see how it ended: a lost "✅ Sent" invites a second copy (R3-7, R3-16).
+    # Telegram's 429 is per chat, so wait before the retry (this is the send's own
+    # thread); then a reply under the preview. preview_mid stays: the buttons match it.
+    text = f"{base}\n\n{line}"
+    if not _owner_tg_edit(chat, pmid, text):
+        time.sleep(3)
+        if not _owner_tg_edit(chat, pmid, text):
+            _owner_tg_reply(chat, pmid, line)
+
+
+def _owner_saved_kind(row: dict) -> str:
+    """How his message is kept in the chat. A booking confirmation told them the date
+    ('owner_book' counts for the day-before reminder); any other message did not
+    ('owner_tg' does not - R2-6)."""
+    return "owner_book" if row["kind"] == "book" else "owner_tg"
+
+
+def _owner_unsure_line(user: str) -> str:
+    """Plain words for a send WhatsApp never confirmed (a timeout, a gateway error)."""
+    name = _customer_first_name(user) or customer_label(user).rsplit(" +", 1)[0]
+    who = f" ({name})" if name and not name.startswith("+") else ""
+    return (f"WhatsApp didn't confirm it went — it may or may not have reached them{who}. "
+            f"Don't send it again; to be sure, please ring them +{user}")
+
+
+def _owner_db_retry(fn, *args, **kwargs):
+    """The bookkeeping after a send must not be lost to a busy database: db() waits 5 s
+    itself; try twice more."""
+    for attempt in range(3):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 2:
+                raise
+            time.sleep(1)
+
+
+def _owner_carry_out(row: dict, no_msg: bool, done: dict) -> tuple:
+    """Inside the customer's lock: re-check, book, send. (status, line for the preview)."""
+    user = row["wa_user"]
+    nothing = "Nothing booked or sent." if row["kind"] == "book" else "Nothing sent."
+    if not OWNER_TG_CMD or (row["kind"] == "book" and not OWNER_TG_BOOK):
+        return "cancelled", "❌ This is switched off — nothing sent or booked."
+    status, why = _owner_recheck(row, no_msg)
+    if status:
+        return status, f"❌ {why} {nothing}"
+    if row["kind"] == "book":
+        fields = json.loads(row["booking_json"] or "{}")
+        gate = owner_booking_gate(dict(fields))
+        if gate:
+            return "failed", f"❌ Not booked: {gate} Nothing sent."
+        ok = False
+        try:
+            ok = save_booking(fields)   # no override: its own last capacity check stands
+        except Exception:
+            log.exception("Owner booking: save failed for %s", user)
+        if not ok:
+            return "failed", ("❌ Not booked — it's already in the diary or the day has just "
+                              "filled. Nothing sent.")
+        done["booked"] = _owner_day(fields.get("date", ""), "%a %d %b")
+        try:
+            # "✅ Book (no message)" runs no register check: it would text a customer he
+            # chose not to message, and its Bot row would cancel their reminder.
+            after_new_booking(user, fields, "owner booking (Telegram)", regcheck=not no_msg)
+        except Exception:
+            log.exception("Owner booking: the after-booking steps failed for %s", user)
+        if no_msg:
+            return "booked", (f"✅ Booked {done['booked']} — not messaged, please ring them +{user}. "
+                              + _owner_reminder_note(fields.get("date", ""), user, 0,
+                                                     fields.get("time", "")))
+    wamid, err = send_whatsapp_checked(user, row["draft_text"], since=row["built_ts"] or 0)
+    if err.startswith("dup: "):
+        # Our own 15-minute guard, not WhatsApp: they already have these very words (R3-18).
+        said = (f"they already got exactly this at {err[5:]}. If they missed it, ring them "
+                f"+{user} or reply to this with different words.")
+        if done["booked"]:
+            return "booked", f"⚠️ Booked {done['booked']}, but not sent again — {said}"
+        return "failed", f"ℹ️ Not sent again — {said}"
+    if err:
+        unsure = err.startswith("unsure: ")
+        head = (f"⚠️ Booked {done['booked']}, but " if done["booked"]
+                else "⚠️ " if unsure else "❌ ")
+        if unsure:   # a timeout or a gateway error: it may have reached them - save/close nothing
+            return ("booked" if done["booked"] else "unknown"), (
+                f"{head}{_owner_unsure_line(user)}")
+        return ("booked" if done["booked"] else "failed"), (
+            f"{head}WhatsApp refused it ({err}) — "
+            + ("" if done["booked"] else "nothing was sent; ") + f"please ring them: +{user}")
+    done["sent"], done["wamid"] = True, wamid
+    # The id first: WhatsApp's NOT DELIVERED verdict is matched on it.
+    _owner_db_retry(_owner_set, row["id"], status="sent", wamid=wamid, done_ts=time.time())
+    _owner_db_retry(save_message, user, "assistant", row["draft_text"], kind=_owner_saved_kind(row))
+    done["saved"] = True
+    early = _owner_early_refusals.pop(wamid, None)
+    if early:   # WhatsApp's NOT DELIVERED overtook Chakra's answer: act on it now
+        try:
+            report_failed_delivery(early[0], early[1], wamid)
+        except Exception:
+            log.exception("Owner draft: the early NOT DELIVERED failed for %s", user)
+    stamp = now_local().strftime("%H:%M")
+    return "sent", (f"✅ Booked {done['booked']} and sent {stamp}" if done["booked"]
+                    else f"✅ Sent {stamp}")
+
+
+def _owner_recheck(row: dict, no_msg: bool) -> tuple:
+    """At tap time: may this still go? ("", "") or (status, why)."""
+    user = row["wa_user"]
+    if is_blocked(user):
+        return "failed", "That number is on the block list."
+    why = "" if no_msg else _owner_window_problem(user)
+    if why:
+        return "failed", _owner_cant_message(user, why) + "."
+    built = row["built_ts"] or 0
+    with closing(db()) as conn:
+        newer = conn.execute("SELECT role, content FROM messages WHERE wa_user = ? AND role IN"
+                             " ('user', 'staff') AND ts > ? ORDER BY id DESC LIMIT 1",
+                             (user, built)).fetchone()
+        other = conn.execute("SELECT 1 FROM owner_drafts WHERE wa_user = ? AND id <> ? AND status IN"
+                             " ('sending', 'sent', 'booked', 'undelivered') AND done_ts > ? LIMIT 1",
+                             (user, row["id"], built)).fetchone()
+    if newer:
+        said = " ".join((newer[1] or "").split())[:200]
+        return "stale", ((f"They've written since: «{said}»" if newer[0] == "user"
+                          else f"A colleague has written to them since: «{said}»")
+                         + " — reply again so I can take that into account.")
+    if other:
+        return "stale", ("Another of your drafts to them went through after this one was "
+                         "written — reply again if this still needs to go.")
+    return "", ""
+
+
+def _owner_after_send(row: dict) -> str:
+    """Once his message went out (outside the lock): close the alert he answered, keep
+    the nudges off it, this bot's extras, and the diary-gap net a colleague's reply
+    gets. Returns a note for the preview."""
+    user, text = row["wa_user"], row["draft_text"]
+    note, failed = "", []
+    try:
+        if (_owner_row(row["id"]) or {}).get("status") == "undelivered":
+            # WhatsApp's NOT DELIVERED beat this step (it overtook Chakra's answer): the
+            # alert stays open - there is nothing for _owner_reopen_alert to reopen (R2-4).
+            note = "\n⚠️ …but WhatsApp has refused it since — not delivered, the alert stays open."
+        else:
+            # Stage 2a for his words too (owner, 29 Sep 2026): only a real answer closes
+            # the alert. The English of a non-English message - classify_staff reads English.
+            note = _owner_db_retry(_owner_close_alert_if_older, user, row["built_ts"] or 0,
+                                   row["alert_ts"] or 0, row.get("draft_en") or text)
+    except Exception:
+        log.exception("Owner draft: could not close the alert for %s", user)
+        failed.append("closing the alert")
+
+    def nudge_timer() -> None:
+        # The 2h same-day nudge treats this customer message as followed up (it
+        # compares the same last role='user' row).
+        with closing(db()) as conn:
+            last_in = conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role = 'user'"
+                                   " ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        if last_in:
+            with closing(db()) as conn, conn:
+                conn.execute("INSERT INTO followups (wa_user, inbound_ts) VALUES (?, ?) "
+                             "ON CONFLICT(wa_user) DO UPDATE SET inbound_ts = excluded.inbound_ts",
+                             (user, last_in[0]))
+    for step, what in ((nudge_timer, "the follow-up timer"),
+                       (lambda: _owner_send_extras(user, text), "the nudge log")):
+        try:
+            _owner_db_retry(step)
+        except Exception:
+            log.exception("Owner draft: %s failed for %s", what, user)
+            failed.append(what)
+    if row["kind"] == "msg":
+        # In English, as the alert close reads it: diary_gap_claims reads English only, so a
+        # Russian "в пятницу" raised nothing (R3-9). One text, so one claim.
+        diary_gap_from_text(user, row.get("draft_en") or text, "staff")   # never raises
+    if failed:
+        note += "\n⚠️ Sent, but the tidy-up failed: " + ", ".join(failed) + "."
+    return note
+
+
+def _owner_close_alert_if_older(user: str, built_ts: float, replied_ts: float = 0,
+                                said: str = "") -> str:
+    """He has answered the customer, so their alert closes - staff stop chasing it and
+    the escalation stops (a bot row never closes one by itself). Not when: an alert
+    raised after his draft was written, or after the one he replied to (replied_ts,
+    from its Done button) - that is news to him; or his words are only a holding line
+    ("we'll check and get back to you"), as for a colleague's (Stage 2a)."""
+    with closing(db()) as conn:
+        row = _alert_row(conn, user)
+    if not row or (row[6] or 0) >= (row[0] or 0):
+        return ""
+    if (row[0] or 0) > built_ts:
+        return "\nℹ️ Their newer alert is still open."
+    # A real answer, not a promise to come back. The owner path's own promise test
+    # (R3-1): the shared one also counts "your car passed its NCT" - and the shared
+    # classifier is left as it is.
+    real = is_real_staff_text(said) and not (_CLAIMS_A_PERSON_MORE_RE.search(said)
+                                             or _OWNER_HOLD_RE.search(said))
+    if replied_ts and int(row[0] or 0) > int(replied_ts):
+        if real:
+            # He answered them from an older copy: the newer alert stays open for him to
+            # press Done, but the bot must not apologise to a customer who has just been
+            # answered, nor tell him "nobody has replied" (R2-10). The repost still comes.
+            now = time.time()
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE alerts SET chased_ts = ?, owner_ts = ? WHERE wa_user = ?"
+                             " AND ts = ? AND COALESCE(closed_ts, 0) < ts", (now, now, user, row[0]))
+        return "\nℹ️ Their newer alert is still open — press Done on it if this sorted it."
+    if not real:
+        return "\nℹ️ The alert stays open (a holding message) — press Done when it's sorted."
+    owner = (get_setting("owner_private_chat") or "").strip()
+    _toast, after = close_alert(user, f"{claim_names().get(owner) or 'Owner'} (Telegram)",
+                                auto=True, tapped_ts=str(int(row[0] or 0)))
+    if after:
+        after()
+        return "\nℹ️ Their alert is closed."
+    return ""
+
+
+# A refusal whose status webhook overtook Chakra's answer finds no draft with that id
+# yet; kept for 10 minutes so _owner_carry_out can act on it once the id is stored.
+_owner_early_refusals: dict = {}
+
+
+def _owner_draft_undelivered(digits: str, wamid: str, errs: list) -> None:
+    """WhatsApp refused a message the owner approved in Telegram: tell HIM, under his
+    draft - the shared NOT DELIVERED note is once a day and skips our own numbers - and
+    open again the alert his ✅ closed. Matched on the message id only. Never raises."""
+    try:
+        if not wamid:
+            return
+        with closing(db()) as conn:
+            row = conn.execute("SELECT id, preview_chat, preview_mid, wa_user, done_ts"
+                               " FROM owner_drafts WHERE wamid = ? AND status = 'sent'"
+                               " ORDER BY id DESC LIMIT 1", (wamid,)).fetchone()
+        if not row:
+            now = time.time()
+            for k, v in list(_owner_early_refusals.items()):
+                if now - v[2] > 600:
+                    _owner_early_refusals.pop(k, None)
+            _owner_early_refusals[wamid] = (digits, errs, now)
+            return
+        _owner_set(row[0], status="undelivered")
+        first = (errs or [{}])[0] or {}
+        detail = f"{first.get('title') or first.get('message') or 'refused'} ({first.get('code', '?')})"
+        who = row[3] or digits
+        reopened = False
+        try:
+            reopened = _owner_reopen_alert(who, row[4] or 0)
+        except Exception:
+            log.exception("Could not reopen the alert for %s", who)
+        _owner_tg_reply(row[1], row[2], f"⚠️ NOT DELIVERED — WhatsApp refused your message to "
+                                        f"{customer_label(who)}: {detail}. They never saw it — "
+                                        f"please ring them: +{who}"
+                                        + ("\nTheir alert is open again." if reopened else ""))
+    except Exception:
+        log.exception("Could not report the owner's undelivered message %s", wamid)
+
+
+def _owner_reopen_alert(user: str, sent_ts: float) -> bool:
+    """His message never arrived, so the alert his ✅ closed opens again - back on the
+    waiting list and the digest, with its Done button back. Only that alert (closed by
+    '(Telegram)' after this send, not raised again since). No chase text, no repost and
+    no second private ping: he has just been told to ring them."""
+    now = time.time()
+    with closing(db()) as conn, conn:
+        row = conn.execute(
+            "SELECT a.ts, a.tg_msgs, a.tg_text, a.headline FROM alerts a JOIN claim_log c"
+            " ON c.wa_user = a.wa_user AND c.alert_ts = a.ts WHERE a.wa_user = ?"
+            " AND COALESCE(a.closed_ts, 0) >= a.ts AND c.closed_ts >= ?"
+            " AND c.closed_by LIKE '%(Telegram)' LIMIT 1", (user, sent_ts)).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE alerts SET closed_ts = 0, chased_ts = ?, owner_ts = ?, escalated_ts = ?"
+                     " WHERE wa_user = ? AND ts = ?", (now, now, now, user, row[0]))
+        conn.execute("UPDATE claim_log SET closed_ts = 0, closed_by = ''"
+                     " WHERE wa_user = ? AND alert_ts = ?", (user, row[0]))
+    if row[1]:
+        _edit_alert_copies(row[1], (row[2] or row[3] or "Alert")
+                           + "\n\n⚠️ The reply sent from Telegram was NOT delivered — still open",
+                           claim_keyboard(user, row[0]))
+    return True
+
+
+def owner_drafts_sweep() -> None:
+    """Minute tick (owner, 29 Sep 2026). A ✅ whose send thread died - a restart
+    mid-send, an error before the verdict - stays 'sending', its preview on "⏳ Working
+    on it…" for good; a note whose drafting died stays "✍️ writing". Say so. Whether a
+    lost send went is unknown, so no buttons come back. A thread that was only slow
+    still writes its own verdict over this when it finishes."""
+    cutoff = time.time() - OWNER_SEND_LOST_MIN * 60
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, status, kind, preview_chat, preview_mid, preview_text, src_chat, src_mid,"
+            " wa_user FROM owner_drafts WHERE (status = 'sending' AND done_ts < ?)"
+            " OR (status = 'drafting' AND created_ts < ?)", (cutoff, cutoff)).fetchall()
+    for did, status, kind, chat, pmid, base, src_chat, src_mid, user in rows:
+        if status == "sending":
+            new, line = "unknown", ("⚠️ " + ("It may or may not be in the diary — check it. "
+                                             if kind == "book" else "") + _owner_unsure_line(user))
+        else:
+            new, line = "failed", "❌ Something went wrong writing that — nothing was sent. Send the note again."
+        if not _owner_flip(did, status, new):
+            continue
+        _owner_set(did, result=line[:300])
+        # No wait here (the minute tick): a failed edit becomes a reply under the preview.
+        if not (pmid and _owner_tg_edit(chat, int(pmid), f"{base}\n\n{line}" if base else line)):
+            _owner_tg_reply(chat or src_chat, int(pmid or src_mid or 0), line)
+
+
+def owner_tg_probe(action: str, phone: str, need: str) -> dict:
+    """?action=tgcmdtest / tgmaptest / ownerdrafts - read-only. Nothing is saved or sent;
+    tgcmdtest asks the model exactly as a real note does (a few cents) - unless the
+    feature is switched off: then a real note gets no reply, and neither does it (R3-6).
+    Both report the kill switches, so switching off can be checked."""
+    switches = {"feature_on": OWNER_TG_CMD, "book_on": OWNER_TG_BOOK}
+    if action == "tgmaptest":
+        text = need or ""
+        nums = owner_numbers_in_text(text)
+        several = len(set(nums + [normalize_phone(n) for n in _OWNER_ANY_LINK_RE.findall(text)])) > 1
+        return {"per_pattern": [sorted({normalize_phone(m.group(1)) for m in rx.finditer(text)})
+                                for rx in _OWNER_LINK_RES],
+                "numbers": nums,
+                "verdict": f"ok {nums[0]}" if len(nums) == 1 else
+                           ("several customers" if several else "none")}
+    if action == "ownerdrafts":
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT id, wa_user, kind, status, created_ts, done_ts, wamid,"
+                                " result, draft_text FROM owner_drafts ORDER BY id DESC LIMIT 20"
+                                ).fetchall()
+        return {**switches,
+                "drafts": [{"id": r[0], "user": r[1], "kind": r[2], "status": r[3],
+                            "created": _owner_when(r[4]) if r[4] else "",
+                            "done": _owner_when(r[5]) if r[5] else "", "wamid": r[6],
+                            "result": r[7], "text": (r[8] or "")[:120]} for r in rows]}
+    if not OWNER_TG_CMD:
+        return {**switches, "would_show_send_button": False,
+                "reason": "Switched off (OWNER_TG_CMD=0): a real note would get no reply at all."}
+    user = _owner_known_chat(phone or "")
+    if not user:
+        return {**switches, "error": "phone=<a number this bot has a WhatsApp chat with> required"}
+    if not (need or "").strip():
+        return {**switches, "error": "need=<the note, as the owner would type it> required"}
+    res = owner_draft_build(user, need)
+    return {"user": user, **switches, "would_show_send_button": res["ok"],
+            **{k: res[k] for k in ("reason", "kind", "text", "en", "fields", "warnings",
+                                   "no_message", "preview")}}
+
+
+def owner_booking_gate(f: dict) -> str:
+    """Why the owner's booking can't go in ("" = it can): the chat path's rules in its
+    order, saving and sending nothing. Garage: car AND reg are required; Saturdays
+    take general services only; the hard-job quota."""
+    why = _owner_gate_basics(f)
+    if why:
+        return why
+    iso, need = f["date"], f["need"]
+    if not (clean_car(f.get("car", "")) and clean_reg(f.get("reg", ""))):
+        return "I need the car make and model and the reg — put them in your note."
+    if before_open_date(iso):
+        return f"We're not taking bookings for {_owner_day(iso)} yet."
+    full = day_full_reason(iso, need)
+    if not full:
+        return ""
+    if full == "hard":
+        rule = ("Saturdays are general services only." if date.fromisoformat(iso).weekday() == 5
+                else f"The hard-job quota for {_owner_day(iso, '%A %d %b')} is used up.")
+    else:
+        rule = f"{_owner_day(iso, '%A %d %b')} is full."
+    return f"{rule} Next free day for this job: {_owner_next_free_day(need)}."
+
+
+def _owner_booking_extra_warnings(user: str, f: dict) -> list:
+    """Garage: a customer on the waiting list for an earlier day has their LATER
+    booking cancelled by settle_waitlist_after_booking when this one goes in (same
+    test as there) - say so before he taps."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT booked_date, reg FROM waitlist WHERE phone LIKE ?"
+                               " AND status IN ('waiting','offered')",
+                               ("%" + user[-9:],)).fetchone()
+    except Exception:
+        return []
+    if not row or (f.get("date") or "") >= (row[0] or ""):
+        return []
+    if row[1] and f.get("reg") and clean_reg(row[1]) != clean_reg(f["reg"]):
+        return []
+    return [f"⚠️ They're on the waiting list: booking this CANCELS their "
+            f"{_owner_day(row[0], '%A %d %b')} booking."]
+
+
+def _owner_send_extras(user: str, text: str) -> None:
+    """Garage, after his message went out: the paid next-day nudge must not chase the
+    enquiry he just answered, and "someone will ring you" in his words is the promise
+    of a person, as it is in the bot's own replies."""
+    _log_followup(user, "next_day_skip", time.time(), "owner_tg")
+    if claims_a_person(text, user):
+        mark_person_promised(user, "owner_tg")
 
 # ---------------------------------------------------------------- diary gaps (Stage 1c)
 # Somebody believes a car is coming in on a day - the customer ("the Kia Sportage
@@ -9994,6 +11939,10 @@ def telegram_button_loop() -> None:
                 if upd.get("callback_query"):
                     handle_claim_callback(upd["callback_query"])
                 else:
+                    try:
+                        owner_note_received(upd)   # fast checks; the work runs in a thread
+                    except Exception:
+                        log.exception("Owner note hook failed")
                     _remember_tg_chat(upd)
         except Exception:
             log.exception("Telegram button poll error")
@@ -10008,6 +11957,10 @@ def telegram_button_loop() -> None:
                 tick_tasks()
             except Exception:
                 log.exception("Task tick error")
+            try:
+                owner_drafts_sweep()   # an owner's ✅ or note lost mid-way (a restart)
+            except Exception:
+                log.exception("Owner drafts sweep error")
 
 UNRESOLVED_DIGEST_HOUR = int(os.environ.get("UNRESOLVED_DIGEST_HOUR", "18"))
 
@@ -10685,6 +12638,9 @@ READ_ONLY_ACTIONS.add("weekdaytest")
 READ_ONLY_ACTIONS.add("sigwatch")
 # Reads nothing but the words you hand it: no customer, no sending, no alert.
 READ_ONLY_ACTIONS.add("promisetest")
+# The owner's Telegram notes: a dry-run draft, the alert mapper, the drafts list -
+# nothing is saved or sent.
+READ_ONLY_ACTIONS.update({"tgcmdtest", "tgmaptest", "ownerdrafts"})
 # Which commit is serving - the deploy probe. Reads nothing else.
 READ_ONLY_ACTIONS.add("version")
 READ_ONLY_ACTIONS.add("tasks")
@@ -12379,6 +14335,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
              "signed": bool(r[_SW_HAS256]), "old_sha1_only": bool(r[_SW_HAS1] and not r[_SW_HAS256]),
              "candidate": r[_SW_CAND]} for r in rows[:10]]
         return summary
+    if action in ("tgcmdtest", "tgmaptest", "ownerdrafts"):
+        # Read-only (29 Sep 2026), the owner's Telegram notes: what a note would draft
+        # (&phone=&need=, model only), which customer a pasted alert maps to (&need=),
+        # the last 20 drafts.
+        return owner_tg_probe(action, phone, need)
     if action == "askbot":
         # Dry-run the bot: ?need=<customer message> (optional &date=<lang hint>).
         # Runs the SAME model + knowledge base + availability the customers get,
@@ -13934,6 +15895,9 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
     the only reliable way to know WHICH message was refused.
     """
     digits = "".join(ch for ch in (recipient or "") if ch.isdigit())
+    # A message the owner approved in Telegram: he hears it failed, under his draft,
+    # whatever the checks below decide. Never raises.
+    _owner_draft_undelivered(digits, wamid, errs)
     if not digits or is_blocked(digits) or _is_internal_number(digits):
         return
     try:
