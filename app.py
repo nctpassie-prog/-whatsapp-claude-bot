@@ -1284,7 +1284,7 @@ def settle_waitlist_after_booking(fields: dict) -> None:
     except Exception:
         log.exception("Waitlist settle failed for %s", phone)
 
-def notify_owner_booking(fields: dict) -> None:
+def notify_owner_booking(fields: dict, owner: bool = False) -> None:
     """Send the owner a booking summary (Telegram + WhatsApp) with a calendar link."""
     car = fields.get("car", "")
     reg = fields.get("reg", "")
@@ -1326,6 +1326,14 @@ def notify_owner_booking(fields: dict) -> None:
     else:
         note += ("\n\nAdd to Google Calendar:\n"
                  + calendar_link(title, summary, fields.get("date", "")))
+    # Owner's rule 29 Sep 2026: a plain booking waits for the evening report; a
+    # comeback, or one booking_note_now says someone must act on, goes now. The
+    # owner's own booking never echoes back to him unless it went wrong.
+    if not (("comeback" in need.lower() and not owner)
+            or booking_note_now(fields, in_calendar, owner=owner)):
+        log.info("Booking note held for the evening report: %s %s on %s",
+                 car, reg, date_str)
+        return
     try:
         send_telegram(note)
     except Exception:
@@ -4137,7 +4145,7 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         added = save_booking(fields, override_capacity=True)
         if not added:
             return  # a duplicate - the booking is already in the diary
-        create_calendar_event(fields)
+        staff_cal = create_calendar_event(fields)
         # A colleague typed "booked now for Tuesday next week 12pm" on 18 Sep and
         # the model read it as Thursday 24 September. The date is deliberately
         # NOT corrected here: this path saves with override_capacity=True, which
@@ -4172,12 +4180,24 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         also = (f"\n\n⚠️ They are also in the diary for {other}. If the day moved, "
                 "please cancel the old booking; if it's a second car or visit, ignore "
                 "this." if other else "")
-        send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
-                      f"{fields.get('name','')} — {fields.get('car','')} "
-                      f"{fields.get('reg','')}\n{fields.get('need','')}\n"
-                      f"Date: {fields.get('date','')} (9-11am)\n"
-                      "It's in the diary and calendar; the reminder will go out "
-                      "automatically." + two_ways + also)
+        # Owner's rule 29 Sep 2026: the evening report lists it. A note now only
+        # when there is something to check - a day read two ways, a second day in
+        # the diary, a car due today or tomorrow (its reminder goes out before the
+        # report), a calendar that refused it.
+        try:
+            cal_missed = calendar_enabled() and not staff_cal
+        except Exception:
+            cal_missed = False
+        if two_ways or also or booking_note_now(fields, staff_cal, lead_days=1):
+            send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
+                          f"{fields.get('name','')} — {fields.get('car','')} "
+                          f"{fields.get('reg','')}\n{fields.get('need','')}\n"
+                          f"Date: {fields.get('date','')} (9-11am)\n"
+                          + ("It's in the diary, but the calendar did NOT take it - "
+                             "please add it by hand. The reminder" if cal_missed else
+                             "It's in the diary and calendar; the reminder"
+                             if calendar_enabled() else "It's in the diary; the reminder")
+                          + " will go out automatically." + two_ways + also)
         log.info("Staff-agreed booking logged for %s on %s", user, fields.get("date"))
     except Exception:
         log.exception("watch_staff_booking failed for %s", user)
@@ -5830,7 +5850,9 @@ def after_new_booking(user: str, booking: dict, source: str, regcheck: bool = Tr
     the owner's "✅ Book (no message)": the register check would text a customer he
     chose not to message, and its saved Bot row would cancel their day-before reminder."""
     try:
-        notify_owner_booking(booking)
+        # The owner's own bookings (WhatsApp "Added" or Telegram) never echo
+        # back to him unless something went wrong (29 Sep 2026).
+        notify_owner_booking(booking, owner=source.startswith("owner booking"))
     except Exception:
         log.exception("Failed to notify owner of booking")
     try:
@@ -6034,7 +6056,8 @@ def _finish_reply(user: str, answer: str) -> str:
         # A repeat of a booking we already hold must not alert, email or make a
         # second calendar entry — that is what filled the diary with doubles.
         if is_new:
-            after_new_booking(user, booking, "chat booking")
+            after_new_booking(user, booking,
+                              "owner booking (WhatsApp)" if is_owner else "chat booking")
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -7377,19 +7400,139 @@ def send_weekly_mechanic_report(force: bool = False, week_of: str = "") -> None:
     send_telegram_private(body)
     return body
 
-def send_telegram_private(text: str) -> None:
+def send_telegram_private(text: str) -> bool:
     """Send to the owner's PERSONAL Telegram chat only (setting owner_private_chat).
     Silently logs if that chat hasn't been linked yet — sensitive reports must
     never fall back to the shared alert channel."""
     chat_id = (get_setting("owner_private_chat") or "").strip()
     if not chat_id or not TELEGRAM_BOT_TOKEN:
         log.warning("Private Telegram chat not set — private report NOT sent")
-        return
+        return False
     try:
-        httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                   json={"chat_id": chat_id, "text": text[:4000]}, timeout=20)
+        r = httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                       json={"chat_id": chat_id, "text": text[:4000]}, timeout=20)
+        if r.status_code >= 300:
+            log.warning("Private Telegram send: HTTP %s %s", r.status_code, (r.text or "")[:200])
+            return False
+        return True
     except Exception:
         log.exception("Private Telegram send failed")
+        return False
+
+# Owner's rule 29 Sep 2026: "if customer did booking do not send follow up. Only
+# send report in evening. How many bookings was done". So no Telegram message for
+# every booking - one evening message instead, with the count and a line each.
+# Every booking still goes in the diary, the booking email and (where connected)
+# the calendar. BOOKING_NOTES_INSTANT=1 brings every instant message back without
+# a redeploy.
+BOOKING_NOTES_INSTANT = os.environ.get("BOOKING_NOTES_INSTANT", "0").strip() == "1"
+BOOKING_REPORT_HOUR = int(os.environ.get("BOOKING_REPORT_HOUR", "18"))
+BOOKING_REPORT_MAX_LINES = 25
+BOOKING_REPORT_MAX_DAYS = 7   # a missed evening (a redeploy at 18:xx) loses nothing
+
+
+def booking_note_now(fields: dict, calendar_ok=None, lead_days: int = 0,
+                     owner: bool = False) -> bool:
+    """Should this booking's instant message still go out? Only when a person
+    must act before the evening report (or the 08:00 briefing, which names every
+    car due that day) could tell them:
+    - the booking is for today - after the briefing - or, with lead_days=1, for
+      tomorrow too (a colleague's booking the model read from staff chat: its
+      reminder goes out before the report); a date that can't be read, always.
+      Never for the owner's own booking - he made it;
+    - it is not in the diary after all (the save failed), so the report will
+      never show it;
+    - the calendar is connected but did not take it.
+    Never raises: in doubt, send."""
+    if BOOKING_NOTES_INSTANT:
+        return True
+    try:
+        day = date.fromisoformat((fields.get("date") or "").strip())
+        if not owner and day <= now_local().date() + timedelta(days=lead_days):
+            return True
+        if (clean_reg(fields.get("reg", "")) or "".join(
+                ch for ch in str(fields.get("phone", "")) if ch.isdigit())):
+            if not booking_already_in_diary(fields):
+                return True
+        if calendar_ok is not None and calendar_enabled() and not calendar_ok:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def booking_report_lines(until_ts: float = 0.0) -> list:
+    """The evening bookings message: every booking made since the last report
+    that reached the owner (at most BOOKING_REPORT_MAX_DAYS back, 24h the first
+    time), one line each. Every booking counts, whoever made it - the bot, a
+    colleague, the phone agent or the owner - because it is read from the diary
+    itself. Read-only."""
+    until_ts = until_ts or time.time()
+    try:
+        since_ts = float(get_setting("booking_report_ts") or 0)
+    except (TypeError, ValueError):
+        since_ts = 0.0
+    if not (until_ts - BOOKING_REPORT_MAX_DAYS * 86400 <= since_ts < until_ts):
+        since_ts = until_ts - 24 * 3600
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT name, car, reg, need, date, phone FROM bookings"
+            " WHERE COALESCE(created_ts, 0) >= ? AND COALESCE(created_ts, 0) < ?"
+            " ORDER BY created_ts, id", (since_ts, until_ts)).fetchall()
+    tz = ZoneInfo("Europe/Dublin")
+    since = datetime.fromtimestamp(since_ts, tz)
+    today = datetime.fromtimestamp(until_ts, tz).date()
+    h = BOOKING_REPORT_HOUR
+    if since.date() == today - timedelta(days=1) and since.hour == h:
+        when = f"{h % 12 or 12}{'am' if h < 12 else 'pm'} yesterday"
+    else:
+        when = since.strftime("%a %d %b %H:%M")
+    lines = [f"\U0001F4C5 Bookings taken since {when}: {len(rows)}"]
+    for name, car, reg, need, day, phone in rows[:BOOKING_REPORT_MAX_LINES]:
+        try:
+            day_label = datetime.strptime(day or "", "%Y-%m-%d").strftime("%a %d %b")
+        except ValueError:
+            day_label = day or "no date"
+        car_reg = " ".join(f"{car or ''} {reg or ''}".split()) or "(no car)"
+        job = " ".join((need or "").split())[:60] or "(no job given)"
+        flag = ""
+        if reg_needs_confirming(reg or ""):
+            digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+            flag = " \u26a0\ufe0f check the reg" + (f" wa.me/{digits}" if digits else "")
+        lines.append(f"\u2022 {day_label} \u2014 {(name or '').strip() or '(no name)'} "
+                     f"\u2014 {car_reg} \u2014 {job}{flag}")
+    if len(rows) > BOOKING_REPORT_MAX_LINES:
+        lines.append(f"\u2026and {len(rows) - BOOKING_REPORT_MAX_LINES} more "
+                     "\u2014 the diary has them all.")
+    return lines
+
+
+def send_evening_booking_report(force: bool = False) -> None:
+    """Owner's 18:00 message (29 Sep 2026): how many bookings were taken, one line
+    each. Its own message, so it can never push the waiting list off the end of
+    another. The window only moves on once Telegram has taken it - otherwise the
+    next evening's report still carries these bookings."""
+    now = now_local()
+    if not force and now.hour != BOOKING_REPORT_HOUR:
+        return
+    today_iso = now.date().isoformat()
+    if not force and get_setting("booking_report_sent") == today_iso:
+        return
+    set_setting("booking_report_sent", today_iso)
+    nowts = time.time()
+    text = "\n".join(booking_report_lines(nowts))
+    delivered = False
+    if (get_setting("owner_private_chat") or "").strip():
+        delivered = send_telegram_private(text)
+    if not delivered:
+        # The bookings used to go to the shared chat anyway - never lose them
+        # because the private chat was never linked or Telegram refused it.
+        log.warning("Private chat unavailable - booking report to the shared channel")
+        send_telegram(text)
+        delivered = telegram_enabled()
+    if delivered:
+        set_setting("booking_report_ts", str(nowts))
+    log.info("Evening booking report: %s", "sent" if delivered else "NOT delivered")
 
 def send_weekly_gap_report(force: bool = False) -> None:
     """Once a week, tell the owner what customers asked that the bot couldn't answer.
@@ -12406,6 +12549,10 @@ def reminder_loop() -> None:
         except Exception:
             log.exception("Daily briefing error")
         try:
+            send_evening_booking_report()
+        except Exception:
+            log.exception("Evening booking report error")
+        try:
             evening_reg_check()
         except Exception:
             log.exception("Evening reg check error")
@@ -12537,7 +12684,7 @@ h1{margin:0;font-size:18px}
 
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
-READ_ONLY_ACTIONS = {"status", "customers", "gaps", "delivery", "followuptest", "gstatus",
+READ_ONLY_ACTIONS = {"status", "bookingreport", "customers", "gaps", "delivery", "followuptest", "gstatus",
                      "nudgetest",
                      "waiting", "claimboard", "claimtest", "claimstatus", "claimname",
                      # Writes, but only ever adds the owner's OWN bookings to the
@@ -13671,6 +13818,13 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"added": bool(added), "calendar": bool(cal),
                 # Only a duplicate can refuse now, so the note is finally true.
                 "note": "already in the diary — nothing added" if not added else "booked"}
+    if action == "bookingreport":
+        # Read-only: tonight's bookings message as it stands now - nothing is sent
+        # and the report window does not move.
+        return {"lines": booking_report_lines(), "instant_booking_notes": BOOKING_NOTES_INSTANT,
+                "report_hour": BOOKING_REPORT_HOUR,
+                "last_report": get_setting("booking_report_ts") or "",
+                "private_chat_linked": bool((get_setting("owner_private_chat") or "").strip())}
     if action == "day":
         # Full job list for a date: ?action=day&date=YYYY-MM-DD (default tomorrow).
         try:
@@ -15648,8 +15802,9 @@ async def retell_function(request: Request):
             return {"booked": False, "reason": "still need the car registration number before I can book this"}
         added = save_booking(fields)
         if added:
+            voice_cal = False
             try:
-                create_calendar_event(fields)
+                voice_cal = create_calendar_event(fields)
             except Exception:
                 log.exception("Voice booking calendar event failed")
             try:
@@ -15717,14 +15872,26 @@ async def retell_function(request: Request):
                     log.exception("Voice booking WhatsApp confirmation failed")
             threading.Thread(target=_register_check_followup,
                               args=(fields, "voice booking"), daemon=True).start()
-            send_telegram("📞 PHONE BOOKING (voice agent)\n"
-                          f"{fields['name']} — {fields['car']} {fields['reg']}\n"
-                          f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
-                          f"Caller: +{fields['phone']}"
-                          + ("\n⚠️ Reg looks unusual — asked the customer to confirm it"
-                             if reg_needs_confirming(fields["reg"]) else "")
-                          + (f"\n📋 Waiting for earlier ({fields['wanted']})"
-                             if fields["wanted"] else ""))
+            # Owner's rule 29 Sep 2026: in the evening report instead (an odd reg
+            # is flagged there, with the number), unless booking_note_now says
+            # someone must act first. A landline caller already has the
+            # ring-them-back message above - one message per booking.
+            try:
+                voice_cal_missed = calendar_enabled() and not voice_cal
+                landline = bool(fields["phone"]) and not is_mobile(fields["phone"])
+            except Exception:
+                voice_cal_missed, landline = False, False
+            if booking_note_now(fields, voice_cal) and (voice_cal_missed or not landline):
+                send_telegram("📞 PHONE BOOKING (voice agent)\n"
+                              f"{fields['name']} — {fields['car']} {fields['reg']}\n"
+                              f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
+                              f"Caller: +{fields['phone']}"
+                              + ("\n⚠️ Reg looks unusual — asked the customer to confirm it"
+                                 if reg_needs_confirming(fields["reg"]) else "")
+                              + (f"\n📋 Waiting for earlier ({fields['wanted']})"
+                                 if fields["wanted"] else "")
+                              + ("\n⚠️ The calendar did NOT take it - please add it by hand"
+                                 if voice_cal_missed else ""))
             confirm = "Booked. Drop-off between 9 and 11am."
             if fields["wanted"]:
                 confirm += (" Also tell them: they are on our cancellation list — "
