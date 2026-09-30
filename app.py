@@ -11735,6 +11735,69 @@ def _gap_date(sentence: str, today) -> tuple:
     return d.isoformat(), how
 
 
+# 30 Sep 2026 - the bot's "booked" sentence borrowing the day from the one before
+# (_gap_joined_claim). That sentence must read like a booking: a time, a drop-off,
+# "booked"/"booking"/"appointment", ending "...it is", or a confirming opener before a
+# full date ("Exactly — the Insignia on Tuesday 6 October."). Not "they'll call you
+# tomorrow", "the retest is Friday", "it'll be ready Friday" - each followed by a stock
+# "You're all set 👍".
+_GAP_JOIN_BOOKING_RE = re.compile(
+    r"\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b|\bdrop[- ]?off\b|\bbook(?:ed|ing)\b|\bappointment\b"
+    r"|\bit is\W*$",
+    re.IGNORECASE)
+# An opener ("Exactly —", "Perfect,", "Great,") counts only before a full date and no
+# helper verb: not "Great, we'll order the part tomorrow", "So the retest is Friday
+# 2 October", "Great news — your car passed the pre-check on Monday".
+_GAP_JOIN_OPENER_RE = re.compile(
+    r"^\W*(?:exactly|perfect|great|grand|brilliant|lovely|sound|excellent|super|brill|right|done|so)\b",
+    re.IGNORECASE)
+_GAP_JOIN_HELPER_RE = re.compile(r"'ll\b|\b(?:will|would|is|are|was|were|has|have|had|be)\b",
+                                 re.IGNORECASE)
+# ...and lends its day to nothing when it turns a day down or calls one off...
+_GAP_JOIN_REFUSED_RE = re.compile(
+    r"\bfully booked\b|\bbooked (?:up|out)\b|\b(?:is|are|we'?re|it'?s|now)\s+(?:now\s+)?full\b"
+    r"|\bno (?:space|room|slots?|availability)\b|\bnot (?:available|free|possible)\b|\bunavailable\b"
+    r"|\bunfortunately\b|\bcancel\w*|\bresched\w*|\bpostpon\w*|\bwaiting list\b|\binstead of\b",
+    re.IGNORECASE)
+# ...or gives opening hours ("We're here until 6pm tomorrow. You're all set 👍")...
+_GAP_JOIN_HOURS_RE = re.compile(r"\bopen\b|\bclos(?:e|ed|es|ing)\b|\buntil\b|\btill\b",
+                                re.IGNORECASE)
+# ...and nothing is booked while it waits on somebody: "Once the team confirms the
+# evening time works, you're booked in" (headlights, 14 Sep). Read with the stock
+# "we'll message you once it's ready to collect" taken out.
+_GAP_JOIN_PENDING_RE = re.compile(
+    r"\bonce\b|\bas soon as\b|\bwhen (?:the team|a colleague|we|they)\b|\bafter (?:the team|we|they)\b"
+    r"|\bpending\b|\bprovisional\w*\b|\bsubject to\b",
+    re.IGNORECASE)
+
+
+def _gap_joined_claim(before: str, s: str, today) -> dict:
+    """The claim a bot sentence with no day ("You're all booked in 👍") makes with
+    the ONE sentence before it, or {} - every single-sentence rule runs on the two
+    together, plus the rules above. Always strong; a long one is stored as the
+    start of the sentence before plus the "booked" words (the task's headline
+    carries the date either way)."""
+    both = before + " " + s
+    plain = _GAP_READY_TEMPLATE_RE.sub(" ", both)
+    if ("?" in both or _GAP_NOT_OURS_RE.search(both) or _GAP_OFFER_RE.search(both)
+            or _GAP_JOIN_REFUSED_RE.search(before) or _GAP_JOIN_HOURS_RE.search(before)
+            or _GAP_JOIN_PENDING_RE.search(plain)
+            or _GAP_COLLECTING_RE.search(plain) or _GAP_COLLECT_RE.search(plain)):
+        return {}
+    if not _GAP_JOIN_BOOKING_RE.search(before):
+        m = _GAP_JOIN_OPENER_RE.search(before)
+        if (not m or _GAP_JOIN_HELPER_RE.search(before[m.end():])
+                or _gap_date(before, today)[1] not in ("date", "ordinal")):
+            return {}
+    d, how = _gap_date(both, today)
+    if not d:
+        return {}
+    # Kept whole when it fits; else the START of the sentence with the day (its
+    # "this"/"next" matters to _gap_later_weekday) and the "booked" words.
+    shown = both if len(both) <= 160 else before[:max(40, 157 - len(s))] + "… " + s
+    return {"date": d, "sentence": shown[:160], "how": how, "strong": True}
+
+
 def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> list:
     """Every sentence in which `source` ("customer", "bot" or "staff") says a car
     is coming in on a day: [{date, sentence, how, strong}]. Pure - the diary is
@@ -11747,8 +11810,11 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
         return []   # "I'm booked in for Friday. I need to cancel" is not a claim
     trigger = {"customer": _GAP_CUSTOMER_RE, "bot": _GAP_BOT_RE, "staff": _GAP_STAFF_RE}[source]
     out = []
+    joined = []   # the bot's "You're all booked in 👍" after the sentence with the day
+    prev = ""
     for raw in re.split(r"(?<=[.!?])\s+|\n+", text):
         s = raw.strip()
+        before, prev = prev, (s or prev)
         if not s or not trigger.search(s) or _GAP_NOT_OURS_RE.search(s):
             continue
         if source == "customer" and _GAP_PAST_VISIT_RE.search(s):
@@ -11760,6 +11826,11 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
         if source == "bot" and _GAP_OFFER_RE.search(s):
             continue   # an offer, not a confirmation
         d, how = _gap_date(s, today)
+        if not d and source == "bot" and before and _GAP_STRONG_RE.search(s):
+            c = _gap_joined_claim(before, s, today)
+            if c:
+                joined.append(c)
+            continue
         if not d:
             continue
         strong = bool(_GAP_STRONG_RE.search(s))
@@ -11770,6 +11841,11 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
             continue   # a bare "see you tomorrow!" sign-off to a chat about something else
         if all(d != c["date"] for c in out):
             out.append({"date": d, "sentence": s[:160], "how": how, "strong": strong})
+    # Only for a day no single sentence claimed: those keep deciding everything
+    # they decided before, the read-back cut included.
+    for c in joined:
+        if all(c["date"] != x["date"] for x in out):
+            out.append(c)
     return out
 
 
