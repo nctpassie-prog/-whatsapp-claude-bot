@@ -270,7 +270,14 @@ weekday. Same for "tomorrow": only call it a weekday the calendar confirms.
 mechanic, or a human being — if a customer asks for a person by name, say they'll \
 get back to them.
 - After 5:30pm, never promise an answer "shortly" — say the team will come back \
-first thing tomorrow morning (or Monday, from Saturday afternoon).
+when the clock line below says we open again ("tomorrow morning at 9am", "on Monday \
+morning at 9am", or after a bank holiday the day it names).
+- NEVER invent reasons we are closed (holidays, staff away) — the availability \
+calendar and the clock line below are the only truth about which days we work. A day \
+they mark CLOSED for a bank holiday IS one: say plainly we're closed that day for the \
+bank holiday and offer another day. Never call any other day a bank holiday (Good \
+Friday is not one, and over Christmas and New Year only 25 and 26 December and 1 \
+January are).
 - Romanian/Moldovan customers often use Russian loanwords for car parts: \
 "steplenia"/"стэплэние" means the CLUTCH (ambreiaj), not suspension.
 - Only state facts found in the business information below. If you don't know \
@@ -2399,50 +2406,239 @@ def booking_already_in_diary(fields: dict) -> bool:
     return bool(dupe)
 
 # Opening hours (business_info.md): Mon-Fri 9:00-18:00, Saturday 9:00-14:00, Sunday
-# closed. weekday() -> (open hour, close hour).
+# and bank holidays closed. weekday() -> (open hour, close hour); bank holidays come
+# from bank_holiday_name() below, not from this dict.
 OPEN_HOURS = {0: (9, 18), 1: (9, 18), 2: (9, 18), 3: (9, 18), 4: (9, 18), 5: (9, 14)}
 _HOURS_SENTENCE = ("Opening hours: Monday to Friday 9am-6pm, Saturday 9am-2pm (14:00), "
-                   "Sunday closed.")
+                   "Sunday and bank holidays closed.")
+
+
+# ---------------------------------------------------------------- bank holidays
+# Owner, 28-29 Sep 2026: "we closed on bank holidays, do not take any bookings". An Irish
+# public holiday is shut ALL DAY - nobody in, no bookings (an evening key drop for the next
+# open day is still fine, like a Sunday evening's - 30 Sep review). The statutory days
+# only, NO substitute days ("no we open after christmas"): when 25/26 Dec, 1 Jan or 17 Mar
+# fall on a weekend, the Monday/Tuesday after is an ordinary open day. Good Friday is not a
+# public holiday. This is NOT closed_dates: a day the owner closes with "close <day>" is
+# open but fully booked - the team is in. bank_holiday_name() is the one source; OPEN_HOURS
+# stays the weekly pattern and hours_on() puts the two together.
+def _easter_sunday(year: int) -> date:
+    """Anonymous Gregorian algorithm (Meeus/Jones/Butcher)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    el = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * el) // 451
+    month, day = divmod(h + el - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+_BANK_HOLIDAYS = {}   # year -> {date: name}
+
+
+def _bank_holidays(year: int) -> dict:
+    if year not in _BANK_HOLIDAYS:
+        def first_monday(month):
+            d = date(year, month, 1)
+            return d + timedelta(days=(7 - d.weekday()) % 7)
+        feb1, oct31 = date(year, 2, 1), date(year, 10, 31)
+        _BANK_HOLIDAYS[year] = {
+            date(year, 1, 1): "New Year's Day",
+            # St Brigid's Day: the first Monday in February - or 1 February itself when
+            # that is a Friday.
+            (feb1 if feb1.weekday() == 4 else first_monday(2)): "St Brigid's Day",
+            date(year, 3, 17): "St Patrick's Day",
+            _easter_sunday(year) + timedelta(days=1): "Easter Monday",
+            first_monday(5): "May bank holiday",
+            first_monday(6): "June bank holiday",
+            first_monday(8): "August bank holiday",
+            oct31 - timedelta(days=oct31.weekday()): "October bank holiday",
+            date(year, 12, 25): "Christmas Day",
+            date(year, 12, 26): "St Stephen's Day",
+        }
+    return _BANK_HOLIDAYS[year]
+
+
+def bank_holiday_name(d) -> str:
+    """The bank holiday's name if `d` (a date, a datetime or 'YYYY-MM-DD...') is one, else ''."""
+    try:
+        if isinstance(d, str):
+            d = datetime.strptime(d.strip()[:10], "%Y-%m-%d").date()
+        elif isinstance(d, datetime):
+            d = d.date()
+        return _bank_holidays(d.year).get(d, "")
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def bank_holiday_shut(d) -> str:
+    """bank_holiday_name(d) for a day from yesterday on, '' for an earlier one. An earlier
+    date only reaches the booking gates as the model's LAST-year date, which save_booking
+    stores a year on: every gate then judges it exactly as live, and the bank-holiday rule
+    is applied to the day really stored (29 Sep 2026 review)."""
+    try:
+        if isinstance(d, str):
+            d = datetime.strptime(d.strip()[:10], "%Y-%m-%d").date()
+        elif isinstance(d, datetime):
+            d = d.date()
+        if d < now_local().date() - timedelta(days=1):
+            return ""
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    return bank_holiday_name(d)
+
+
+def bank_holidays_between(start, end) -> list:
+    """[(date, name)] of the bank holidays from `start` to `end`, both included."""
+    out = []
+    for year in range(start.year, end.year + 1):
+        out += [(d, n) for d, n in _bank_holidays(year).items() if start <= d <= end]
+    return sorted(out)
+
+
+def hours_on(d):
+    """(open hour, close hour) when the TEAM is in on this day, or None: a Sunday or a bank
+    holiday. A day the owner closed to bookings is still a working day."""
+    if bank_holiday_name(d):
+        return None
+    return OPEN_HOURS.get(d.weekday())
+
+
+def next_open_day(d):
+    """The first day after `d` the team is in - past Sundays and bank holidays."""
+    for i in range(1, 15):
+        if hours_on(d + timedelta(days=i)):
+            return d + timedelta(days=i)
+    return d + timedelta(days=1)   # never: at most four shut days in a row
+
+
+def bank_holidays_ahead(today, days: int = 7) -> str:
+    """One sentence for the clock line naming the bank holidays in the next `days` days."""
+    hols = bank_holidays_between(today + timedelta(days=1), today + timedelta(days=days))
+    if not hols:
+        return ""
+    names = [f"{d:%A} {d.day} {d:%B} ({n})" for d, n in hols]
+    said = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return (f" {said} {'is a bank holiday' if len(hols) == 1 else 'are bank holidays'}: "
+            "we are CLOSED all day - nobody in and no bookings.")
+
+
+def bank_holidays_note(start, end) -> str:
+    """For the model's day list: the bank holidays after the list, up to `end`."""
+    hols = bank_holidays_between(start, end)
+    if not hols:
+        return ""
+    return ("\nBank holidays after this list - CLOSED all day, never offer or book them: "
+            + ", ".join(f"{d:%a %d %b %Y} ({n})" for d, n in hols) + ".")
+
+
+def closed_days_list(start, days: int) -> list:
+    """The bank holidays in the voice agent's window, so it can say WHY a day is missing."""
+    return [{"date": d.isoformat(), "day": d.strftime("%A"),
+             "why": f"bank holiday ({n}) - we are closed"}
+            for d, n in bank_holidays_between(start, start + timedelta(days=days))]
+
+
+# The honest refusal for a bank holiday - never "that day is fully booked".
+CLOSED_DAY_MSG = {
+    "en": "Sorry — we're closed on {day} (bank holiday). 🙏 The nearest day I can offer "
+          "you is {alt} — would that suit?",
+    "ru": "К сожалению, {day} мы закрыты — это государственный праздник. 🙏 Ближайший "
+          "день, который могу предложить — {alt}. Подойдёт?",
+    "lt": "Deja, {day} nedirbame — tai valstybinė šventė. 🙏 Artimiausia diena, kurią "
+          "galiu pasiūlyti — {alt}. Ar tiktų?",
+    "ro": "Ne pare rău — pe {day} suntem închiși (sărbătoare legală). 🙏 Cea mai apropiată "
+          "zi pe care o pot oferi este {alt} — vă convine?",
+}
+# ...and when no day in the next four weeks takes the job: never "The nearest day I can
+# offer you is none in the next four weeks — ask the team — would that suit?".
+CLOSED_DAY_NOALT_MSG = {
+    "en": "Sorry — we're closed on {day} (bank holiday). 🙏 Could we do a different day? "
+          "Just tell me another day that suits and I'll sort it.",
+    "ru": "К сожалению, {day} мы закрыты — это государственный праздник. 🙏 Можем "
+          "предложить другой день? Напишите, какой день вам удобен, и я всё устрою.",
+    "lt": "Deja, {day} nedirbame — tai valstybinė šventė. 🙏 Gal galime pasiūlyti kitą "
+          "dieną? Parašykite, kuri diena jums tinka, ir aš viską suderinsiu.",
+    "ro": "Ne pare rău — pe {day} suntem închiși (sărbătoare legală). 🙏 Putem stabili "
+          "altă zi? Spuneți-mi o altă zi potrivită și rezolv eu.",
+}
+
+
+def closed_day_msg(lang: str, iso: str, alt: str) -> str:
+    try:
+        day = datetime.strptime((iso or "")[:10], "%Y-%m-%d").strftime("%A %d %B")
+    except ValueError:
+        day = iso
+    # `alt` is a day ("Tuesday 27 October") - or, when nothing is free, the helpers'
+    # fallback sentence for the owner ("next month — ask the team"): ask instead.
+    if not re.fullmatch(r"[A-Z][a-z]+day \d{2} [A-Z][a-z]+", alt or ""):
+        return CLOSED_DAY_NOALT_MSG.get(lang, CLOSED_DAY_NOALT_MSG["en"]).format(day=day)
+    return CLOSED_DAY_MSG.get(lang, CLOSED_DAY_MSG["en"]).format(day=day, alt=alt)
+
+
+def booking_year_fix(d, today):
+    """The day save_booking really stores for a date the model wrote. ONE roll forward
+    covers the real mistake (LAST year's date); the old unbounded loop made phantom
+    bookings a year and a half out (2 Sep 2026). And the same mistake forwards:
+    "13 August" once became 2027-08-13 - nobody books more than ~13 months out."""
+    if d < today - timedelta(days=1):
+        d = d.replace(year=d.year + 1)
+    while d > today + timedelta(days=396):
+        d = d.replace(year=d.year - 1)
+    return d
 
 
 def _hour_label(h: int) -> str:
     return f"{h % 12 or 12}{'am' if h < 12 else 'pm'}"
 
 
-def clock_line() -> str:
+def clock_line(now=None) -> str:
     """Tell the model what time it is, what day, and whether we are open — 3 Sep
     2026 audit: at 21:56 the bot told a breakdown customer 'the team is still
     looking into whether we can squeeze you in today', and at 18:45 'call us right
     now'. 26 Sep: on a Saturday at 09:14 it told a customer "We're open until 6pm
     today" (Saturday closes at 2pm) - the line said only "the workshop is OPEN", so
-    the model filled in the weekday hours. Now it says the day and today's close."""
-    now = now_local()
-    wd, hm = now.weekday(), now.hour + now.minute / 60
+    the model filled in the weekday hours. Now it says the day and today's close.
+    29 Sep: a bank holiday is CLOSED all day, "when we open again" walks past it, and
+    one in the next week is named. `when` names the weekday only, never a date: the
+    garage reply guard reads "Tuesday 27 October" in a reply as an offer of that day.
+    `now` is for the read-only ?action=holidays probe only."""
+    now = now or now_local()
+    today, wd, hm = now.date(), now.weekday(), now.hour + now.minute / 60
     day = now.strftime("%A")
-    hours = OPEN_HOURS.get(wd)
+    hours = hours_on(today)
+    ahead = bank_holidays_ahead(today)
     if hours and hours[0] <= hm < hours[1]:
         close = _hour_label(hours[1])
         return (f"It is now {now.strftime('%H:%M')} on {day} — the workshop is OPEN "
                 f"until {close} today. {_HOURS_SENTENCE} If a customer asks when we "
-                f"close today, the answer is {close}.")
-    if wd == 6 or (wd == 5 and hm >= 14):
-        when = "on Monday morning at 9am"
-    elif wd == 4 and hm >= 18:
-        # Saturday is a working day (9am-2pm) - the team answers chats then. A Saturday
-        # closed with ?action=closeday is only fully booked (owner, 28 Sep 2026): the
-        # team is still in.
-        when = "tomorrow (Saturday) morning at 9am"
-    elif hm >= 18:
-        when = "tomorrow morning at 9am"
-    else:
+                f"close today, the answer is {close}." + ahead)
+    if hours and hm < hours[0]:
         when = "this morning at 9am"
-    return (f"It is now {now.strftime('%H:%M')} on {day} — the workshop is CLOSED. Nobody "
+    else:
+        # Saturday is a working day (9am-2pm) - the team answers chats then. A day closed
+        # with ?action=closeday is only fully booked (owner, 28 Sep 2026): the team is in.
+        # Past a bank holiday, nxt is never tomorrow: "on Tuesday morning at 9am".
+        nxt = next_open_day(today)
+        at = _hour_label(OPEN_HOURS[nxt.weekday()][0])
+        if nxt == today + timedelta(days=1) and wd != 6:
+            when = (f"tomorrow ({nxt:%A}) morning at {at}" if nxt.weekday() == 5
+                    else f"tomorrow morning at {at}")
+        else:
+            when = f"on {nxt:%A} morning at {at}"
+    hol = bank_holiday_name(today)
+    why = f" all day today for the bank holiday ({hol})" if hol else ""
+    return (f"It is now {now.strftime('%H:%M')} on {day} — the workshop is CLOSED{why}. Nobody "
             f"is in the building; the team will see this chat {when}. So: never say the "
             "team is 'looking into it now' or 'will call you shortly', never offer a "
             "drop-off or an answer 'today', never tell the customer to ring now — say "
             f"plainly that we are closed and the team will pick it up {when}. If they "
             "ask whether we are open, the answer is NO - say when we open again. Bookings "
-            f"for future days are still fine. {_HOURS_SENTENCE}")
+            f"for future days are still fine. {_HOURS_SENTENCE}" + ahead)
 
 def normalize_phone(phone: str) -> str:
     """Digits only, Irish numbers in international form: '086 389 1825',
@@ -2477,7 +2673,8 @@ def is_day_full(date_str: str, need: str = "") -> bool:
     """
     return day_is_full(date_str, need or "")
 
-def save_booking(fields: dict, override_capacity: bool = False) -> bool:
+def save_booking(fields: dict, override_capacity: bool = False,
+                 allow_holiday: bool = False) -> bool:
     """Store a booking. Returns False if it was a duplicate and nothing was saved.
 
     The same car was being written twice for one day (the booking marker can be
@@ -2496,12 +2693,7 @@ def save_booking(fields: dict, override_capacity: bool = False) -> bool:
         # ONE roll forward covers the real mistake (model wrote LAST year's date).
         # 2026-09-02: the old unbounded loop rolled 2025-05-16 -> 2027-05-16 and
         # 2025-01-11 -> 2027-01-11 - two phantom bookings a year and a half out.
-        if d < today - timedelta(days=1):
-            d = d.replace(year=d.year + 1)
-        # And the same mistake forwards: "13 August" once became 2027-08-13. Nobody
-        # books a garage more than ~13 months out, so pull absurd years back too.
-        while d > today + timedelta(days=396):
-            d = d.replace(year=d.year - 1)
+        d = booking_year_fix(d, today)   # (and absurd years pulled back)
         if d < today - timedelta(days=1):
             # Still in the past after one roll = the date was off by MORE than a
             # year. That's not a typo, it's a guess - never book it, tell the owner.
@@ -2589,6 +2781,29 @@ def save_booking(fields: dict, override_capacity: bool = False) -> bool:
                 log.exception("Failed to backfill existing booking id=%s", dupe[0])
             record_customer(fields.get("phone", ""), fields.get("name", ""), reg)
             return False
+    # A bank holiday is shut all day (owner, 28 Sep 2026): refused even past
+    # override_capacity - a colleague's "see you Monday" in bank-holiday week must not put
+    # a car in the diary and send a reminder for a day nobody is in. Only the owner's own
+    # ?action=addbooking passes allow_holiday. After the duplicate check (a row already
+    # there is not a new booking) and on the date as corrected above. The fields say why,
+    # so the staff watcher can tell a refusal from a duplicate; it sends its own note.
+    if date_ and not allow_holiday and bank_holiday_name(date_):
+        log.warning("Booking refused: %s is a bank holiday", date_)
+        fields["refused"] = "bank_holiday"
+        if not override_capacity:
+            try:
+                send_telegram(
+                    "⚠️ BOOKING NOT ADDED — that day is a bank holiday, we're closed\n"
+                    f"{fields.get('name') or 'no name'} — "
+                    f"{clean_car(fields.get('car', '')) or 'no car'} ({reg or 'no reg'})\n"
+                    f"{(fields.get('need', '') or 'no job given')[:80]}\n"
+                    f"Date asked for: {date_} ({bank_holiday_name(date_)})\n"
+                    + (f"💬 https://wa.me/{phone}\n" if phone else "")
+                    + "Please ring them for another day. If you really are opening that "
+                      "day, add it with ?action=addbooking.")
+            except Exception:
+                pass
+        return False
     # Capacity is checked AFTER the duplicate check above: a booking already in
     # the diary is not asking for a new slot, so a re-confirmation on a day that
     # has since filled must not be refused - nor should it raise a race-condition
@@ -2681,15 +2896,21 @@ def parse_day(text_in: str) -> str:
     return ""
 
 def closed_dates() -> set:
-    """Specific dates the owner has closed (holidays, staff off, already too busy)."""
+    """Specific dates the owner has closed to bookings ("close <day>"). The team is
+    still in: OPEN BUT FULLY BOOKED (owner, 28 Sep 2026). Bank holidays are not
+    here - bank_holiday_name() shuts those, and "open <day>" cannot undo one."""
     raw = get_setting("closed_dates") or os.environ.get("CLOSED_DATES", "")
     return {d.strip() for d in raw.split(",") if d.strip()}
 
 def day_capacity(d) -> int:
     """Max bookings for a given date: 10 Mon-Fri, 4 Saturday, 0 (closed) Sunday.
 
-    A date the owner has closed has no capacity at all, whatever day it falls on.
+    A date the owner has closed has no capacity at all, whatever day it falls on,
+    and neither has a bank holiday (shut all day; a past one is history - see
+    bank_holiday_shut).
     """
+    if bank_holiday_shut(d):
+        return 0
     if d.isoformat() in closed_dates():
         return 0
     wd = d.weekday()  # Mon=0 .. Sun=6
@@ -3029,11 +3250,15 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     """'' = bookable; 'capacity' = day genuinely full; 'hard' = this KIND of job
     cannot go on this day: its hard-job quota is used, or it is not a general
     service and the day is a services-only Saturday. An empty need is not judged
-    for its kind - only for room."""
+    for its kind - only for room. A bank holiday gets '' too: it is not full, it is
+    SHUT - day_is_full says so and the booking gates refuse it honestly, while the
+    reply guard (which only knows "full") leaves it alone (30 Sep 2026)."""
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
     except Exception:
         return ""  # unknown/vague date -> let the owner sort the exact day
+    if bank_holiday_shut(d) and d.weekday() != 6:
+        return ""
     with closing(db()) as conn:
         n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?",
                          (date_str,)).fetchone()[0]
@@ -3059,8 +3284,9 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     return ""
 
 def day_is_full(date_str: str, need: str = "") -> bool:
-    """True if the date has no free slot for THIS kind of job."""
-    return bool(day_full_reason(date_str, need))
+    """True if the date has no free slot for THIS kind of job - or is a bank holiday
+    (shut all day; day_full_reason leaves those to bank_holiday_name)."""
+    return bool(day_full_reason(date_str, need) or bank_holiday_shut(date_str))
 
 # A person may have agreed a Saturday job the bot turns down: staff do make
 # exceptions ("staff said bring Saturday": 29 Aug brake discs and a goodwill tyre,
@@ -3170,14 +3396,20 @@ def _saturday_refusal_alert(user: str, booking: dict) -> None:
 
 def next_day_for_job(need: str, not_before: str = "") -> str:
     """Nearest bookable day for this job, nicely formatted — for the honest
-    'that day is full for this kind of work' message."""
+    'that day is full for this kind of work' message. With not_before (a bank holiday
+    somebody asked for), the first such day after it - from today if none in 4 weeks."""
     today = now_local().date()
-    for i in range(1, 29):
-        d = today + timedelta(days=i)
-        if day_capacity(d) == 0:
-            continue
-        if not day_full_reason(d.isoformat(), need):
-            return d.strftime("%A %d %B")
+    try:
+        starts = [max(today, date.fromisoformat(not_before)), today] if not_before else [today]
+    except ValueError:
+        starts = [today]
+    for start in starts:
+        for i in range(1, 29):
+            d = start + timedelta(days=i)
+            if day_capacity(d) == 0:
+                continue
+            if not day_full_reason(d.isoformat(), need):
+                return d.strftime("%A %d %B")
     return "next month — ask the team"
 
 # The honest message when a day's hard-job quota is used up.
@@ -3262,6 +3494,13 @@ def availability_block() -> str:
     for i in range(28):
         d = start + timedelta(days=i)
         cap = day_capacity(d)
+        hol = bank_holiday_name(d)
+        if hol:
+            # Shown, not skipped: a missing Monday reads as "full", and the model needs
+            # the word to say why (bank holidays are shut - owner, 28 Sep 2026).
+            lines.append(f"{d.strftime('%a %d %b')}: CLOSED — bank holiday ({hol}), nobody "
+                         "in: never offer or book it")
+            continue
         if cap == 0:
             continue  # closed Sundays
         iso = d.isoformat()
@@ -3300,16 +3539,20 @@ def availability_block() -> str:
         "services and easy jobs. When a day shows SERVICES & EASY JOBS ONLY, do not book "
         "hard work on it — offer the NEAREST day from the list that still shows hard-job "
         "space. Always trust the numbers in the list. Saturday is GENERAL SERVICES ONLY, "
-        "up to 4 cars (no repairs); closed Sunday. Slots already booked are counted. "
+        "up to 4 cars (no repairs); closed Sundays and bank holidays - a bank holiday is "
+        "marked CLOSED in the list: never offer it, and if asked say we're closed that day "
+        "for the bank holiday. Slots already booked are counted. "
         "Next 4 weeks:\n" + "\n".join(lines) +
+        bank_holidays_note(start + timedelta(days=28), start + timedelta(days=393)) +
         "\n\nNever tell a customer a day is full when the list shows space for their kind "
         "of job, and never invent availability beyond this list — for dates past the list, "
-        "an easy job can still be booked; for hard jobs offer the latest listed day "
+        "an easy job can still be booked (never on a Sunday or a bank holiday); for hard jobs offer the latest listed day "
         "with hard space instead. STRICTLY INTERNAL: never reveal ANY of this system to "
         "customers — never mention quotas, 'hard jobs', 'easy jobs', or that certain days "
         "are kept for services. When their day doesn't work for their job, say ONLY that "
         "the day is already fully booked for that kind of work and offer the nearest day "
-        "that suits — nothing about why.")
+        "that suits — nothing about why. A day marked CLOSED is different: say we're "
+        "closed that day for the bank holiday and offer the nearest day after it.")
 
 def seen_before(msg_id: str) -> bool:
     """Read-only twin of already_seen: has this id been recorded?"""
@@ -4128,6 +4371,22 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
             # button - post it now rather than send a second message.
             if task_for_watch_note(user, fields.get("date", "")):
                 return
+            # (Whatever goes wrong here, the note below still goes out, as before.)
+            try:
+                hol_d = booking_year_fix(date.fromisoformat(fields.get("date", "")),
+                                         now_local().date())
+                hol = bank_holiday_shut(hol_d)
+            except Exception:
+                hol_d, hol = None, ""
+                log.warning("Bank-holiday check for the watch note failed", exc_info=True)
+            if hol:
+                _watch_note_once(user, hol_d.isoformat(),
+                                 "🎌 Your colleague seems to have agreed "
+                                 f"{hol_d.strftime('%A %d %B')} with {customer_label(user)} - "
+                                 f"that's a bank holiday ({hol}), we're closed. NOT put in the "
+                                 "diary and no reminder will go out - please sort another day "
+                                 f"with them. https://wa.me/{user}")
+                return
             _watch_note_once(user, fields.get("date", ""),
                              "📌 Your colleague seems to have agreed a day in chat with "
                              f"{customer_label(user)} ({fields.get('date')}), but I "
@@ -4144,6 +4403,17 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         # them arrive to a day nobody has a record of.
         added = save_booking(fields, override_capacity=True)
         if not added:
+            # save_booking refuses a bank holiday even past the override (owner, 28 Sep
+            # 2026). The customer was told a day nobody is in: tell a person, once.
+            if fields.get("refused") == "bank_holiday" and not task_for_watch_note(
+                    user, fields.get("date", "")):
+                _watch_note_once(user, fields.get("date", ""),
+                                 "🎌 Your colleague seems to have agreed "
+                                 f"{date.fromisoformat(fields['date']).strftime('%A %d %B')} "
+                                 f"with {customer_label(user)} - that's a bank holiday "
+                                 f"({bank_holiday_name(fields.get('date', ''))}), we're closed. "
+                                 "NOT put in the diary and no reminder will go out - please "
+                                 f"sort another day with them. https://wa.me/{user}")
             return  # a duplicate - the booking is already in the diary
         staff_cal = create_calendar_event(fields)
         # A colleague typed "booked now for Tuesday next week 12pm" on 18 Sep and
@@ -4166,8 +4436,10 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
             if alt:
                 two_ways = ("\n\n⚠️ I read the day two ways. They wrote "
                             f"\"{said_words[:70]}\", which sounds like "
-                            f"{date.fromisoformat(alt).strftime('%A %d %B')}. "
-                            "Please check before the reminder goes out.")
+                            f"{date.fromisoformat(alt).strftime('%A %d %B')}"
+                            + (" (a bank holiday - we're closed that day)"
+                               if bank_holiday_name(alt) else "")
+                            + ". Please check before the reminder goes out.")
                 log.warning("Staff booking for %s logged %s, words suggest %s",
                             user, fields.get("date"), alt)
         except Exception:
@@ -5261,7 +5533,8 @@ def saturday_hours_wording(text: str) -> str:
     alone, and so is any sentence that is about the week or already says 2pm."""
     try:
         today = now_local()
-        if today.weekday() != 5 or "6" not in text and "six" not in text.lower() \
+        if today.weekday() != 5 or bank_holiday_name(today) or "6" not in text \
+                and "six" not in text.lower() \
                 and "18" not in text:
             return text
     except Exception:
@@ -5942,8 +6215,10 @@ def _finish_reply(user: str, answer: str) -> str:
         # AND the registration — this also catches website-form submissions,
         # which arrive pre-filled with everything EXCEPT the car (the form has
         # no make/model field), so the model must never treat that as complete.
-        if not is_owner and not already_booked and not (clean_car(booking.get("car", ""))
-                                                          and clean_reg(booking.get("reg", ""))):
+        # (Not for a bank holiday: it can never be booked, so the reg question would only
+        # delay the honest "we're closed" - the holiday gate below says it at once.)
+        if (not is_owner and not already_booked and not bank_holiday_shut(booking.get("date", ""))
+                and not (clean_car(booking.get("car", "")) and clean_reg(booking.get("reg", "")))):
             missing = "the car make and model" if not clean_car(booking.get("car", "")) else "the registration number"
             log.info("Booking for %s rejected: missing %s", booking.get("date"), missing)
             answer = f"Just before I book you in — could I get {missing} please? 👍"
@@ -5967,6 +6242,23 @@ def _finish_reply(user: str, answer: str) -> str:
                             f"{booking.get('need', '')}). Squeeze them in?", kind="not_open_date")
             except Exception:
                 log.exception("Failed to alert owner about an early-date request")
+            save_message(user, "assistant", answer)
+            return answer
+        # A bank holiday is shut (owner, 28 Sep 2026): say so, never "fully booked", and
+        # offer the first free day after it. Judged on the day save_booking would really
+        # store - the model sometimes writes LAST year's date; the marker itself is left
+        # as written, so every other gate judges it exactly as before. The owner's own
+        # chat falls through to save_booking, which refuses it and tells him.
+        _stored = booking.get("date", "")
+        try:
+            _stored = booking_year_fix(datetime.strptime(_stored, "%Y-%m-%d").date(),
+                                       now_local().date()).isoformat()
+        except Exception:
+            pass
+        if not is_owner and not already_booked and bank_holiday_shut(_stored):
+            alt = next_day_for_job(booking.get("need", ""), not_before=_stored)
+            log.info("Booking for %s rejected: bank holiday", _stored)
+            answer = closed_day_msg(reminder_lang_code(booking.get("lang", "")), _stored, alt)
             save_message(user, "assistant", answer)
             return answer
         if (not is_owner and not already_booked
@@ -6044,6 +6336,18 @@ def _finish_reply(user: str, answer: str) -> str:
             is_new = save_booking(booking)
         except Exception:
             log.exception("Failed to save booking")
+        if is_owner and not is_new and booking.get("refused") == "bank_holiday":
+            # The owner's own booking for a bank holiday: save_booking refused it (and
+            # told him on Telegram), so his reply must not say it was added. Any other
+            # hidden marker in the reply is kept for the steps below.
+            try:
+                _d = date.fromisoformat(booking.get("date", ""))
+                answer = (f"⚠️ NOT added - {_d.strftime('%A %d %B')} is a bank holiday "
+                          f"({bank_holiday_name(_d)}), we're closed. If you really are "
+                          "opening that day, add it with ?action=addbooking."
+                          + "".join(re.findall(r"<<<.*?>>>", answer or "", flags=re.S)))
+            except Exception:
+                log.exception("Could not word the owner's bank-holiday refusal")
         # Only ever added to a reply that already says something. A marker-only
         # answer arrives here as "" (process_booking strips the marker), and a
         # reply that is one parenthesised block is the model thinking out loud.
@@ -6828,38 +7132,30 @@ def send_parts_to_group(msg: str) -> bool:
         log.exception("Whapi send failed")
     return False
 
-def send_parts_orders() -> None:
-    now = now_local()
-    wd = now.weekday()  # Mon=0 ... Sat=5, Sun=6
-    if wd == 6:
-        return  # Sunday closed — Monday's parts were ordered Saturday morning
-    # Owner: Saturday's order goes out at 11am (garage closes at 2) and covers
-    # MONDAY, since Sunday is closed. Weekdays order at 2pm for tomorrow.
-    if now.hour < (11 if wd == 5 else PARTS_ORDER_HOUR):
-        return
-    today = now.date().isoformat()
-    if get_setting("parts_order_sent") == today:
-        return
-    target = (now.date() + timedelta(days=2 if wd == 5 else 1)).isoformat()
-    with closing(db()) as conn:
-        rows = conn.execute("SELECT reg, car, need FROM bookings WHERE date = ?",
-                            (target,)).fetchall()
-    cars = [(clean_reg(r or ""), (c or "").strip()) for r, c, n in rows
-            if _SERVICE_PARTS_RE.search(n or "") and "TEST" not in (r or "").upper()]
-    set_setting("parts_order_sent", today)  # once per day, even when nothing to order
-    if not cars:
-        set_setting("parts_last", json.dumps({"ran": now.strftime("%Y-%m-%d %H:%M"),
-                                              "for": target, "cars": 0, "posted": "nothing to order"}))
-        return
-    day_label = datetime.strptime(target, "%Y-%m-%d").strftime("%A %d %B")
-    when_word = "Monday" if wd == 5 else "tomorrow"
-    lines = [f"Parts for {when_word} ({day_label}) please:"]
-    for reg, car in cars:
-        label = reg or car or "?"
-        if reg and car:
-            label = f"{reg} ({car})"
-        lines.append(f"- {label} — air, oil, fuel filter")
-    msg = "\n".join(lines) + "\nThanks!"
+def _after_bank_holiday(day) -> bool:
+    """Is `day` the first open day after a bank holiday (Tue 27 Oct 2026, Mon 28 Dec)?"""
+    d = day - timedelta(days=1)
+    while not hours_on(d) and d > day - timedelta(days=8):
+        if bank_holiday_name(d):
+            return True
+        d -= timedelta(days=1)
+    return False
+
+
+def _fed_by_early_order(day) -> bool:
+    """Was `day`'s parts order an EARLY one - sent from the last open day before it, not the
+    usual day before (the same test as send_parts_orders' `early`)? Only then does a top-up
+    follow. A holiday alone on a Sunday (Sun 17 Mar 2030) leaves Saturday's order an
+    ordinary one for Monday: no 'sending' record, so a top-up could order its cars twice."""
+    prev = day - timedelta(days=1)
+    while not hours_on(prev) and prev > day - timedelta(days=8):
+        prev -= timedelta(days=1)
+    return prev + timedelta(days=2 if prev.weekday() == 5 else 1) != day
+
+
+def _post_parts_order(msg: str, what: str, for_word: str, target: str, n_cars: int) -> bool:
+    """Post a parts order everywhere it goes: the supplier group, the Telegram parts group,
+    the supplier's own number, and a copy to the owner. True when a group has it."""
     in_group = send_parts_to_group(msg)
     # Telegram parts group (free, official — owner's preferred route): the
     # setting parts_telegram_chat is filled by ?action=partsgroup once the
@@ -6877,31 +7173,174 @@ def send_parts_orders() -> None:
         try:
             send_whatsapp("".join(ch for ch in PARTS_ORDER_TO if ch.isdigit()), msg,
                           from_phone_id=PARTS_FROM_PHONE_ID)
-            log.info("Parts order sent to supplier for %s (%d cars)", target, len(cars))
+            log.info("Parts order sent to supplier for %s (%d cars)", target, n_cars)
         except Exception:
             log.exception("Parts order WhatsApp send failed")
     try:
         if in_group:
-            note = f"🧰 Parts order posted in the '{PARTS_GROUP_NAME}' group:"
+            note = f"🧰 {what} posted in the '{PARTS_GROUP_NAME}' group:"
         elif PARTS_ORDER_TO:
-            note = "🧰 Parts order for tomorrow (sent to the supplier on WhatsApp):"
+            note = f"🧰 {what} for {for_word} (sent to the supplier on WhatsApp):"
         else:
-            note = ("🧰 Parts order for tomorrow — forward this into the "
+            note = (f"🧰 {what} for {for_word} — forward this into the "
                     f"'{PARTS_GROUP_NAME}' group:")
         send_telegram_private(note + "\n\n" + msg)
     except Exception:
         log.exception("Parts order Telegram send failed")
+    return in_group
+
+
+def _parts_topup(now) -> None:
+    """The first open day after a bank holiday: its parts went on the last open day
+    before the holiday (owner, 30 Sep 2026). A car booked for it since is in no order -
+    so, once, at the first run after 9am, post those cars as an extra for today. Nothing
+    is posted when there are none."""
+    today = now.date()
+    iso = today.isoformat()
+    if (not _after_bank_holiday(today) or not _fed_by_early_order(today)
+            or get_setting("parts_topup_sent") == iso):
+        return
+    set_setting("parts_topup_sent", iso)   # one look, whatever it finds
+    try:
+        last = json.loads(get_setting("parts_last") or "null") or {}
+    except ValueError:
+        last = {}
+    if last.get("for") == iso and "ids" not in last:
+        return  # ordered by a run that did not note its cars: never order a car twice
+    if (last.get("for") or "") > iso:
+        return  # a later day's order has run since (a deploy mid-day): today's went already
+    # The cars the early order LISTED - by row and by reg, so a car cancelled and re-added
+    # (a new row) is not ordered twice, and a job that has since become a service is.
+    seen = set(last.get("ids") or []) if last.get("for") == iso else set()
+    seen_regs = set(last.get("regs") or []) if last.get("for") == iso else set()
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT reg, car, need, id FROM bookings WHERE date = ?",
+                            (iso,)).fetchall()
+    cars = [(clean_reg(r or ""), (c or "").strip()) for r, c, n, i in rows
+            if i not in seen and not (clean_reg(r or "") and clean_reg(r or "") in seen_regs)
+            and _SERVICE_PARTS_RE.search(n or "") and "TEST" not in (r or "").upper()]
+    if last.get("for") == iso and last.get("posted") == "sending":
+        # The early order was cut off while posting (a restart): nobody knows whether the
+        # supplier got it. Its cars are never posted a second time - the owner checks.
+        try:
+            send_telegram_private(
+                f"⚠️ The parts order for today ({today.strftime('%A %d %B')}) may not have "
+                f"reached the supplier - the bot restarted while posting it ({last.get('ran', '')}). "
+                f"Please check the '{PARTS_GROUP_NAME}' group. {last.get('cars', 0)} car(s) were in "
+                "it" + (": " + ", ".join(last.get("regs") or []) if last.get("regs") else "")
+                + ". Order any it is missing by hand.")
+        except Exception:
+            log.exception("Parts order check note failed")
+    if not cars:
+        return
+    lines = [f"Extra parts for today ({today.strftime('%A %d %B')}) please - booked since "
+             "the last order:"]
+    for reg, car in cars:
+        label = reg or car or "?"
+        if reg and car:
+            label = f"{reg} ({car})"
+        lines.append(f"- {label} — air, oil, fuel filter")
+    msg = "\n".join(lines) + "\nThanks!"
+    in_group = _post_parts_order(msg, "Extra parts order", "today", iso, len(cars))
+    _record_parts_last({
+        "ran": now.strftime("%Y-%m-%d %H:%M"), "for": iso, "cars": len(cars),
+        "posted": ("supplier group" if in_group else
+                   "supplier number" if PARTS_ORDER_TO else
+                   "NOT posted - copy sent to owner's Telegram to forward"),
+        "message": msg[:1500], "topup": True, "ids": sorted({r[3] for r in rows})}, tries=3)
+
+
+def _record_parts_last(rec: dict, tries: int = 1) -> None:
+    """parts_last: the ?action=status line - and, for an early order or a top-up, what the
+    next top-up relies on, so those writes are retried (a passing 'database is locked'
+    must not leave 'sending' behind)."""
+    for i in range(tries):
+        try:
+            set_setting("parts_last", json.dumps(rec))
+            return
+        except Exception:
+            if i + 1 == tries:
+                log.exception("Could not record parts_last")
+            else:
+                time.sleep(1)
+
+
+def send_parts_orders() -> None:
+    now = now_local()
+    wd = now.weekday()  # Mon=0 ... Sat=5, Sun=6
+    if wd == 6:
+        return  # Sunday closed — Monday's parts were ordered Saturday morning
+    # Bank holidays (owner, 30 Sep 2026: "send parts order on saturday before"): nothing
+    # goes to the supplier ON one; the day after it was ordered on the last open day
+    # before it, and cars booked for it since go out as a top-up after 9am that day.
+    if bank_holiday_name(now):
+        return
+    if now.hour >= 9:
+        try:
+            _parts_topup(now)
+        except Exception:
+            log.exception("Parts top-up failed")
+    # Owner: Saturday's order goes out at 11am (garage closes at 2) and covers
+    # MONDAY, since Sunday is closed. Weekdays order at 2pm for tomorrow.
+    if now.hour < (11 if wd == 5 else PARTS_ORDER_HOUR):
+        return
+    today = now.date().isoformat()
+    if get_setting("parts_order_sent") == today:
+        return
+    # The next day the team is in: tomorrow (Monday from a Saturday) - or, when a bank
+    # holiday comes first, the day after it (Sat 24 Oct 2026 orders for Tuesday 27).
+    usual = (now.date() + timedelta(days=2 if wd == 5 else 1)).isoformat()
+    target = next_open_day(now.date()).isoformat()
+    early = target != usual
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT reg, car, need, id FROM bookings WHERE date = ?",
+                            (target,)).fetchall()
+    listed = [r for r in rows
+              if _SERVICE_PARTS_RE.search(r[2] or "") and "TEST" not in (r[0] or "").upper()]
+    cars = [(clean_reg(r[0] or ""), (r[1] or "").strip()) for r in listed]
+    # An early order notes the cars it LISTED (rows and regs): the top-up sends only the
+    # ones booked, or turned into a service, after it.
+    seen = {"ids": sorted(r[3] for r in listed),
+            "regs": sorted({clean_reg(r[0] or "") for r in listed} - {""})} if early else {}
+    if early:
+        # At most once (30 Sep 2026 review): the day's "sent" mark and the record of the
+        # cars this order lists go in ONE transaction, BEFORE posting. A restart mid-post
+        # leaves "sending": the top-up never posts those cars again and tells the owner to
+        # check. If neither is written, the next hourly run simply tries again.
+        with closing(db()) as conn, conn:
+            for key, value in (("parts_order_sent", today), ("parts_last", json.dumps({
+                    "ran": now.strftime("%Y-%m-%d %H:%M"), "for": target, "cars": len(cars),
+                    "posted": "sending" if cars else "nothing to order", **seen}))):
+                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+    else:
+        set_setting("parts_order_sent", today)  # once per day, even when nothing to order
+    if not cars:
+        if not early:
+            set_setting("parts_last", json.dumps({"ran": now.strftime("%Y-%m-%d %H:%M"),
+                                                  "for": target, "cars": 0,
+                                                  "posted": "nothing to order"}))
+        return
+    day_label = datetime.strptime(target, "%Y-%m-%d").strftime("%A %d %B")
+    when_word = (datetime.strptime(target, "%Y-%m-%d").strftime("%A") if early
+                 else "Monday" if wd == 5 else "tomorrow")
+    lines = [f"Parts for {when_word} ({day_label}) please:"]
+    for reg, car in cars:
+        label = reg or car or "?"
+        if reg and car:
+            label = f"{reg} ({car})"
+        lines.append(f"- {label} — air, oil, fuel filter")
+    msg = "\n".join(lines) + "\nThanks!"
+    in_group = _post_parts_order(msg, "Parts order", when_word if early else "tomorrow",
+                                 target, len(cars))
     # Visible on ?action=status so "did the parts order go out?" is a one-call
     # check instead of a Railway-log hunt (9 Sep 2026).
-    try:
-        set_setting("parts_last", json.dumps({
-            "ran": now.strftime("%Y-%m-%d %H:%M"), "for": target, "cars": len(cars),
-            "posted": ("supplier group" if in_group else
-                       "supplier number" if PARTS_ORDER_TO else
-                       "NOT posted - copy sent to owner's Telegram to forward"),
-            "message": msg[:1500]}))
-    except Exception:
-        log.exception("Could not record parts_last")
+    _record_parts_last({
+        "ran": now.strftime("%Y-%m-%d %H:%M"), "for": target, "cars": len(cars),
+        "posted": ("supplier group" if in_group else
+                   "supplier number" if PARTS_ORDER_TO else
+                   "NOT posted - copy sent to owner's Telegram to forward"),
+        "message": msg[:1500], **seen}, tries=3 if early else 1)
 
 # When a customer asks to move a booking, the bot creates the new row but does
 # not always remove the old one, so the same car sits in the diary twice. Live on
@@ -6992,6 +7431,25 @@ def send_due_reminders() -> None:
             " WHERE date = ? AND COALESCE(reminded, 0) = 0",
             (tomorrow,),
         ).fetchall()
+    # A bank holiday is shut (owner, 28 Sep 2026). A row can only get onto one through
+    # the owner's own ?action=addbooking (or from before this rule): never tell a
+    # customer to drop the car in on a day nobody is there - tell the team, once.
+    hol = bank_holiday_name(tomorrow)
+    if hol and rows:
+        with closing(db()) as conn, conn:
+            conn.executemany("UPDATE bookings SET reminded = 1 WHERE id = ?",
+                             [(r[0],) for r in rows])
+        try:
+            send_telegram(
+                f"⚠️ BOOKED ON A BANK HOLIDAY — no reminder sent\nTomorrow ({tomorrow}) is "
+                f"a bank holiday ({hol}) and we're closed, but the diary has:\n"
+                + "\n".join(f"• {r[1] or 'no name'} {clean_car(r[3]) or ''} "
+                            f"({clean_reg(r[4]) or 'no reg'})"
+                            + (f" +{r[2]}" if r[2] else " (no phone)") for r in rows)
+                + "\nRing them to move it - or remind them yourself if you are opening. No parts were ordered for that day.")
+        except Exception:
+            log.exception("Could not report bookings on a bank holiday")
+        return
     for bid, name, phone, car, reg, tt, lang, made_ts in rows:
         # Somebody who was TOLD the date in chat minutes ago does not need a paid
         # template repeating it back (garage booking 438: reminder 31 minutes
@@ -7591,7 +8049,7 @@ def send_weekly_gap_report(force: bool = False) -> None:
              f"🙋 Times a human was needed: {handovers}"]
     try:
         parts.append("🔁 " + followup_week_stats())
-        parts.append("   (Paid reminders only go Mon-Fri 10-5 and Sat 10-12, never Sunday, so "
+        parts.append("   (Paid reminders only go Mon-Fri 10-5 and Sat 10-12, never Sunday or a bank holiday, so "
                      "enquiries from about 11am Friday to 10am Saturday get none.)")
     except Exception:
         log.exception("Follow-up stats failed")
@@ -8130,7 +8588,7 @@ FOLLOWUP_SENT_KINDS = ("same_day", "next_day", "chase_template")
 FOLLOWUP_PAID_KINDS = ("next_day", "chase_template")
 NUDGE_RULES_TEXT = (
     "A paid 'still interested?' nudge goes only 24-48h after the customer's last "
-    "message, Mon-Fri 10:00-17:00 or Sat 10:00-12:00 (never Sunday) - so enquiries "
+    "message, Mon-Fri 10:00-17:00 or Sat 10:00-12:00 (never Sunday or a bank holiday) - so enquiries "
     "from about 11am Friday until 10am Saturday get none. It never goes to anyone with "
     "a booking (future, or made in the last 14 days), a colleague's message in the "
     "last 7 days, an alert under 48h old or still open from the last 7 days, a "
@@ -8211,7 +8669,10 @@ def _log_followup(user: str, kind: str, ts: float, note: str = "") -> None:
 
 
 def nudge_send_hours(now) -> bool:
-    """Paid nudges: Mon-Fri 10:00-17:00, Saturday 10:00-12:00, never Sunday."""
+    """Paid nudges: Mon-Fri 10:00-17:00, Saturday 10:00-12:00, never Sunday or a bank
+    holiday (the team is not in to answer)."""
+    if bank_holiday_name(now):
+        return False
     wd, h = now.weekday(), now.hour
     return (wd < 5 and 10 <= h < 17) or (wd == 5 and 10 <= h < 12)
 
@@ -9903,7 +10364,10 @@ def _owner_warnings(user: str, kind: str, text: str, allowed: str, note: str,
         today = now_local().date()
         for d in sorted({x for x in (weekday_asked_for(note, today),
                                      weekday_asked_for(text, today)) if x}):
-            if not booking_already_in_diary({"date": d, "phone": user}):
+            if bank_holiday_name(d):
+                out.append(f"⚠️ {_owner_day(d, '%A %d %b')} is a bank holiday "
+                           f"({bank_holiday_name(d)}) — we're closed; tell them another day.")
+            elif not booking_already_in_diary({"date": d, "phone": user}):
                 out.append(f"⚠️ They're not in the diary for {_owner_day(d, '%A %d %b')} — "
                            + ("start your note with BOOK to put them in." if OWNER_TG_BOOK
                               else "put them in the diary if this is a booking."))
@@ -10045,8 +10509,10 @@ def _owner_gate_basics(f: dict) -> str:
         return f"{_owner_day(iso)} is in the past."
     need = (f.get("need") or "").strip()
     if day_capacity(d) == 0:
-        return (f"We're closed on {_owner_day(iso, '%A %d %b')}. "
-                f"Next free day for this job: {_owner_next_free_day(need)}.")
+        hol = bank_holiday_name(d)
+        return (f"We're closed on {_owner_day(iso, '%A %d %b')}"
+                + (f" - bank holiday ({hol})" if hol else "") + ". "
+                f"Next free day for this job: {_owner_next_free_day(need, iso if hol else '')}.")
     if not need:   # on the garage an empty job would skip the Saturday rule
         return "What's the job? e.g. \"book Friday service\"."
     if booking_already_in_diary(f):
@@ -10054,15 +10520,21 @@ def _owner_gate_basics(f: dict) -> str:
     return ""
 
 
-def _owner_next_free_day(need: str) -> str:
-    """The nearest day in the next four weeks that takes this job."""
+def _owner_next_free_day(need: str, after: str = "") -> str:
+    """The nearest day in the next four weeks that takes this job - after `after` (a
+    bank holiday somebody asked for) when one is given, from today if none."""
     today = now_local().date()
-    for i in range(1, 29):
-        d = today + timedelta(days=i)
-        iso = d.isoformat()
-        if day_capacity(d) == 0 or before_open_date(iso) or day_is_full(iso, need):
-            continue
-        return d.strftime("%A %d %B")
+    try:
+        starts = [max(today, date.fromisoformat(after)), today] if after else [today]
+    except ValueError:
+        starts = [today]
+    for start in starts:
+        for i in range(1, 29):
+            d = start + timedelta(days=i)
+            iso = d.isoformat()
+            if day_capacity(d) == 0 or before_open_date(iso) or day_is_full(iso, need):
+                continue
+            return d.strftime("%A %d %B")
     return "none in the next four weeks — ask the team"
 
 
@@ -11221,7 +11693,9 @@ def _gap_candidates(sentence: str, today) -> list:
     if _GAP_TONIGHT_RE.search(sentence):
         # Left overnight: the work day is the next one we are open.
         nxt = today + timedelta(days=1)
-        cands.append((nxt + timedelta(days=1) if nxt.weekday() == 6 else nxt, "tonight"))
+        while nxt.weekday() == 6 or bank_holiday_name(nxt):
+            nxt += timedelta(days=1)
+        cands.append((nxt, "tonight"))
     if _GAP_TODAY_RE.search(sentence) and not _GAP_HOURS_TALK_RE.search(sentence):
         cands.append((today, "today"))
     return cands
@@ -11247,7 +11721,7 @@ def _gap_date(sentence: str, today) -> tuple:
         night = [d for d, h in pool if h == "tonight"]
         if night:
             last = night[0]
-            while last.weekday() >= 5:
+            while last.weekday() >= 5 or bank_holiday_name(last):
                 last += timedelta(days=1)
             if not all(night[0] <= d <= last for d, h in rest if h != "weekday_raw"):
                 return "", ""
@@ -11344,7 +11818,7 @@ def _gap_in_diary(claim_date: str, how: str, diary_dates: list, today) -> bool:
     d = date.fromisoformat(claim_date)
     last = d
     if how == "tonight":
-        while last.weekday() >= 5:
+        while last.weekday() >= 5 or bank_holiday_name(last):
             last += timedelta(days=1)
     for x in diary_dates:
         if abs((x - d).days) <= 1 or d <= x <= last:
@@ -11711,6 +12185,9 @@ def _task_text(user: str, day: str, source: str, sentence: str, created_ts: floa
     if since:
         text += (f"\n✅ Since then: “{since[:200]}” - so probably nothing to do. "
                  "Check the chat if that's not how it reads.\n")
+    elif bank_holiday_name(day):
+        text += (f"⚠️ {_task_day(day)} is a BANK HOLIDAY ({bank_holiday_name(day)}) - we're "
+                 "closed. Tell them and offer another day, then press Done.\n")
     else:
         text += "Put it in the diary (or tell them it isn't booked), then press Done.\n"
     text += f"Chat: https://wa.me/{user}"
@@ -12409,7 +12886,7 @@ def chase_outstanding_invoices() -> None:
     accountant and tell the owner. Once only, in daytime.
     """
     now = now_local()
-    if not (9 <= now.hour < 19) or now.weekday() == 6:
+    if not (9 <= now.hour < 19) or now.weekday() == 6 or bank_holiday_name(now):
         return
     wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
     for key, n, first_ts, last_ts, chased in outstanding_invoices(min_hours=20):
@@ -12456,15 +12933,38 @@ def send_daily_briefing(force: bool = False) -> None:
             "SELECT name, car, reg, need FROM bookings WHERE date = ?", (tomorrow_iso,)).fetchall()
         waiting, older = waiting_alerts(conn)   # oldest first, inside the age floor
     parts = [f"☀️ Good morning — {now.strftime('%A %d %B')}", ""]
+    hol_today, hol_tom = bank_holiday_name(today_iso), bank_holiday_name(tomorrow_iso)
+    if hol_today:
+        parts.append(f"🎌 Bank holiday ({hol_today}) — we're CLOSED today.")
     if today_rows:
-        parts.append(f"📅 IN TODAY ({len(today_rows)}) — drop-off 9-11am:")
+        parts.append(f"⚠️ BOOKED IN ON A CLOSED DAY ({len(today_rows)}) — ring them:"
+                     if hol_today else f"📅 IN TODAY ({len(today_rows)}) — drop-off 9-11am:")
         for name, car, reg, need in today_rows:
             parts.append(f"  • {name or '(no name)'} — {car} {reg} — {need}")
-    else:
+    elif not hol_today:
         parts.append("📅 Nothing booked in today.")
-    if tom_rows:
+    if hol_tom:
+        parts.append("")
+        parts.append(f"➡️ Tomorrow is a bank holiday ({hol_tom}) — we're closed."
+                     + (f" ⚠️ {len(tom_rows)} booked in on it — ring them." if tom_rows else ""))
+    elif tom_rows:
         parts.append("")
         parts.append(f"➡️ Tomorrow: {len(tom_rows)} booked in.")
+    # A bank holiday AFTER tomorrow, before the team is next in, with cars on it: Saturday's
+    # briefing is the last one staff read before a bank-holiday Monday (29 Sep 2026 review).
+    # Nothing for a plain weekend, or for a holiday with nobody booked on it.
+    _d = now.date() + timedelta(days=2)
+    while _d < next_open_day(now.date()):
+        _hol = bank_holiday_name(_d)
+        if _hol:
+            with closing(db()) as conn:
+                _n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?",
+                                  (_d.isoformat(),)).fetchone()[0]
+            if _n:
+                parts.append("")
+                parts.append(f"⚠️ {_d:%a %d %b} is a bank holiday ({_hol}) — {_n} booked in "
+                             "on it — ring them.")
+        _d += timedelta(days=1)
     if waiting:
         parts.append("")
         parts.append(f"⚠️ STILL WAITING ON YOU ({len(waiting)}), longest-waiting first:")
@@ -12813,6 +13313,8 @@ READ_ONLY_ACTIONS.add("tasks")
 READ_ONLY_ACTIONS.add("gaptest")
 READ_ONLY_ACTIONS.add("stafftest")
 READ_ONLY_ACTIONS.add("wordingtest")
+# The bank-holiday list and what the rules make of one moment: pure, reads no customer.
+READ_ONLY_ACTIONS.add("holidays")
 
 
 def review_link_token() -> str:
@@ -13154,7 +13656,10 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             return {"error": "need one real date, e.g. ?action=openday&date=2026-12-24"}
         days = closed_dates(); days.discard(iso)
         set_setting("closed_dates", ",".join(sorted(d for d in days if d)))
-        return {"closed": sorted(closed_dates())}
+        hol = bank_holiday_name(iso)
+        return {"closed": sorted(closed_dates()),
+                **({"bank_holiday": hol, "note": "a bank holiday is always closed - the bot "
+                    "never books it; add a car by hand with ?action=addbooking"} if hol else {})}
     if action == "templates":
         out = []
         for waba in ("1713722639843344", "236685551234423"):
@@ -13832,11 +14337,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # behind the admin token, and it is the second half of the documented way
         # to move a booking (cancel, then re-add). Refusing here on a full or
         # closed day would lose a car whose original row has already been deleted.
-        added = save_booking(fields, override_capacity=True)
+        # A bank holiday is shut and the bot never books one - but a car the owner adds
+        # by hand goes in (allow_holiday), with a warning so it is never by accident.
+        added = save_booking(fields, override_capacity=True, allow_holiday=True)
+        hol = bank_holiday_name(fields.get("date", "")) if added else ""
         cal = create_calendar_event(fields) if added else False
         return {"added": bool(added), "calendar": bool(cal),
                 # Only a duplicate can refuse now, so the note is finally true.
-                "note": "already in the diary — nothing added" if not added else "booked"}
+                "note": ("already in the diary — nothing added" if not added else "booked")
+                + (f" - ⚠️ {fields.get('date')} is a bank holiday ({hol}): we're closed that "
+                   "day, so make sure you really mean it - no parts are ordered for a bank holiday, so order them yourself if you are opening" if hol else "")}
     if action == "bookingreport":
         # Read-only: tonight's bookings message as it stands now - nothing is sent
         # and the report window does not move.
@@ -14410,6 +14920,46 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "courtesy cars, cars already in, and parts brought in alone are "
                         "skipped. It posts after TASK_GRACE_MIN minutes, 8am-8pm, unless "
                         "a row appears first."}
+    if action == "holidays":
+        # Read-only (29 Sep 2026): the bank holidays of this year and next, and what the
+        # clock line / capacity / parts order make of one moment: &date=YYYY-MM-DDTHH:MM
+        # (default now). (`date` is the query string here - datetime only.)
+        at = now_local()
+        if date:
+            try:
+                at = datetime.strptime(date.strip()[:16], "%Y-%m-%dT%H:%M")
+            except ValueError:
+                return {"error": "date must be YYYY-MM-DDTHH:MM, e.g. 2026-10-25T20:00"}
+            if not 2000 <= at.year <= 2100:
+                return {"error": "date must be YYYY-MM-DDTHH:MM between 2000 and 2100, "
+                                 "e.g. 2026-10-25T20:00"}
+        day0 = at.date()
+        out = {"at": at.strftime("%a %d %b %Y %H:%M"),
+               "bank_holiday": bank_holiday_name(day0),
+               "team_in": bool(hours_on(day0)),
+               "capacity": 0 if bank_holiday_name(day0) else day_capacity(day0),
+               "next_open_day": next_open_day(day0).strftime("%a %d %b %Y"),
+               "clock": clock_line(at),
+               "list": [f"{d:%a %d %b %Y} - {n}" for d, n in bank_holidays_between(
+                   day0.replace(month=1, day=1), day0.replace(year=day0.year + 1, month=12, day=31))],
+               # what the model's day list says about bank holidays right now (not at &date)
+               "day_list_now": [x[:160] for x in availability_block().splitlines()
+                                if "CLOSED — bank holiday" in x
+                                or x.startswith("Bank holidays after")]}
+        # send_parts_orders' rule: the next open day (tomorrow; Monday from a Saturday;
+        # past a bank holiday - early), nothing on a Sunday or a bank holiday, and a 9am
+        # top-up on the first open day after a bank holiday.
+        _pt = next_open_day(day0)
+        out["parts_order"] = (
+            "none - Sunday" if day0.weekday() == 6
+            else "none - bank holiday" if bank_holiday_name(day0)
+            else "for " + _pt.strftime("%a %d %b")
+            + (" (early - a bank holiday comes first)"
+               if _pt != day0 + timedelta(days=2 if day0.weekday() == 5 else 1) else ""))
+        out["parts_topup"] = (bool(hours_on(day0)) and _after_bank_holiday(day0)
+                              and _fed_by_early_order(day0))
+        out["paid_nudge_hours"] = nudge_send_hours(at)
+        return out
     if action == "wordingtest":
         # Read-only (29 Sep). What the reply fixers make of a text at this moment:
         # the Saturday hours net, the closed-now wording and the weekday guard.
@@ -15263,8 +15813,13 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         rest = text.strip().lstrip("#/ ").split(" ", 1)[1].strip() if " " in text.strip() else ""
         if cmd == "closed" and not rest:
             days = sorted(closed_dates())
-            send_whatsapp(sender, ("🚫 Closed for bookings:\n" + "\n".join(days))
-                          if days else "No days are closed — normal capacity everywhere.")
+            hols = bank_holidays_between(now_local().date(),
+                                         now_local().date() + timedelta(days=365))
+            send_whatsapp(sender, (("🚫 Closed for bookings:\n" + "\n".join(days))
+                                   if days else "No days are closed — normal capacity everywhere.")
+                          + (("\n\n🎌 Bank holidays - always shut, the bot never books them:\n"
+                              + "\n".join(f"{d:%a %d %b %Y} ({n})" for d, n in hols))
+                             if hols else ""))
             return
         iso = parse_day(rest)
         if not iso:
@@ -15275,7 +15830,11 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         if cmd == "open":
             days.discard(iso)
             set_setting("closed_dates", ",".join(sorted(days)))
-            send_whatsapp(sender, f"✅ {pretty} is open for bookings again.")
+            hol = bank_holiday_name(iso)
+            send_whatsapp(sender, (f"⚠️ {pretty} is a bank holiday ({hol}) - the bot never "
+                                   "takes bookings on one. If you are opening, add the cars "
+                                   "by hand (?action=addbooking).") if hol
+                          else f"✅ {pretty} is open for bookings again.")
         else:
             days.add(iso)
             set_setting("closed_dates", ",".join(sorted(days)))
@@ -15752,7 +16311,11 @@ async def retell_function(request: Request):
         today = now_local().date()
         return {"today": f"{today.strftime('%A %d %B %Y')}",
                 "open_days": _voice_availability(),
-                "note": ("Drop-off is mornings 9 to 11am. Closed Sunday. Monday to "
+                "closed_days": closed_days_list(today, 28),
+                "note": ("Drop-off is mornings 9 to 11am. Closed Sundays and bank "
+                         "holidays - a bank holiday is in closed_days: never offer it, and "
+                         "if the caller asks for it say we're closed that day for the bank "
+                         "holiday. Monday to "
                          "Friday ANY job can book any open day up to 4 weeks ahead. HARD JOBS - "
                          "diagnostics, injectors, turbo, clutch, engine repairs or "
                          "engine noise, electrical, suspension - need "
@@ -15803,6 +16366,9 @@ async def retell_function(request: Request):
             return {"booked": False, "reason": "date format error — use YYYY-MM-DD"}
         if before_open_date(iso):
             return {"booked": False, "reason": "we are not taking bookings for that date yet — pick from check_availability"}
+        if bank_holiday_shut(d):
+            return {"booked": False, "reason": "we are closed that day - it is a bank holiday "
+                    f"({bank_holiday_name(d)}). Offer the next open day from check_availability"}
         if day_capacity(d) == 0:
             return {"booked": False, "reason": "we are closed that day — pick from check_availability"}
         need = fields["need"]
@@ -15917,6 +16483,13 @@ async def retell_function(request: Request):
                             "if an earlier slot frees up we'll message them on "
                             "WhatsApp straight away.")
             return {"booked": True, "date": fields["date"], "confirm": confirm}
+        if fields.get("refused") == "bank_holiday":
+            # save_booking pulled a far-off date back a year onto a bank holiday.
+            # fields["date"] is the day it judged, not the one the agent sent.
+            return {"booked": False, "reason": (
+                f"we are closed on {fields['date']} - it is a bank holiday "
+                f"({bank_holiday_name(fields['date'])}). Offer the next open day "
+                "from check_availability")}
         return {"booked": False,
                 "reason": "duplicate - this car already has a booking that day"}
 
