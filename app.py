@@ -2962,6 +2962,51 @@ def is_hard_job(need: str) -> bool:
     n = need or ""
     return bool(_DIAG_RE.search(n) or _HARD_RE.search(n))
 
+# 30 Sep 2026 (service bookings review): a general SERVICE where the customer also
+# mentions a small symptom to look at - a noise, a rattle, a warning light, a leak to
+# check - is service work with a quick look during it (a quick diagnosis, up to about
+# 15 minutes, is free: business_info.md). It read as a hard job ("Annual service with
+# own parts and oil leak check", "full service and check engine light diagnosis"), so
+# it waited for a day with hard-job space: one customer was offered Monday 28 Sep and
+# then had it withdrawn, another waited 13 days. A fault on its own, or any named
+# repair (injectors, DPF, a leak REPAIR, a comeback...), stays hard. Saturdays are
+# untouched: saturday_service_only still wants a plain service.
+# Only the symptom word itself is taken out, never the word before it: "clutch noise",
+# "gearbox noise", "head gasket leak", "injector leak" keep their hard word and stay
+# hard.
+_QUICK_LOOK_RE = re.compile(
+    r"(?:(?:check|look at|quick look at|diagnos\w*)(?:\s*[:(\-–]\s*|\s+(?:on|for|of|into)\s+|\s+)"
+    r"(?:the\s+|a\s+|an\s+)?)?"
+    r"(?:(?:check\s+)?engine\s+(?:management\s+|warning\s+|check\s+)*light|warning\s+light"
+    r"|dash(?:board)?\s+(?:warning\s+)?light|\beml\b|nois[ey]\w*|rattl\w*|knock\w*"
+    r"|squeak\w*|squeal\w*|click\w*|clunk\w*|grind\w*|leak(?!\s*(?:repair|replace))\w*)"
+    r"(?:\s+(?:check\w*|diagnos\w*|look|inspection))?",
+    re.IGNORECASE)
+# Named repairs and real faults stay hard. Whole words only: "is that a fixed price?",
+# "a replacement car" and "I'll come back to you" are not repairs (review, 30 Sep).
+_QUICK_LOOK_NOT_RE = re.compile(
+    r"comeback|came back|back again|repair|replac(?!ement (?:car|vehicle))|\bdpf\b|\begr\b|adblue"
+    r"|won'?t start|cut(?:s|ting)? out|diesel knock|over bumps|water leak|into the (?:cabin|car)"
+    r"|leak\w* inside"
+    # The owner's hard list names "engine noise": an engine or gearbox making a noise
+    # ("diesel engine is noisy", "DSG gearbox clunking") - never its warning light.
+    r"|\b(?:engine|gearbox|transmission)\b(?!\s+(?:management\s+|warning\s+|check\s+)*lights?)"
+    r"(?:(?!\b(?:and|also|plus|with)\b)[^.,;:!?\n\-–]){0,15}?(?:nois|knock|rattl|click|clunk|grind)",
+    re.IGNORECASE)
+
+
+def service_quick_look(need: str) -> bool:
+    """A general service plus nothing harder than a small symptom to look at: booked
+    as a service, never against the hard-job quota (see above)."""
+    n = need or ""
+    if not is_hard_job(n) or _QUICK_LOOK_NOT_RE.search(n):
+        return False
+    if not _saturday_asks_for_service(_saturday_plain(n)):
+        return False
+    # The car's description ("1.6 TDI engine") comes out FIRST, while the symptom
+    # word after it still marks a fault; then the symptom words.
+    return not is_hard_job(_QUICK_LOOK_RE.sub(" ", _saturday_plain(n)))
+
 # Owner's decision 9 Sep 2026 (Tom Shields' Clio): a car LEFT WITH US for a week
 # or more does not eat a ramp on its drop-off day - nobody touches it that day, the
 # work happens on any quiet day while it sits here. So a long-stay drop-off is
@@ -2991,7 +3036,8 @@ def _hard_count(date_str: str) -> int:
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?",
                             (date_str,)).fetchall()
-    return sum(1 for (n,) in rows if is_hard_job(n or "") and not is_long_stay(n or ""))
+    return sum(1 for (n,) in rows if is_hard_job(n or "") and not is_long_stay(n or "")
+               and not service_quick_look(n or ""))
 
 # Owner, 25 Sep 2026: "must be 4 service only for saturdays" - up to four cars,
 # GENERAL SERVICES ONLY, no repairs. The gate used to turn a Saturday down only
@@ -3274,7 +3320,8 @@ def day_full_reason(date_str: str, need: str = "") -> str:
         # raw words it would read "Full oil service - 2.0L diesel engine" as engine
         # work and refuse it once one car is booked.
         return ""
-    if need and is_hard_job(need) and not is_long_stay(need):
+    if (need and is_hard_job(need) and not is_long_stay(need)
+            and not service_quick_look(need)):
         if _hard_count(date_str) >= HARD_JOBS_PER_DAY:
             return "hard"
         # Owner 2026-08-27: a nearly-booked day keeps its LAST slots for easy
@@ -3486,11 +3533,13 @@ def availability_block() -> str:
     taken, hard = {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
-        if is_hard_job(need or "") and not is_long_stay(need or ""):
+        if (is_hard_job(need or "") and not is_long_stay(need or "")
+                and not service_quick_look(need or "")):
             hard[d] = hard.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
     lines = []
+    nearest_service = None   # fix 4 (30 Sep 2026): from tomorrow, Saturdays included
     for i in range(28):
         d = start + timedelta(days=i)
         cap = day_capacity(d)
@@ -3505,6 +3554,8 @@ def availability_block() -> str:
             continue  # closed Sundays
         iso = d.isoformat()
         left = max(0, cap - taken.get(iso, 0))
+        if left and nearest_service is None and d > today:
+            nearest_service = d
         hard_left = max(0, HARD_JOBS_PER_DAY - hard.get(iso, 0))
         if left < HARD_NEEDS_FREE_SLOTS:
             hard_left = 0  # nearly-full day: remaining slots are for easy work
@@ -3538,11 +3589,20 @@ def availability_block() -> str:
         f"{HARD_JOBS_PER_DAY} slots per day, because the rest of every day is kept for "
         "services and easy jobs. When a day shows SERVICES & EASY JOBS ONLY, do not book "
         "hard work on it — offer the NEAREST day from the list that still shows hard-job "
-        "space. Always trust the numbers in the list. Saturday is GENERAL SERVICES ONLY, "
+        "space. A general SERVICE where they also mention a small symptom to look at (a "
+        "noise, a rattle, a warning light, a leak to check) is NOT a hard job: book it like a "
+        "service on any weekday with space, and say the team will take a quick look at it "
+        "during the service. Always trust the numbers in the list. Saturday is GENERAL "
+        "SERVICES ONLY, "
         "up to 4 cars (no repairs); closed Sundays and bank holidays - a bank holiday is "
         "marked CLOSED in the list: never offer it, and if asked say we're closed that day "
         "for the bank holiday. Slots already booked are counted. "
         "Next 4 weeks:\n" + "\n".join(lines) +
+        (f"\nNEAREST DAY FOR A PLAIN GENERAL SERVICE (a service with no other work): "
+         f"{nearest_service.strftime('%a %d %b')}"
+         + (" - a Saturday: offer it FIRST, then the nearest weekday if they prefer one"
+            if nearest_service.weekday() == 5 else " - offer it first")
+         if nearest_service else "") +
         bank_holidays_note(start + timedelta(days=28), start + timedelta(days=393)) +
         "\n\nNever tell a customer a day is full when the list shows space for their kind "
         "of job, and never invent availability beyond this list — for dates past the list, "
@@ -16344,7 +16404,8 @@ def _voice_availability() -> str:
     taken, hard = {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
-        if is_hard_job(need or "") and not is_long_stay(need or ""):
+        if (is_hard_job(need or "") and not is_long_stay(need or "")
+                and not service_quick_look(need or "")):
             hard[d] = hard.get(d, 0) + 1
     opens = bookings_open_from()
     start = max(today, opens) if opens else today
@@ -16398,6 +16459,10 @@ async def retell_function(request: Request):
                          "slots_for_diagnostics (max 4 a day; 0 on Saturdays, which "
                          "are general services only). When a day has none left, "
                          "offer the nearest day that still shows hard-job space. "
+                         "A general service where the caller also mentions a small symptom "
+                         "to look at (a noise, a warning light, a leak to check) is NOT a "
+                         "hard job: on a weekday it books like a service, and the team takes "
+                         "a quick look during it. "
                          "SATURDAYS ARE GENERAL SERVICES ONLY: a plain service (with the "
                          "free pre-NCT check at most) can have a Saturday; NCT work, "
                          "brakes, tyres, alignment, bulbs, a pre-NCT check on its own and "
