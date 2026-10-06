@@ -6394,6 +6394,7 @@ def _maybe_courtesy_close(user: str) -> str | None:
     before_net = reply
     reply = promise_safety_net(user, reply)
     note_older_reading(user, before_net, reply, raw)
+    reply = plain_job_words(reply, user)   # last: no internal booking words (1 Oct 2026)
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
     log.info("Assisted while staff handling: %s", user)
@@ -7963,6 +7964,71 @@ def _after_hours_sentence(s: str, when: str) -> str:
     return re.sub(re.escape(rw), lambda m: AFTER_HOURS_REPLY_WHEN_THEY if _after_hours_who(s[:m.start()]) else rw, s)
 
 
+# 1 Oct 2026: the bot told customers our internal booking terms 29 times since 27 Aug
+# ("A turbo replacement is a hard job, so...", "we have hard-job space from...",
+# "fully booked for services and easy jobs") although availability_block says they
+# are STRICTLY INTERNAL. Plain English instead, every sentence kept whole; the same
+# words as the knowledge base where it has them ("fully booked for that kind of
+# work"). Runs LAST on the customer send paths, never on the owner's own words.
+_JARGON_SUBS = (
+    (re.compile(r"\s*\((?:which has|with)\s+hard[- ]job\s+(?:space|slots?|availability)\)", re.I), ""),
+    (re.compile(r"\s*\(for (?:services and easy[- ]jobs|easy[- ]jobs|hard[- ]jobs)\)", re.I), ""),
+    # "Monday, with hard-job space, would suit" - the commas or dashes go with it.
+    # Never when a day follows: "Monday is fully booked, with hard-job space from
+    # Wednesday" must not become "fully booked from Wednesday" (the later rule makes
+    # it "..., with space from Wednesday").
+    (re.compile(r"(?:\s*[,—–]\s*|\s+)with\s+(?:our\s+)?hard[- ]job\s+(?:space|slots?|availability)\b"
+                r"(?!\s+(?:from|on|until|till|after|before|this|next|that|in)\b)"
+                r"(?:\s*[,—–](?=\s))?", re.I), ""),
+    (re.compile(r"\bfor\s+hard[- ]jobs\s+like\b", re.I), "for jobs like"),
+    (re.compile(r"\bfor\s+(?:a\s+)?hard[- ]jobs?\b", re.I), "for that kind of work"),
+    (re.compile(r"\bhard[- ]job\s+(space|availability)\b", re.I), r"\1"),
+    # "the next hard-job slot", "one of our hard-job slots", "no hard-job slots left":
+    # the customer's own article and number stay.
+    (re.compile(r"\bhard[- ]job\s+(slots?)\b", re.I), r"\1 for bigger jobs"),
+    (re.compile(r"\bhard[- ]job\s+quota\b", re.I), "space for bigger jobs"),
+    (re.compile(r"\bhard[- ]jobs\b", re.I), "bigger jobs"),
+    (re.compile(r"\bhard[- ]job\b", re.I), "bigger job"),
+    (re.compile(r"\ban\s+easy[- ]job\b", re.I), "a smaller job"),
+    (re.compile(r"\beasy[- ]jobs\b", re.I), "smaller jobs"),
+    (re.compile(r"\beasy[- ]job\b", re.I), "smaller job"),
+)
+_JARGON_RE = re.compile(r"hard[- ]job|easy[- ]job", re.I)
+
+
+def plain_job_words(text: str, user: str = "") -> str:
+    """Customer-facing text without our internal booking words. Never raises.
+    Logged when it changes something, so the model's leaks stay countable."""
+    if not text or not _JARGON_RE.search(text):
+        return text
+    try:
+        out = text
+        for rx, rep in _JARGON_SUBS:
+            out = rx.sub(lambda m, rep=rep: _match_case(m.group(0), m.expand(rep)), out)
+        # Tidy only what a swap can leave: a doubled space between words, a space
+        # before a full stop or comma - never an emoticon or a list indent.
+        out = re.sub(r"(?<=\S)[ \t]{2,}(?=\S)", " ", out)
+        out = re.sub(r"(?<=\w)[ \t]+([,.;!?])(?=\s|$)", r"\1", out)
+        if out != text:
+            log.info("Internal booking words rewritten for %s: %r -> %r", user or "?",
+                     text[:160], out[:160])
+        return out
+    except Exception:
+        log.exception("plain_job_words failed")
+        return text
+
+
+def _match_case(old: str, new: str) -> str:
+    """Keep the case of what it replaces: "Hard jobs" -> "Bigger jobs",
+    "EASY JOBS" -> "SMALLER JOBS"."""
+    o = old.strip()
+    if new and o.isupper() and any(ch.isalpha() for ch in o):
+        return new.upper()
+    if new and o[:1].isupper() and new[:1].islower():
+        return new[:1].upper() + new[1:]
+    return new
+
+
 def after_hours_wording(text: str) -> str:
     """When the workshop is closed, swap the model's 'shortly' / 'right back to
     you' / 'straight away' for 'once the team is back in' - never a clock time (Fix 1,
@@ -8910,6 +8976,8 @@ def _finish_reply(user: str, answer: str) -> str:
         before_net = answer
         answer = promise_safety_net(user, answer, ack_turn=ack_turn)
         note_older_reading(user, before_net, answer, raw_answer)
+    if not is_owner:
+        answer = plain_job_words(answer, user)   # last: no internal booking words (1 Oct 2026)
     save_message(user, "assistant", answer)
     return answer
 
@@ -11242,7 +11310,7 @@ def _make_followup(user: str) -> str:
             or (text.startswith("(") and text.endswith(")"))):
         return ""
     # It runs 9-20h every day, so often while we are closed (28 Sep review).
-    return fix_weekday_mentions(after_hours_wording(strip_phone_readback(text)))
+    return plain_job_words(fix_weekday_mentions(after_hours_wording(strip_phone_readback(text))), user)
 
 ALERT_CHASE_HOURS = float(os.environ.get("ALERT_CHASE_HOURS", "3"))
 
@@ -12253,6 +12321,7 @@ def chase_unresolved_alerts() -> None:
             # since six, it promised somebody the team would be right back to them.
             try:
                 text = promise_safety_net(user, after_hours_wording(_make_chase(user)), chase=True)
+                text = plain_job_words(text, user)   # last: no internal booking words (1 Oct 2026)
                 # Belt and braces: never send the customer the same line twice in a row.
                 with closing(db()) as conn:
                     last = conn.execute(
@@ -19410,7 +19479,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # main path's promise safety net makes of them (askbot still skips strip_phone_readback,
         # fix_weekday_mentions and the diary-gap check, so it is not the exact sent text)
         return {"ok": True, "question": q, "reply": visible, "markers": markers,
-                "reply_after_net": promise_fix(visible) if PROMISE_FIX else visible,
+                "reply_after_net": plain_job_words(promise_fix(visible) if PROMISE_FIX else visible),
                 "clock": clock_line()[:60], "raw_length": len(raw or "")}
     if action == "ghosts":
         # Customers whose contact record is NEWER than their last saved message —
@@ -20685,6 +20754,9 @@ async def retell_function(request: Request):
                          "to look at (a noise, a warning light, a leak to check) is NOT a "
                          "hard job: on a weekday it books like a service, and the team takes "
                          "a quick look during it. "
+                         "'Hard job', 'easy job' and slot counts are internal words: never "
+                         "say them to a caller - say the day is fully booked for that kind "
+                         "of work and offer the nearest day. "
                          "SATURDAYS ARE GENERAL SERVICES ONLY: a plain service (with the "
                          "free pre-NCT check at most) can have a Saturday; NCT work, "
                          "brakes, tyres, alignment, bulbs, a pre-NCT check on its own and "
@@ -20739,7 +20811,7 @@ async def retell_function(request: Request):
         if r == "hard" and d.weekday() == 5:
             return {"booked": False, "reason": "Saturdays take general services only - no repairs, NCT work, checks or diagnostics. Offer the nearest weekday from check_availability"}
         if r == "hard":
-            return {"booked": False, "reason": "that day is full for hard jobs (Saturdays are services only) — pick another date from check_availability"}
+            return {"booked": False, "reason": "that day is fully booked for that kind of work (Saturdays are services only) — pick another date from check_availability. Never say 'hard job' to the caller"}
         if r:
             return {"booked": False, "reason": "that day is fully booked — pick from check_availability"}
         # Owner's rule: NEVER finalize a booking without both the car make/model
