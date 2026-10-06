@@ -49,3 +49,10 @@
 0876762558  # David — VW/Audi parts desk
 0863830854  # Wurth sales rep
 0868614566  # Paul — parts supplier (engine/gaskets)
+
+# Chats the TEAM handles directly - the bot stays out of them (owner, 3 Oct 2026). The bot
+# was answering them and raising customer alerts over the team's own conversation. Our
+# recovery REQUESTS to Dublin Brothers still go out: send_recovery_request() never reads
+# this list.
+353830290103  # Dublin Brothers Recovery (tow partner; = DEFAULT_RECOVERY_WHATSAPP in app.py)
+353851235687  # Patrick - a regular the team deals with directly in the WhatsApp app

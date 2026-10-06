@@ -257,9 +257,15 @@ to whatever is still missing.
 collect unless a STAFF message in THIS conversation says so. Old 'ready' messages \
 about a previous visit do not count.
 - NEVER say "the team confirmed" or "the team can accommodate" something unless a \
-staff member actually wrote it in this chat. For special requests — waiting on site \
-while we work, evening arrival times, same-day turnaround — say a colleague will \
-confirm, and do not promise the answer yourself.
+staff member actually wrote it in this chat. For waiting on site and for leaving the car \
+the evening before a booking, give the business information's own answers (a service: \
+yes, they can wait; a bigger repair: no promise — a time once we've had a look; the \
+evening before: yes, with the key photo after 7pm) and never a number of hours it does \
+not give. For other special requests — collecting it in the evening, a same-day \
+turnaround, coming in today without a booking, or later than the 9–11am drop-off today (unless the \
+business information says they can just pop in) — say a colleague will confirm, do not \
+promise the answer yourself, and add the HANDOVER marker with a reason starting \
+"SPECIAL REQUEST —" so the team is alerted.
 - If a staff member replied in this chat, repeat their instruction EXACTLY as given \
 — never re-interpret it (staff saying "pop in after lunch" must never become a \
 9-11am drop-off).
@@ -274,17 +280,31 @@ the named person will call, reply or be in, and never say when.
 "shortly", "soon", "today", "this morning", "first thing", "at 9am", "right away", \
 "right now" or "right with you". Where the business information gives the words for \
 the case (a status question, a complaint, a request for a person or a call), use them \
-without a time; otherwise say "I've passed this to the team — they'll reply here." This rule is \
+without a time; otherwise say "I've passed this to the team — they'll reply here." (in the \
+customer's language). This rule is \
 only about replies and call-backs: booking days and times, the 9–11am drop-off window, \
-our opening hours, how long a job takes, "we'll message you when it's ready", key-drop \
-instructions and a free slot today from the availability list are facts — say them \
-exactly as the business information gives them. When the clock line below says CLOSED, \
-say we're closed and when we open again as a sentence of its own ("We're closed now — \
-we open again tomorrow at 9am."). Only if the customer needs a PERSON (something you \
-cannot answer or do from the business information: a status, a price the team must \
-work out, a complaint, a request to talk to or be called by someone) add that the team \
+our opening hours, how long a job takes in the business information's own words (never \
+a number of hours it does not give), "we'll message you when it's ready", key-drop \
+instructions and a free slot today from the availability list (before 11am) are facts — \
+say them exactly as the business information gives them. When the clock line below says \
+CLOSED and the customer needs a PERSON or asks whether we are open, say we're closed and \
+when we open again as a sentence of its own ("We're closed now — we open again tomorrow \
+at 9am."); a reply that books a future day, or gives a price you know or our hours, needs \
+no closed line. Only if the customer needs a PERSON (something you \
+cannot answer or do from the business information: a status the business information \
+says needs a colleague, a price the team must \
+work out, a special request the business information does not answer, a complaint, a \
+request to talk to or be called by someone) add that the team \
 will come back to them here when they're back. Otherwise just answer, and never say \
 anyone will get back to them.
+- NEVER say HOW the team will handle it — in any language: no "they'll treat it as \
+urgent", "urgently", "as a priority", "prioritise", "fast-track", "escalated", "right \
+away" or "immediately" — even if earlier messages in this chat said so. If the customer \
+gives a deadline for something only the team can do (a refund, a quote, a repair or a \
+part already with us: "need it for the weekend", "can you send it today"), say you've \
+passed that on to the team and they'll get back to them here; never say or hint it will \
+be done by then. A deadline for a NEW booking follows the business information's \
+"needs it SOONER" rules (the earliest day you can book first).
 - NEVER invent reasons we are closed (holidays, staff away) — the availability \
 calendar and the clock line below are the only truth about which days we work. A day \
 they mark CLOSED for a bank holiday IS one: say plainly we're closed that day for the \
@@ -606,7 +626,11 @@ def _register_check_followup(fields: dict, source: str):
         return
     if not conflict:
         return
-    if fields.get("phone"):
+    # O2: outside WhatsApp's 24-hour window (a phone booking, nearly always) the question
+    # would be refused - then a person asks: on the read-back task when there is one, else
+    # the Telegram below says so.
+    why = caller_window_problem(fields.get("phone", "")) if fields.get("phone") else ""
+    if fields.get("phone") and not why:
         try:
             followup_text = (
                 f"Quick check on your booking — reg {fields.get('reg', '')} is "
@@ -618,10 +642,17 @@ def _register_check_followup(fields: dict, source: str):
         except Exception:
             log.exception("Register-check WhatsApp follow-up failed")
     try:
+        if why and readback_add_line(
+                fields.get("phone", ""), fields.get("date", ""),
+                f"⚠️ The public register says {conflict} for reg {fields.get('reg', '')} — "
+                "check the car on the call."):
+            return   # O2: on the read-back the person ringing is already looking at
         send_telegram(f"⚠️ REG/CAR MISMATCH vs public register ({source})\n"
                       f"{fields.get('name', '')} — diary says "
                       f"\"{fields.get('car', '')}\" ({fields.get('reg', '')}), "
-                      f"register says {conflict}. Asked customer to confirm.")
+                      f"register says {conflict}. "
+                      + ("Asked customer to confirm." if not why else
+                         f"Could NOT ask them on WhatsApp: {why}. Please ring them to check."))   # [R3 fix, W-4]
     except Exception:
         log.exception("Register-check Telegram alert failed")
 
@@ -1241,11 +1272,31 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
             with closing(db()) as conn:
                 known = conn.execute(
                     "SELECT 1 FROM messages WHERE wa_user = ? LIMIT 1", (digits,)).fetchone()
+                # O2: a phone booking is known too - its written confirmation is no longer
+                # saved when WhatsApp could not take it, and the caller was told on the phone
+                # they are on this list.
+                if not known and CALLER_WINDOW_CHECK:
+                    known = conn.execute(
+                        "SELECT 1 FROM bookings WHERE REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','')"
+                        " LIKE ? LIMIT 1", ("%" + digits[-9:],)).fetchone()
             if not known:
                 log.warning("Waitlist offer skipped: %s has never messaged us", digits)
                 with closing(db()) as conn, conn:
                     conn.execute("UPDATE waitlist SET status='done' WHERE id=?", (wid,))
                 continue
+            # O2: outside WhatsApp's 24-hour window the offer is refused (7 of the 8 offers in
+            # the chats went to someone who had not written for 2-8 days, or ever). A person
+            # rings them instead; the slot is still theirs first (one offer per freed slot).
+            why = caller_window_problem(digits)
+            if why:
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE waitlist SET status='offered', offered_date=?,"
+                                 " offered_ts=? WHERE id=?", (freed_date, time.time(), wid))
+                # [R3 fix, W-4] the reason after a colon (it ends in its own brackets); both days as "Thu 08 Oct"
+                send_telegram(f"📋 Waiting list: the {_o2_day_label(freed_date)} slot has freed up — "
+                              f"{customer_label(digits)} wants it (booked {_o2_day_label(booked)}), but WhatsApp "
+                              f"can't reach them: {why}. Ring them to offer it.")
+                return
             send_whatsapp(digits, msg)
             save_message(digits, "assistant", msg, kind="slot_offer")
             with closing(db()) as conn, conn:
@@ -1879,6 +1930,165 @@ def wide_promise_phrase(text: str) -> str:
     return ""
 
 
+# [Fix 1b, 2 Oct 2026; v2 3 Oct] Deferrals no list saw, the special-request hand-over and the bot's own
+# night person line: "I'll need to check stock and pricing with the team" (BMW, 29 Sep: three days of
+# silence), "the team will check availability and get back to you" (Chris, 1 Oct: 25 hours), "A
+# colleague will confirm whether you can wait" (item 1), "The team will see this here when they're
+# back" (Mick, 2 Oct: Fix 1's own night line, nobody told). They raise the promise alert like the older
+# lists (fix1b_phrase -> alerting_lists_see), but only after a real message that is not a sign-off
+# (fix1b_counts_after: "Many thanks", "Thanks Vlad 👍" are not), and the F3 cover folds a repeat inside
+# 2 h. Never a sentence about the job, a visit, a booking or an offer ("We'll give you a call if we find
+# anything else", "When you bring it in, we'll check it over and get back to you", "Shall I check with
+# the team?"), never a bare "We'll be in touch 👍" (a sign-off), never the attachment line ("one of the
+# team will look at it and get back to you": its own 📎 alert goes with it). DEFERRAL_ALERTS=0 takes
+# out the deferrals and the special-request hand-over; NIGHT_LINE_ALERT=0 takes out the night line
+# (on since the owner's yes, 3 Oct 2026).
+_FIX1B_TEAM = (r"(?:the team|a colleague|my colleagues?|the lads|the workshop|our team|the office"
+               r"|the (?:mechanics?|technicians?|manager|owner|boss)|vlad|dima|tadas)")
+_DEFER_CHECK_RE = re.compile(
+    # one word boundary and a first-letter gate for all of them (IGNORECASE covers capitals)
+    r"\b(?=[ilw])(?:"
+    # "I'll need to check stock and pricing with the team", "let me find out from the lads"
+    r"(?:i.ll|i will|i.d|i would|we.ll|we will|let me|i (?:need|have) to|we (?:need|have) to)"
+    r"(?: just| first| also| now)?(?: (?:need|have) to)?(?: just)?"
+    r" (?:check|confirm|find out|ask|clarify|verify|double.check)\b[^.!?\n]{0,70}?"
+    r"\b(?:with|from) " + _FIX1B_TEAM + r"\b(?![^.!?\n]*\?)"
+    # "Let me ask the team and come back to you"
+    r"|(?:i.ll|i will|let me|we.ll|we will)(?: just| first)? ask " + _FIX1B_TEAM + r"\b(?![^.!?\n]*\?)"
+    r")", re.IGNORECASE)
+_DEFER_BACK_RE = re.compile(
+    r"\b(?=[aiostw])(?:"
+    r"(?:the team|someone|a colleague|one of (?:the|our) team|they|we|i)(?:['’]ll| will) "
+    # "<person> will check on that and come back to you" - never the attachment line (look / listen /
+    # watch / review / hear) and never the job ("we'll run a diagnostic and get back to you with the
+    # price", "we'll order the part and get back to you", "we'll check it over and ...")
+    r"(?:(?!(?:have |take |give it )?(?:a (?:quick |proper |closer |good )?)?(?:look|listen|watch|review|hear)\b)"
+    r"(?!(?:run|do|diagnose|inspect|test|strip|fit|replace|repair|fix|service|order|book)\b"
+    r"|check (?:it|the car|your car|the van|the unit|the headlights?) over\b)"
+    r"(?:[\w'’-]+ ){1,6}?and (?:come|get) (?:straight |right )?back to you"
+    # "<person> will give you a call" - never the job's call ("... if we find anything else", "... when
+    # it's ready", "... once we've had a look", "... before doing any extra work", "... the day before")
+    r"|give you a (?:call|ring|shout|bell)\b(?: back\b)?(?!(?: [\w'’]+){0,3}? (?:if|when|once|as soon as"
+    r"|the moment|the minute|the second|before|after|on the day|the day before)\b))"
+    # "we'll be in touch to confirm the best day" - a bare "We'll be in touch 👍" is a sign-off
+    r"|(?:we|i|they|the team)(?:['’]ll| will) be in touch(?: (?:very )?(?:soon|shortly))? (?:to|about|regarding) "
+    r"(?!(?:let you know|say|tell you|confirm when)\b)"
+    r")", re.IGNORECASE)
+# [item 1] the special-request hand-over, even when the model forgets its HANDOVER line
+_SPECIAL_HANDOVER_RE = re.compile(
+    r"\b(?:a colleague|the team|someone|one of (?:the|our) team)(?:['’]ll| will) confirm (?:whether|if) "
+    r"(?:you|we|they|it|the car|someone)\b(?![^.!?\n]*\?)|\bflagged your (?:request|question)\b", re.IGNORECASE)
+# [item 2] Fix 1's own night person line (NIGHT_LINE_ALERT=1 only)
+# [R3 fix, NL] ...and the headlights variant "The team will see your message(s) and (the) video / photo(s) when
+# they're back" (…564, Sat 3 Oct 16:22)
+_NIGHT_LINE_RE = re.compile(r"\bthe team will see (?:this|it|your messages?(?: and (?:the |your )?(?:videos?|photos?"
+                            r"|pictures?|pics|images?|voice notes?|files?|documents?))?)(?: here)? (?:when|once)"
+                            r" they(?:['’]re| are) back\b", re.IGNORECASE)
+# a deferral sentence that is an offer, or about the visit ("when you bring it in", "once we've had a
+# look"), is not a reply promise; a call / be-in-touch / come-back sentence with a job condition ("if we
+# find anything else", "before doing any extra work", "on the day") is not one either. A check-with-the-
+# team sentence keeps its "if": "let me check with the team if there's any way we can fit you in" (v2).
+_FIX1B_OFFER_VISIT_RE = re.compile(
+    r"\bif you(?:['’]d| would)? (?:like|prefer|want)\b|\bwould you like\b|\bshall I\b|\bdo you want\b|\bwant me to\b"
+    r"|\b(?:when|once|after|as soon as) (?:you (?:bring|drop|arrive|come|get here)|it(?:['’]s| is) (?:in|here|with us)\b"
+    r"|the car (?:is|arrives|comes)|it arrives|the part|we(?:['’]ve| have)? (?:had a look|looked|inspected|diagnosed"
+    r"|seen|got|get|receive|finish|start)|we(?:['’]re| are) (?:finished|done))"
+    r"|\bduring the (?:service|inspection|visit|job|diagnostic)\b", re.IGNORECASE)
+_FIX1B_JOB_COND_RE = re.compile(
+    r"\bif (?:there['’]s|there is|anything|we (?:find|need|see|spot)|it needs|something|any)\b"
+    r"|\bbefore (?:doing |starting |carrying out )?any (?:extra |more |further |additional )?work\b"
+    r"|\bon the day\b|\bthe day before\b", re.IGNORECASE)
+# a cheap first look (plain substrings of the lower-cased text): most replies hold none of these
+_FIX1B_CHEAP = ("check", "confirm", "find out", "ask", "clarify", "verify", "back to you", "give you a",
+                "be in touch", "flagged your", "will see")
+
+
+def fix1b_phrase(text: str, every: bool = False,
+                 _cheap=re.compile("|".join(re.escape(w) for w in _FIX1B_CHEAP))) -> str:
+    """[Fix 1b] The deferral, special-request hand-over or night person line in this text, or ''.
+    Judged sentence by sentence, hidden markers out: a deferral counts only in a sentence that is
+    not an offer or about the visit (_PF_KEEP_RE, _FIX1B_OFFER_VISIT_RE), and a call / be-in-touch /
+    come-back one only without a job condition (_FIX1B_JOB_COND_RE). The
+    switches: DEFERRAL_ALERTS (deferrals, special requests; on) and NIGHT_LINE_ALERT (the night line;
+    on). every=True ignores them (the read-only probes). No thank-you rule here: claims_a_person and
+    alerting_lists_see apply fix1b_counts_after."""
+    # [R1 fix, G-1] the hidden-marker strip only when there is a marker (without one it changes nothing),
+    # and the cheap first look as one compiled search (the same words: _FIX1B_CHEAP)
+    t = text or ""
+    if "<<<" in t:
+        t = re.sub(r"<<<.*?>>>", " ", t, flags=re.S)
+    if not _cheap.search(t.lower()):
+        return ""
+    defer = every or globals().get("DEFERRAL_ALERTS", True)
+    night = every or globals().get("NIGHT_LINE_ALERT", False)
+    if not (defer or night):
+        return ""
+    for s in _PF_SENT_SPLIT_RE.split(t):
+        if not s.strip():
+            continue
+        if defer:
+            m = _SPECIAL_HANDOVER_RE.search(s)
+            if m:
+                return m.group(0)
+            if not (_PF_KEEP_RE.search(s) or _FIX1B_OFFER_VISIT_RE.search(s)):
+                m = _DEFER_CHECK_RE.search(s)
+                if m:
+                    return m.group(0)
+                m = _DEFER_BACK_RE.search(s)
+                if m and not _FIX1B_JOB_COND_RE.search(s):
+                    return m.group(0)
+        if night:
+            m = _NIGHT_LINE_RE.search(s)
+            if m:
+                return m.group(0)
+    return ""
+
+
+# [Fix 1b v2, CRITIQUE 1] a sign-off is_pure_ack misses ("Many thanks", "Thanks Vlad 👍", "Great stuff,
+# thanks a lot 😎", "No prob", "Thank you brother God bless you"): the bot's "You're very welcome! We'll
+# be in touch soon 👍" to it is no promise anybody waits on
+_SIGNOFF_THANKS_RE = re.compile(
+    r"\b(?:thank\w*|thx|thnx|thks|tks|ty|cheers|god bless|bless you|appreciate\w*|no prob\w*|no worries|no bother"
+    r"|all good|no rush|no hurry|take (?:your|ur) time|(?:i['’]?ll|i will|will) wait|(?:do ?n[o'’]?t|not to) worr\w*)\b"
+    r"|спасибо|благодар|mersi|mul[țţt]umesc|a[čc]i[ūu]|d[ėe]koju", re.IGNORECASE)
+# v2 review: a thank-you that still asks or tells something ("Hi Dima did you get a date for me yet
+# thanks", "Hi, following up on this. Thanks", "I'm outside if car is ready") is a real message
+_SIGNOFF_ASKS_RE = re.compile(
+    r"\?|\d|@|\b(?:yes|yeah|yep|yea|please|pls|plz|can|could|would|will you|when|what|how|where|which|who|why|price"
+    r"|cost|quote|book\w*|call|ring|phone|send|sent|attached|here(?:['’]s| is| are)|photo\w*|pic\w*|video\w*|need"
+    r"|want|any|still|but|however|asap|urgent\w*|refund\w*|money|invoice\w*|receipt\w*|paid|payment\w*|bill"
+    r"|did|does|do you|have you|has|yet|follow\w*|ready|outside|connect|tonight|if|go ahead)\b",
+    re.IGNORECASE)
+
+
+def customer_signoff(text: str) -> bool:
+    """[Fix 1b v2] A customer message that only closes the chat: a thank-you, an ok, a 👍 or a
+    sticker (is_filler_customer_text), or a short sign-off with a thank word and no question, no
+    digit and no word that asks for anything. "yes please thank you", "Thanks, the light is still
+    on", "Cash price I don't need a receipt, thanks" are real messages."""
+    t = " ".join((text or "").split())
+    if is_filler_customer_text(t):
+        return True
+    return (len(t) <= 80 and not t.startswith("[Customer sent") and bool(_SIGNOFF_THANKS_RE.search(t))
+            and not _SIGNOFF_ASKS_RE.search(t))
+
+
+def fix1b_counts_after(user: str) -> bool:
+    """[Fix 1b v2] A Fix 1b phrase counts only after a real message: this turn's customer messages
+    (since the bot's or a colleague's last line), at least one of them more than a sign-off - a photo
+    sent with "thanks" counts. Unsure: it counts (the alert fires)."""
+    try:
+        with closing(db()) as conn:
+            last = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE wa_user = ? AND role IN"
+                                " ('assistant', 'staff')", (user,)).fetchone()[0] or 0
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND id > ?"
+                                " ORDER BY id DESC LIMIT 6", (user, last)).fetchall()
+        said = [r[0] or "" for r in rows] or [_recent_customer_words(user, 1)]
+    except Exception:
+        return True
+    return any(not customer_signoff(w) for w in said)
+
+
 
 # ------------------------------------------------ the safety net (never on owner paths)
 # A promise may stay; its TIME and a staff NAME may not. Only the words that say WHEN a
@@ -2056,12 +2266,19 @@ _PF_FOREIGN_TIME_RE = re.compile(
     re.IGNORECASE)
 
 
-def _pf_tidy(s: str) -> str:
-    s = re.sub(r"[ \t]+([,.!?;:])", r"\1", s)
-    s = re.sub(r",(\s*[.!?])", r"\1", s)
-    s = re.sub(r"(?<=\S)[ \t]{2,}", " ", s)
-    s = re.sub(r"[ \t]+[—–-][ \t]*(?=[.!?]|$)", "", s)
-    s = re.sub(r"\bhere here\b", "here", s)
+def _pf_tidy(s: str, _subs=(
+        # [R1 fix, T-3] a dash pair left round a word that was taken out: "passed it on — urgently — and"
+        # -> "passed it on — and", the first dash kept (and "— —." -> "—." -> "." by the end-dash rule below)
+        (re.compile(r"[ \t]*([—–])[ \t]*[—–](?=\s|[.!?,;:]|$)"), r" \1"),
+        # [R2 fix, T-3] ...and a spaced ASCII pair: "passed it on - urgently - and" -> "passed it on - and"
+        (re.compile(r"[ \t]+-[ \t]+-(?=[ \t]|[.!?,;:]|$)"), " -"),
+        (re.compile(r"[ \t]+([,.!?;:])"), r"\1"), (re.compile(r",(\s*[.!?])"), r"\1"),
+        (re.compile(r"(?<=\S)[ \t]{2,}"), " "), (re.compile(r"[ \t]+[—–-][ \t]*(?=[.!?]|$)"), ""),
+        (re.compile(r"\bhere here\b"), "here"))) -> str:
+    # [R1 fix, G-1] the same substitutions in the same order, compiled once (they were looked up in re's
+    # cache on every call)
+    for rx, rep in _subs:
+        s = rx.sub(rep, s)
     return s
 
 
@@ -2115,6 +2332,101 @@ _PF_FOREIGN_CLOCK_RE = re.compile(
 _PF_BE_WITH_YOU_RE = re.compile(r"\bbe (?:right )?with you\b", re.IGNORECASE)
 # [R2 fix, L8] a he / she / him / his / her left after a staff name became "the team"
 _PF_LEFT_PRONOUN_RE = re.compile(r"\b(?:he|she|him|his|her)\b", re.IGNORECASE)
+# [Fix 1b item 3, 2 Oct 2026; v2 3 Oct] HOW the team will act is a promise too: "they'll prioritise
+# this and get back to you here" (Jack, a €450 refund nobody had prioritised), "someone will look at
+# this urgently", "...so someone can come out to your car immediately" (Ashley, three times in a
+# minute; the car was still being checked hours later). The net took out only reply times and names.
+# Same gate as the time strip (a promise sentence, no "?", no staff relay, no KEEP line); a visit keeps
+# its words, and a sentence that would still hold a priority word stays as it was. v2: never the bot's
+# own action ("I'll / We'll pass this to the team right now", "We can take it right away"), never the
+# customer's own urgency ("you need the car urgently"), and never a priority word that is the
+# complement of its verb ("they'll treat it as a priority", "I've marked it as urgent": taking it out
+# leaves broken English - the sentence stays and the prompt rule covers it). PROMISE_URGENCY_FIX=0
+# turns it off. RU/RO/LT forms are left to the prompt rule.
+_PF_PRIORITY_KEEP_BEFORE_RE = re.compile(
+    r"(?:\b(?:treat|treated|treating|mark|marked|marking|class|classed|regard|regarded|consider|considered|log"
+    r"|logged)(?: (?:it|this|that|them|(?:the|this|that|your|his|her|our) [\w'’]+(?: [\w'’]+)?))?(?: again)?"
+    r"|\byou(?:['’](?:re|ve|d)| (?:need|needs|want|wanted|are|were|have|had|must|said|asked|mentioned|got|would"
+    r"|will))\b[^,;:.!?—–]*)$", re.IGNORECASE)
+
+
+def _pf_priority_drop(m) -> str:
+    """'' for a priority word that is HOW the team will act; the words as they were when they are the
+    complement of the verb before them or the customer's own urgency (v2)."""
+    return m.group(0) if _PF_PRIORITY_KEEP_BEFORE_RE.search(m.string[:m.start()]) else ""
+
+
+_PF_PRIORITY_SUBS = (
+    # [R1 fix, T-3] "as urgently as possible / as they can" goes as one phrase, as "as soon as possible" does
+    # (taking the word alone left "get back to you as as possible")
+    # [R2 fix, T-3] ...only where the clause ends ("…as urgently as we can manage." keeps live's sentence)
+    (re.compile(r",? as urgently as (?:possible|(?:they|we|the team|he|she|I) (?:can|could))\b"
+                r"(?=\s*(?:[.!?,;:)]|$|[—–]|-\s|(?:and|but|so|then)\b))", re.IGNORECASE), ""),
+    # "they'll prioritise this and get back to you" -> "they'll get back to you"
+    (re.compile(r"\b(?:prioriti[sz]e|fast-?track|expedite|escalate|chase up|push through)"
+                r"(?: (?:this|it|that|your (?:[\w'’]+ ){0,2}?[\w'’]+))?(?: (?:for you|first|now))?"
+                r" and (?=(?:get|come|be|reply|respond|contact|call|ring|let|update|message|follow|reach|sort)\b)",
+                re.IGNORECASE), ""),
+    # "look at this urgently", "flagged this again as urgent", "as a (top) priority", "as a matter
+    # of urgency", "with priority", "on a priority basis"
+    (re.compile(r",? (?:as (?:a |an )?(?:(?:top|high|real|absolute|urgent|matter of) )?(?:priority|urgency|urgent)"
+                r"(?: (?:priority|matter|case|request|complaint|issue|job|one|query))?"
+                r"|(?<!\bas )(?<!\band )(?<!\bor )urgently(?! as (?:possible|soon|quickly|fast)\b)"   # [R2 fix, T-3]
+                r"|with (?:top |high )?priority|on (?:a )?priority(?: basis)?)\b(?! (?:you|for you)\b)",
+                re.IGNORECASE), _pf_priority_drop),
+)
+# "someone can check your Mercedes right away": a person who will act - never "I" or "we" (the bot's
+# own true action: "I'll pass this to the team right now", "We can take it right away") - then can /
+# will, a reply or visit verb within a few words, then the immediacy word - which is not the job's
+# ("...right away if anything changes")
+_PF_NOW_WHO = (r"(?:\bsomeone|\bsomebody|\bthey|\bhe|\bshe|\bthe team|\bour team|\ba colleague|\bone of (?:the|our) \w+"
+               r"|\b(?:the|a|our) (?:manager|owner|boss|lads|mechanic|technician)|\b" + _PF_STAFF + r")")
+_PF_NOW_VERB = (r"(?:call|ring|phone|contact|reply|respond|text|message|get back|come back|be in touch|look|check|see"
+                r"|come out|come over|come down|pop out|be out|be over|sort|deal|fix|help|attend)")
+_PF_NOW_RE = re.compile(
+    r"(?P<keep>" + _PF_NOW_WHO + r"(?:['’]ll| will| can| could| should| is going to| are going to|['’]s going to|['’]re going to)"
+    r"(?: (?!(?:but|so|or|if|when|because|until|before|after|once|whether|and)\b)[\w'’]+){0,3}? " + _PF_NOW_VERB + r"\b"
+    r"(?: (?!(?:but|so|or|if|when|because|until|before|after|once|whether|and)\b)[\w'’]+){0,6}?)"
+    r"(?P<t>,? (?:right away|straight away|immediately|right now|at once|asap|a\.s\.a\.p\.?|as soon as possible))"
+    r"(?![\w'’-])(?! (?:if|when|once|as soon as|after|before)\b)", re.IGNORECASE)
+_PF_PRIORITY_LEFT_RE = re.compile(r"\bprioriti[sz]|\burgen(?:t|cy|tly)\b|\btop of the (?:list|pile|queue)\b|\bfast-?track",
+                                  re.IGNORECASE)
+# a cheap first look (plain substrings of the lower-cased sentence): most promise sentences hold none
+# of these words, and they skip the strip
+_PF_URGENCY_WORDS = ("priorit", "urgen", "fast-track", "fast track", "fasttrack", "expedite", "escalate", "chase up",
+                     "push through", "right away", "straight away", "immediately", "right now", "at once", "asap",
+                     "a.s.a.p", "as soon as possible")
+# [Fix 1b item 7, S0-07] a chase never says what the answer will be: "they'll reply here with that
+# quote for you" - five minutes later the answer was a no
+_PF_CHASE_ANSWER_RE = re.compile(
+    r"(?P<keep>\b(?:reply|respond|get back to you|come back to you|be in touch)(?: here)?)"
+    r" with (?:that|the|your|a|an) (?:quote|price|prices|answer|figure|cost|costs|refund)(?: for you)?"
+    r"(?=\s*(?:$|[.!,;👍🙏😊]|\s[—–-]))", re.IGNORECASE)
+
+
+def _pf_urgency(out: str, visit: bool, chase: bool,
+                _cheap=re.compile("|".join(re.escape(w) for w in _PF_URGENCY_WORDS))) -> str:
+    """[Fix 1b item 3] The priority and immediacy words out of a promise sentence (the gate is
+    _pf_sentence's). A visit keeps its words; if a priority word would still be left, the
+    sentence stays as it was. [R1 fix, G-1] The cheap first look is one compiled search for the same
+    words (_PF_URGENCY_WORDS)."""
+    if visit:
+        return out
+    low = out.lower()
+    if not (_cheap.search(low) or (chase and " with " in low)):
+        return out
+    if not globals().get("PROMISE_URGENCY_FIX", True):
+        return out
+    new = out
+    for rx, rep in _PF_PRIORITY_SUBS:
+        new = rx.sub(rep, new)
+    new = _PF_NOW_RE.sub(lambda m: m.group("keep"), new)
+    if chase:
+        new = _PF_CHASE_ANSWER_RE.sub(lambda m: m.group("keep"), new)
+    if new == out:
+        return out
+    new = _pf_tidy(new)
+    return out if _PF_PRIORITY_LEFT_RE.search(new) else new
 
 
 def _pf_sentence(s: str, named: bool, chase: bool, keep_day: bool = False, names: bool = True):
@@ -2208,6 +2520,7 @@ def _pf_sentence(s: str, named: bool, chase: bool, keep_day: bool = False, names
         if new == out:
             break
         out = new
+    out = _pf_urgency(out, visit, chase)     # [Fix 1b item 3]
     replaced = False
     if names:
         for rx, rep in _PF_NAME_SUBS:
@@ -2241,12 +2554,25 @@ def promise_fix(text: str, chase: bool = False, names: bool = True) -> str:
             continue
         sents = _PF_SENT_SPLIT_RE.split(part)
         pieces = []
+        # [R1 fix, G-1] each sentence's next sentence with words in it, found in ONE pass from the end
+        # (it was a fresh scan of all the rest for every sentence)
+        nexts, nxt = [""] * len(sents), ""
+        for k in range(len(sents) - 1, -1, -1):
+            nexts[k] = nxt
+            if sents[k].strip():
+                nxt = sents[k]
         for k, s in enumerate(sents):
-            nxt = next((x for x in sents[k + 1:] if x.strip()), "")
+            nxt = nexts[k]
             new, rep = _pf_sentence(s, named, chase, keep_day=bool(nxt and _PF_THEN_RE.search(nxt)), names=names)
             named = named or rep
             if named:
                 after.append(new)
+                # [R1 fix, G-1] a he / she / him / his / her left INSIDE this sentence (away from both of
+                # its edges, where a neighbour could join it into a longer word) is in the joined text the
+                # L8 check below reads whatever comes after it: the re-run with the names kept is certain,
+                # so it starts now instead of after a pass whose result is thrown away (the same answer)
+                if names and any(0 < p.start() and p.end() < len(new) for p in _PF_LEFT_PRONOUN_RE.finditer(new)):
+                    return promise_fix(text, chase=chase, names=False)
             pieces.append(new)
         out.append("".join(pieces))
     if named and names and _PF_LEFT_PRONOUN_RE.search("".join(after)):
@@ -2359,7 +2685,9 @@ def claims_a_person(reply: str, user: str) -> bool:
     if _CLAIMS_A_PERSON_RE.search(reply or "") or _HOUSE_HANDOVER_RE.search(reply or ""):
         return True
     if not (_CLAIMS_A_PERSON_MORE_RE.search(reply or "") or wide_promise_phrase(reply)):
-        return False
+        # [Fix 1b] a deferral, a special-request hand-over or the night person line no other list
+        # sees: after a real message that is not a sign-off ("Many thanks", "Thanks Vlad 👍")
+        return bool(fix1b_phrase(reply)) and fix1b_counts_after(user)
     return new_phrases_count_after(_recent_customer_words(user, 1))
 
 
@@ -2417,10 +2745,26 @@ WIDE_QUIET_MINUTES = _env_int("WIDE_QUIET_MINUTES", 120)
 PROMISE_WIDE_ALERTS = os.environ.get("PROMISE_WIDE_ALERTS", "0").strip() == "1"
 PROMISE_COVER_ORIG = _env_on("PROMISE_COVER_ORIG")
 PROMISE_FIX = _env_on("PROMISE_FIX")
+# [Fix 1b, 2 Oct 2026; v2 3 Oct] Every Fix 1b change has its own switch, read at start and shown by
+# the probes. ON unless set to 0 / off / false / no: the deferral phrases and the special-request
+# hand-over (DEFERRAL_ALERTS), the urgency words taken out of a promise (PROMISE_URGENCY_FIX), a
+# repeat only the Fix 1 list sees folded into the open alert (PROMISE_FOLD_WIDE), a repeat with a
+# deadline or about money raised as a new alert (REPEAT_BUZZ; never within REPEAT_BUZZ_MIN_MINUTES
+# of the alert), every "sorry for the wait" the customer saw counted for the chase's 2-promise rule
+# (SORRY_COUNT), and the night person line raising the alert with the clock line asking for its
+# HANDOVER line (NIGHT_LINE_ALERT - the owner's yes, 3 Oct 2026).
+DEFERRAL_ALERTS = _env_on("DEFERRAL_ALERTS")
+NIGHT_LINE_ALERT = _env_on("NIGHT_LINE_ALERT")
+PROMISE_URGENCY_FIX = _env_on("PROMISE_URGENCY_FIX")
+PROMISE_FOLD_WIDE = _env_on("PROMISE_FOLD_WIDE")
+REPEAT_BUZZ = _env_on("REPEAT_BUZZ")
+REPEAT_BUZZ_MIN_MINUTES = _env_int("REPEAT_BUZZ_MIN_MINUTES", 15)
+SORRY_COUNT = _env_on("SORRY_COUNT")
 # Alert kinds that ask a person to answer the customer (the ask counter, Stage C, and the
-# F3 cover use the same set).
+# F3 cover use the same set). O1 (owner, 2 Oct): + staff_stalled, a customer message left
+# waiting in a chat a colleague was handling (sweep_stalled_staff_chats).
 ASK_KINDS = {"handover", "blank", "attachment", "phone_msg", "missed_call", "unhappy",
-             "feedback", "review_unhappy"}
+             "feedback", "review_unhappy", "staff_stalled"}
 
 
 def promise_switches() -> dict:
@@ -2429,7 +2773,12 @@ def promise_switches() -> dict:
     change is a redeploy of the same commit, so ?action=version cannot show it took effect."""
     return {"PROMISE_FIX": PROMISE_FIX, "PROMISE_WIDE_ALERTS": PROMISE_WIDE_ALERTS,
             "PROMISE_COVER_ORIG": PROMISE_COVER_ORIG, "WIDE_QUIET_MINUTES": WIDE_QUIET_MINUTES,
-            "ASK3_PING": ASK3_PING, "ASK_GAP_MINUTES": ASK_GAP_MINUTES, "REPEAT_DAYS": REPEAT_DAYS}
+            "ASK3_PING": ASK3_PING, "ASK_GAP_MINUTES": ASK_GAP_MINUTES, "REPEAT_DAYS": REPEAT_DAYS,
+            # [Fix 1b]
+            "DEFERRAL_ALERTS": DEFERRAL_ALERTS, "NIGHT_LINE_ALERT": NIGHT_LINE_ALERT,
+            "PROMISE_URGENCY_FIX": PROMISE_URGENCY_FIX, "PROMISE_FOLD_WIDE": PROMISE_FOLD_WIDE,
+            "REPEAT_BUZZ": REPEAT_BUZZ, "REPEAT_BUZZ_MIN_MINUTES": REPEAT_BUZZ_MIN_MINUTES,
+            "SORRY_COUNT": SORRY_COUNT}
 
 
 def open_alert_within(user: str, seconds: float) -> bool:
@@ -2456,10 +2805,22 @@ def open_alert_within(user: str, seconds: float) -> bool:
         return False
 
 
+def open_alert_kind(user: str) -> str:
+    """[R1 fix, S-2] The kind of this customer's alert row ('' when there is none or it cannot be read)."""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT COALESCE(kind, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        return (r[0] or "") if r else ""
+    except Exception:
+        return ""
+
+
 _QUIET_REPEAT_MARK = "\n➕ "
 
 
-def note_quiet_repeat(user: str, words: str) -> bool:
+def note_quiet_repeat(user: str, words: str, chase_clock: bool = True,
+                      said: str = "the bot told them the team will get back to them",
+                      at: float = 0.0) -> bool:
     """F3: the customer asked again inside the cover window and the bot told them the team
     will get back to them. Edit the open alert's copies in place (one '➕ wrote again N×'
     line, rewritten each time - a burst never stacks lines) and keep it in tg_text, so a
@@ -2468,7 +2829,12 @@ def note_quiet_repeat(user: str, words: str) -> bool:
     the alert (never quiet by accident). [R3 fix, FG-2] When the customer has not written since
     the alert (or since the repeat last folded in) - the stalled-staff sweep, or an assist after an
     outage, answering the very message the open alert was raised for - there is nothing to add: True,
-    with no edit and no "wrote again" (that alert already covers the message)."""
+    with no edit and no "wrote again" (that alert already covers the message).
+    [Fix 1b] chase_clock=False (a 'fold_only' edit) leaves fold_ts, the chase's clock, alone.
+    O1 (agreed 3 Oct, shipped here so O1 rebases on it): the stalled-staff sweep folds a message it
+    finds an hour or more later - `said` is what the bot told the customer (it says "the bot told ..."
+    so the ladder's quote of the newest words still ends there) and `at` the time they wrote it (0 =
+    now, every other caller). Today's callers pass neither: the stored line is byte-identical."""
     try:
         with closing(db()) as conn:
             r = conn.execute("SELECT ts, COALESCE(tg_msgs, ''), COALESCE(tg_text, ''), COALESCE(headline, '')"
@@ -2496,17 +2862,22 @@ def note_quiet_repeat(user: str, words: str) -> bool:
         base, _, prev = (r[2] or r[3] or "Alert").partition(_QUIET_REPEAT_MARK)
         m = re.match(r"wrote again (\d+)×", prev)
         n = (int(m.group(1)) if m else 0) + 1
+        when = datetime.fromtimestamp(at, ZoneInfo("Europe/Dublin")) if at else now_local()
         line = (f"{_QUIET_REPEAT_MARK}wrote again {n}× since this alert, last at "
-                f"{now_local().strftime('%H:%M')}: “{' '.join((words or '').split())[:100]}”"
-                " — the bot told them the team will get back to them. Press Done only when"
+                f"{when.strftime('%H:%M')}: “{' '.join((words or '').split())[:100]}”"
+                f" — {said}. Press Done only when"
                 " this is sorted too.")
         text = base[:max(0, 3900 - len(line))] + line
         with closing(db()) as conn, conn:
             # [R2 fix, C1] fold_ts: when the customer's newest question was folded in - the chase's
             # "did the bot really answer?" starts there, as it did from live's re-raised alert
+            # [Fix 1b item 4] chase_clock=False (a 'fold_only' edit: only the Fix 1 list sees the
+            # promise) edits the text but leaves fold_ts, so the chase's "did the bot really answer?"
+            # clock stays where live has it - never a chase note live would not send (Fix 1's O1)
             try:
-                hit = conn.execute("UPDATE alerts SET tg_text = ?, fold_ts = ? WHERE wa_user = ? AND ts = ?"
-                                   " AND COALESCE(closed_ts, 0) < ts", (text, time.time(), user, r[0])).rowcount
+                hit = conn.execute("UPDATE alerts SET tg_text = ?, fold_ts = COALESCE(?, fold_ts) WHERE wa_user = ?"
+                                   " AND ts = ? AND COALESCE(closed_ts, 0) < ts",
+                                   (text, time.time() if chase_clock else None, user, r[0])).rowcount
             except sqlite3.OperationalError as e:
                 if "no such column" not in str(e):
                     raise
@@ -2570,8 +2941,157 @@ def older_lists_see(text: str, own: str = "") -> bool:
     as today's code read it? `own` = the model's words before the night rewriter and the net
     (older_lists_text). No thank-you rule here: claims_a_person applies it."""
     t = older_lists_text(text, own) if own else (text or "")
+    # [Fix 1b] + a deferral, a special-request hand-over or (NIGHT_LINE_ALERT=1) the night line: they
+    # raise the alert now, so the chase reads them as "not an answer" too
     return bool(_CLAIMS_A_PERSON_RE.search(t) or _CLAIMS_A_PERSON_MORE_RE.search(t)
-                or _HOUSE_HANDOVER_RE.search(t))
+                or _HOUSE_HANDOVER_RE.search(t) or fix1b_phrase(t))
+
+
+# [Fix 1b item 4, owner 2 Oct 2026; v2 3 Oct] F3's exception: a repeat ask with a DEADLINE ("If can
+# sort today so can have for weekend" - Jack's €450 refund, folded quietly into a 30-minute-old alert)
+# or about MONEY raises a new alert (a buzz) instead of folding quietly. v2 (CRITIQUE 2, 3): only the
+# customer's NEW words count (this turn's, since the open alert and its last fold), never a thank-you
+# or sign-off, never no new words at all (FG-2), never within REPEAT_BUZZ_MIN_MINUTES of the alert (a
+# burst is one ask); a deadline is a real one ("need it for Friday", "by 5pm", "for the weekend", "can
+# you do it today", "asap" - never a bare weekday, "have a good weekend" or "not urgent"); money is
+# money (refund, paid, invoice, an amount in € or euro - never "BMW 330e", "charging" or "pay by card").
+_REPEAT_NOT_URGENT_RE = re.compile(
+    r"\b(?:not|no|isn['’]?t|wasn['’]?t|nothing|never)\s+(?:(?:that|too|very|so|really|super|at all|an?)\s+)*"
+    r"(?:urgent\w*|rush\w*|panic|hurry|emergency|asap)\b|\bno (?:rush|hurry|panic|pressure|stress)\b"
+    r"|не\s+(?:очень\s+|так\s+)?(?:срочн\w*|к\s+спеху|спеш\w*)"
+    r"|\bnu\s+(?:(?:e|este|[îi]i|chiar|a[șs]a|foarte)\s+)*(?:urgen\w*|grab\w*)|\bne\s?skub\w*", re.IGNORECASE)
+_REPEAT_DAY = r"(?:mon|tues|wednes|thurs|fri|satur|sun)day"
+_REPEAT_SOON = r"(?:today|tonight|tomorrow|tmrw?|this (?:morning|afternoon|evening))"
+_REPEAT_DEADLINE_RE = re.compile(
+    r"\b(?:asap|a\.s\.a\.p|urgent(?:ly)?|emergency|as soon as possible|end of (?:the )?day)\b"
+    r"|\b(?:need|needs|needed|want|wanted)\s+(?:it|them|the car|my car|the van|my van|her|him|the headlights?)"
+    r"(?:\s+back)?\s+(?:for|by|before|on)\b"
+    r"|\b(?:need|needs|needed|must|have to|has to|got to|gotta)\b[^.!?\n]{0,30}?\b(?:" + _REPEAT_SOON
+    + r"|(?:the |this )?week-?end)\b"
+    r"|\bby (?:\d{1,2}(?:[:.]\d\d)?\s*(?:am|pm|o['’]?clock)?|lunch(?:time)?|noon|" + _REPEAT_SOON
+    + r"|(?:the )?week-?end|" + _REPEAT_DAY + r")(?![\w:.])"
+    r"|\bbefore (?:the )?(?:week-?end|" + _REPEAT_SOON + r"|" + _REPEAT_DAY + r"|\d{1,2}(?:[:.]\d\d)?\s*(?:am|pm))\b"
+    r"|\bfor (?:the |this )?week-?end\b"
+    r"|\b(?:can you|could you|will you|sort(?:ed)?|ready|done|finish(?:ed)?|fix(?:ed)?|collect|pick (?:it |the car )?up"
+    r"|have (?:it|the car)|work|leave|go)\b[^.!?\n]{0,25}?\b" + _REPEAT_SOON + r"\b"
+    r"|\b(?:today|tonight)\b[^.!?\n]{0,25}?\b(?:need|must|have to|can you|could you|sort|ready|done|finish|fix|collect)\b"
+    # Russian, Romanian, Lithuanian: the same shapes
+    r"|(?:нужн\w*|надо|сможете|успеете|можно|готов\w*|забрать|сдела\w*|почин\w*)[^.!?\n]{0,25}?"
+    r"(?:сегодня|завтра|к выходным|до выходных|к вечеру|до вечера)"
+    r"|(?:сегодня|завтра)[^.!?\n]{0,25}?(?:нужн\w*|надо|сможете|успеете|можно|готов\w*|забрать|сдела\w*)|срочн\w*"
+    r"|(?:trebuie|nevoie|pute[țt]i|po[țt]i|gata|ridic\w*|termina\w*|repara\w*)[^.!?\n]{0,25}?"
+    r"\b(?:ast[ăa]zi|azi|m[âa]ine|weekend)\b|\b(?:ast[ăa]zi|azi|m[âa]ine)\b[^.!?\n]{0,25}?(?:trebuie|nevoie|pute[țt]i"
+    r"|po[țt]i|gata)|\burgen[tț]\w*"
+    r"|(?:reikia|reik|reik[ėe]s|galit\w*|gal[ėe]sit\w*|paruo\w*|pasiim\w*|padary\w*|sutaisy\w*)[^.!?\n]{0,25}?"
+    r"(?:[šs]iandien|rytoj|savaitgal\w*)|(?:[šs]iandien|rytoj)[^.!?\n]{0,25}?(?:reikia|reik|galit\w*|paruo\w*"
+    r"|pasiim\w*)|skubiai|skubu\b", re.IGNORECASE)
+_REPEAT_MONEY_RE = re.compile(
+    r"\b(?:refund\w*|owe[sd]?|owing|paid|payment\w*|invoice\w*|receipt\w*|bill|billed|deposit\w*|overcharg\w*"
+    r"|charged me|money|revolut|bank transfer)\b|€\s?\d|\b\d+(?:[.,]\d+)?\s?(?:€|euros?\b|eur\b)"
+    r"|возврат\w*|деньг\w*|оплат\w*|заплат\w*|сч[её]т\b|ramburs\w*|\bbani\b|\bpl[ăa]t[ăia]\w*|factur\w*|pinig\w*"
+    r"|s[ąa]skait\w*", re.IGNORECASE)
+_REPEAT_MONEY_TOPICS = {"money", "bill_dispute", "price_dispute"}
+
+
+def _repeat_preview(reply: str, cust: str) -> str:
+    """[Fix 1b item 4, promisetest] What this reply would do while a trusted open alert covers the
+    customer - text only, no alert or chat is read (the open alert's own topic and the
+    REPEAT_BUZZ_MIN_MINUTES burst rule are not seen here)."""
+    counts = new_phrases_count_after(cust)
+    signoff = customer_signoff(cust)
+    orig = bool(_CLAIMS_A_PERSON_RE.search(reply) or _HOUSE_HANDOVER_RE.search(reply)
+                or (_CLAIMS_A_PERSON_MORE_RE.search(reply) and counts)
+                or (fix1b_phrase(reply) and not signoff))
+    wide = not orig and bool(wide_promise_phrase(reply)) and counts
+    if not orig and not (wide and (PROMISE_WIDE_ALERTS or PROMISE_FOLD_WIDE)):
+        return "nothing - no promise an alert would see"
+    if orig and not PROMISE_COVER_ORIG:
+        return "alert - PROMISE_COVER_ORIG is off"
+    why = repeat_buzz_reason(cust) if (REPEAT_BUZZ and not signoff) else ""
+    if why:
+        # [R3 fix, D-5] since R2C-F2 a buzz is a loud post ON the open alert, which keeps its clocks; the burst guard
+        # counts from the alert or its last buzz
+        return ("buzz - a loud post on the open alert, its clocks kept (a new alert only if that alert is chased, "
+                f"closed or not on Telegram): the repeat is about {'money' if why == 'money' else 'a deadline'}"
+                f" ({REPEAT_BUZZ_MIN_MINUTES}+ minutes after the alert or its last buzz)")
+    if orig or PROMISE_WIDE_ALERTS:
+        return "covered - a quiet edit of the open alert (an alert if the edit fails)"
+    if signoff:
+        return "nothing - a thank-you adds nothing to the open alert"
+    return "fold_only - a quiet edit of the open alert (nothing if the edit fails)"
+
+
+def repeat_buzz_reason(words: str, topic: str = "") -> str:
+    """'deadline' / 'money' / '' for a customer's NEW words and the open alert's topic. The topic
+    counts only with new words; a negated "not urgent" / "no rush" is no deadline."""
+    w = _REPEAT_NOT_URGENT_RE.sub(" ", words or "")
+    if not w.strip():
+        return ""
+    if _REPEAT_DEADLINE_RE.search(w):
+        return "deadline"
+    if topic in _REPEAT_MONEY_TOPICS or _REPEAT_MONEY_RE.search(w):
+        return "money"
+    return ""
+
+
+def repeat_must_buzz(user: str, words: str = None) -> str:
+    """[Fix 1b item 4] Why this repeat raises a new alert ('deadline' / 'money'; '' = fold it
+    quietly, F3). `words`: the customer's new words, when the caller has them (the stalled-staff
+    sweep); None: read them - this turn's customer messages, since the open alert, its last fold and
+    the bot's or a colleague's last line. Never within REPEAT_BUZZ_MIN_MINUTES of the alert (a burst
+    is one ask), never on a thank-you or sign-off, never with no new words at all (FG-2: the open
+    alert already covers that message). Off (REPEAT_BUZZ=0) or unsure: '' (F3 as today; a fold that
+    fails still raises the alert)."""
+    if not REPEAT_BUZZ:
+        return ""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT ts, COALESCE(topic, '') FROM alerts WHERE wa_user = ?",
+                             (user,)).fetchone()
+            if not r:
+                return ""
+            # [R2 fix, R2C-F2] ...or minutes after its last buzz: a buzz keeps the alert's own time
+            # (buzz_onto_row notes buzz_ts:<user>); unreadable -> the alert's time, as before
+            try:
+                b = conn.execute("SELECT value FROM settings WHERE key = ?", (f"buzz_ts:{user}",)).fetchone()
+                last_buzz = float((b[0] if b else 0) or 0)
+            except (sqlite3.OperationalError, ValueError, TypeError):
+                last_buzz = 0.0
+            if time.time() - max(r[0] or 0, last_buzz) < REPEAT_BUZZ_MIN_MINUTES * 60:
+                return ""                       # a burst: the alert is only minutes old
+            if words is None:
+                since = r[0] or 0.0
+                try:
+                    f = conn.execute("SELECT COALESCE(fold_ts, 0) FROM alerts WHERE wa_user = ?",
+                                     (user,)).fetchone()
+                    since = max(since, (f[0] if f else 0.0) or 0.0)
+                except sqlite3.OperationalError:
+                    pass    # no fold_ts column (SN11): the alert's own time
+                last = conn.execute("SELECT COALESCE(MAX(ts), 0) FROM messages WHERE wa_user = ? AND role IN"
+                                    " ('assistant', 'staff')", (user,)).fetchone()[0] or 0.0
+                said = [x[0] or "" for x in conn.execute(
+                    "SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND ts > ?"
+                    " ORDER BY id DESC LIMIT 4", (user, max(since, last))).fetchall()]
+            else:
+                said = [words]
+        said = [w for w in said if w.strip() and not customer_signoff(w)]
+        return repeat_buzz_reason(" ".join(said), r[1]) if said else ""
+    except Exception:
+        log.exception("Repeat buzz check failed for %s - folded as before", user)
+        return ""
+
+
+def alerting_lists_see(text: str, user: str) -> bool:
+    """[Fix 1b] promise_alert_decision's 'orig': a list that raises the promise alert sees a promise
+    in `text` (the reply as today's code read it) and that list's thank-you rule lets it count - the
+    two older lists and the house hand-over line exactly as today (older_lists_see and
+    claims_a_person), and a Fix 1b phrase only after a real message that is not a sign-off."""
+    t = text or ""
+    if _CLAIMS_A_PERSON_RE.search(t) or _HOUSE_HANDOVER_RE.search(t):
+        return True
+    if _CLAIMS_A_PERSON_MORE_RE.search(t) and claims_a_person(t, user):
+        return True
+    return bool(fix1b_phrase(t)) and fix1b_counts_after(user)
 
 
 def promise_alert_decision(reply: str, user: str, own: str = "") -> str:
@@ -2581,14 +3101,116 @@ def promise_alert_decision(reply: str, user: str, own: str = "") -> str:
     and alert if that returns False); '' - no promise, or only the Fix 1 list sees it and
     PROMISE_WIDE_ALERTS is off. `own` = the model's words before the night rewriter. With
     the switch off (the default) this is TODAY's decision: the older lists on the reply as
-    today's code read it (older_lists_text), the newer phrases only after a real message."""
+    today's code read it (older_lists_text), the newer phrases only after a real message.
+    [Fix 1b] The Fix 1b phrases alert like the older lists, after a real message that is not a
+    sign-off (alerting_lists_see). 'fold_only' - only the Fix 1 list sees it and a trusted open
+    alert covers the customer: folded in quietly as well (PROMISE_FOLD_WIDE), never an alert of its
+    own. 'buzz:deadline' / 'buzz:money' - a repeat that would have been 'covered' or 'fold_only'
+    carries a deadline or is about money (repeat_must_buzz, REPEAT_BUZZ): a new alert that says
+    why. settle_promise_call does the folding and the buzz."""
     today = older_lists_text(reply, own)
-    orig = older_lists_see(today) and claims_a_person(today, user)
-    if not orig and not (PROMISE_WIDE_ALERTS and claims_a_person(reply, user)):
+    orig = alerting_lists_see(today, user)
+    wide = not orig and claims_a_person(reply, user)
+    if not orig and not (wide and (PROMISE_WIDE_ALERTS or PROMISE_FOLD_WIDE)):
         return ""
     if (PROMISE_COVER_ORIG or not orig) and open_alert_within(user, WIDE_QUIET_MINUTES * 60):
-        return "covered"
-    return "alert"
+        if (orig or PROMISE_WIDE_ALERTS) and open_alert_kind(user) == "staff_stalled":
+            # [R1 fix, S-2 / R1-3] an open stalled-chat alert (O1) is no cover for the BOT's own promise: its
+            # chase is a staff-only note, so the customer would never get live's "sorry for the wait"
+            # (owner Q3: kept). The promise raises its own hand-over alert, as live does.
+            return "alert"
+        why = repeat_must_buzz(user)
+        if why:
+            # [R2 fix, R2C-F2] ':wide' - it stands in for a 'fold_only' edit (only the Fix 1 list sees the
+            # promise), which leaves the chase's clock alone; else for 'covered', which moves it
+            return "buzz:" + why + ("" if (orig or PROMISE_WIDE_ALERTS) else ":wide")
+        return "covered" if (orig or PROMISE_WIDE_ALERTS) else "fold_only"
+    return "alert" if (orig or PROMISE_WIDE_ALERTS) else ""
+
+
+def stall_quote(words: str, most: int = 80) -> str:
+    """[R2 fix, RT-6 / RT-3] The customer's words for an alert's first line, in “…”: cut on a word boundary with
+    '…' when longer than `most` (a cut mid-word inside closed quotes read as if they wrote 'Frid')."""
+    w = " ".join((words or "").split())
+    if len(w) <= most:
+        return f"“{w}”"
+    cut = w[:most]
+    sp = cut.rfind(" ")
+    if sp >= most // 2:
+        cut = cut[:sp]
+    return f"“{cut.rstrip(' ,.;:-—–')}…”"
+
+
+def repeat_buzz_quote(user: str, why: str, words: list = None) -> str:
+    """[R2 fix, RT-3] What a buzz alert quotes (stall_quote): the newest message of the turn that carries the
+    deadline ('deadline') or the money words ('money') on its own - not the "Hello??", the photo or the "Thanks"
+    sent after it. `words`: the waiting messages, newest first (the stalled-staff sweep); None: the messages
+    repeat_must_buzz judged (since the open alert, its last fold and the bot's or a colleague's last line).
+    None of them on its own (a money topic): all their words. Unsure: the newest message."""
+    try:
+        if words is None:
+            with closing(db()) as conn:
+                r = conn.execute("SELECT ts, COALESCE(fold_ts, 0) FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+                since = max((r[0] or 0.0) if r else 0.0, (r[1] or 0.0) if r else 0.0)
+                last = conn.execute("SELECT COALESCE(MAX(ts), 0) FROM messages WHERE wa_user = ? AND role IN"
+                                    " ('assistant', 'staff')", (user,)).fetchone()[0] or 0.0
+                words = [x[0] or "" for x in conn.execute(
+                    "SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND ts > ?"
+                    " ORDER BY id DESC LIMIT 4", (user, max(since, last))).fetchall()]
+        said = [w for w in words if (w or "").strip() and not customer_signoff(w) and not stall_media(w)]
+        rx = _REPEAT_DEADLINE_RE if why == "deadline" else _REPEAT_MONEY_RE
+        hit = next((w for w in said if rx.search(_REPEAT_NOT_URGENT_RE.sub(" ", w))), "")
+        text = hit or " ".join(reversed(said))
+    except Exception:
+        log.exception("Buzz quote failed for %s - the newest message", user)
+        text = ""
+    return stall_quote(text or _recent_customer_words(user, 1))
+
+
+def mark_fold_seen(user: str) -> None:
+    """[R1 fix, N-3] When the customer's newest message was last folded into their open alert as a quiet
+    '➕ wrote again' edit at the bot's reply ('covered' or 'fold_only' - the latter leaves fold_ts, the chase's
+    clock, alone): the stalled-staff sweep then knows that message is already on the alert (stall_cover)."""
+    try:
+        set_setting(f"fold_seen:{user}", str(time.time()))
+    except Exception:
+        log.exception("Could not note the fold for %s", user)
+
+
+def settle_promise_call(call: str, user: str) -> str:
+    """[Fix 1b item 4] promise_alert_decision's answer, settled at both alert sites. Returns
+    'alert' when the caller must raise the promise alert, '' when nothing more is to be done:
+    'covered' - the repeat is folded into the open alert quietly, and 'alert' if that fails (never
+    quiet by accident); 'fold_only' - folded in quietly (never for a thank-you: it adds nothing),
+    and nothing if that fails (only the Fix 1 list sees it: it raised nothing before);
+    'buzz:<why>' - a new alert that says why it buzzed (CRITIQUE 16), 'alert' if that fails."""
+    if call == "covered":
+        if note_quiet_repeat(user, _recent_customer_words(user, 1)):
+            mark_fold_seen(user)        # [R1 fix, N-3]
+            return call
+        return "alert"
+    if call == "fold_only":
+        words = _recent_customer_words(user, 1)
+        if not customer_signoff(words) and note_quiet_repeat(user, words, chase_clock=False):
+            mark_fold_seen(user)        # [R1 fix, N-3]
+        return ""
+    if call.startswith("buzz:"):
+        about, _, wide = call[5:].partition(":")
+        said = repeat_buzz_quote(user, about)       # [R2 fix, RT-3] the words that carry the deadline / money
+        why = ("⏰ asked again, with a deadline" if about == "deadline" else "asked again about money")
+        log.warning("Repeat from %s %s - a loud post instead of a quiet fold", user, why)
+        try:
+            # [R2 fix, R2C-F2] an extra LOUD post on the open alert, which keeps its own clocks: live's 2-h owner
+            # ping, repost and customer chase come when they were due, and a later repeat after the owner ping is
+            # live's new '🔁 2nd ask' alert. A new alert only when no open, unchased alert stands (alert_owner).
+            alert_owner(user, "🙋 A customer needs you to follow up",
+                        f"{why}: {said} — the bot told them the team will get back to them",
+                        kind="handover", keep_clock=True, fold_clock=wide != "wide")
+            return ""
+        except Exception:
+            log.exception("Repeat buzz alert failed for %s", user)
+            return "alert"
+    return call
 
 
 # Item 4 (the thank-you turn). Built as Stage 2a2 P07's helpers (DESIGN 3.5), with
@@ -2655,10 +3277,52 @@ def open_alert_for_ack(user: str) -> bool:
         return False
 
 
+# [Fix 1b, s6-01, 2 Oct 2026] "</![CDATA[" went to a customer who had just complained (garage
+# …4459): markup the model wrote, or what was left once a thank-you turn lost its promise sentence
+# (visible_text counted "CDATA" as words). Markup debris never goes out, and a reply with no words
+# in it is never sent: _finish_reply, the assist, chase and follow-up paths and the net below.
+# v2 (CRITIQUE 12): debris is CDATA, "]]>", a whole <!-- ... --> and a short list of tags a model
+# leaks ("</thought>", "</response>", "<br/>", "<b>"); any other "<word>" ("<name>", "<SAVE10>"), a
+# lone "-->", "<3" and an e-mail in brackets stay.
+_MARKUP_TAGS = (r"(?:thought|thinking|reasoning|response|answer|reply|output|assistant|user|system|message|final"
+                r"|text|p|br|hr|b|i|u|em|strong|div|span|html|body|ul|ol|li)")
+_MARKUP_DEBRIS_RE = re.compile(r"<?/?!?\[CDATA\[?|\]\]>|<!--[\s\S]{0,400}?-->|</?" + _MARKUP_TAGS + r"\b[^<>\n]{0,40}?/?>",
+                               re.IGNORECASE)
+_PICTOGRAPH_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
+
+
+def strip_markup_debris(text: str) -> str:
+    """The text without markup debris ('</![CDATA[', ']]>', '</thought>', '<br/>'); as it was if it has none."""
+    t = text or ""
+    out = _MARKUP_DEBRIS_RE.sub("", t)
+    if out == t:
+        return t
+    out = re.sub(r"(?<=\S)[ \t]{2,}", " ", out)
+    return re.sub(r"[ \t]+(?=\n|$)", "", out).strip()
+
+
+def reply_has_words(text: str) -> bool:
+    """Is anything left for the customer to read once the hidden markers and any markup debris
+    are gone - a letter, a digit or an emoji ('👍' alone is a reply)? '</![CDATA[', '...' and ''
+    are not."""
+    t = strip_markup_debris(visible_text(text or ""))
+    return bool(re.search(r"[^\W_]", t) or _PICTOGRAPH_RE.search(t))
+
+
+def ack_short_close(user: str, text: str = "") -> str:
+    """[R2 fix, C2] The short close in the customer's language: their own recent messages first
+    (a thank-you itself is "thanks" or an emoji), then `text` (the reply's)."""
+    lang = _guess_lang_code(_recent_customer_words(user, 4))
+    if lang == "en":
+        lang = _guess_lang_code(text)
+    return _ACK_CLOSE.get(lang, _ACK_CLOSE["en"])
+
+
 def promise_safety_net(user: str, text: str, ack_turn: bool = False, chase: bool = False) -> str:
     """Fix 1: never send a person-promise with a reply TIME or a staff NAME; on a pure
     thank-you turn never send a NEW promise at all. Runs after the promise alert was
-    decided on the model's own words. Any failure sends the text unchanged."""
+    decided on the model's own words. Any failure sends the text unchanged. [Fix 1b, s6-01]
+    Never a reply with no words left in it: on a thank-you turn the short close goes instead."""
     if not PROMISE_FIX or not text:
         return text
     try:
@@ -2667,16 +3331,11 @@ def promise_safety_net(user: str, text: str, ack_turn: bool = False, chase: bool
             kept = drop_promise_sentences(out)
             if kept != out.strip():
                 log.info("Thank-you turn for %s: new promise dropped: %r", user, out[:200])
-                if visible_text(kept):
-                    out = kept
-                else:
-                    # [R2 fix, C2] the short close in the customer's language: their own recent
-                    # messages first (a thank-you itself is "thanks" or an emoji), then the reply's
-                    lang = _guess_lang_code(_recent_customer_words(user, 4))
-                    if lang == "en":
-                        lang = _guess_lang_code(text)
-                    out = _ACK_CLOSE.get(lang, _ACK_CLOSE["en"])
+                # [Fix 1b, s6-01] words only: a leftover "</![CDATA[" is nothing
+                out = kept if reply_has_words(kept) else ack_short_close(user, text)
         fixed = promise_fix(out, chase=chase)
+        if not reply_has_words(fixed) and reply_has_words(out):
+            fixed = out          # [Fix 1b, s6-01] never trimmed down to no words
         if fixed != out:
             log.info("Promise safety net for %s: %r -> %r", user, out[:200], fixed[:200])
         return fixed
@@ -3554,13 +4213,20 @@ def clock_line(now=None) -> str:
             "never offer a drop-off or an answer 'today', and never tell the customer to ring "
             "now or offer the phone number as a way to reach someone now. If the customer "
             "needs a PERSON (something you cannot answer or do from the business information: "
-            "a status, a price the team must work out, a complaint, a request to talk to or be "
+            "a status the business information says needs a colleague, a price the team must "
+            "work out, a special request the business information does not answer such as an "
+            "evening arrival or a same-day turnaround, a complaint, a request to talk to or be "
             "called by someone), say plainly that we are closed and when we open again "
             f"({when}) as a sentence of its own, then that the team will see this here when "
-            "they're back. Otherwise (a price you know, a "
+            "they're back"
+            # [Fix 1b item 2] the HANDOVER line only while NIGHT_LINE_ALERT=1 (the owner's yes)
+            + (", and add the hidden <<<HANDOVER|reason=...>>> line saying who or what they "
+               "need, so the team is told" if globals().get("NIGHT_LINE_ALERT", False) else "")
+            + ". Otherwise (a price you know, a "
             "booking for a future day, our hours, a thank-you or a goodbye) just answer: you "
             f"may say we're closed and open again {when}, but never say anyone will get back "
-            "to them. If they ask whether we are open, the answer is NO - say when we open "
+            "to them. A special request about a future booking is not 'just answer' unless the "
+            "business information answers it. If they ask whether we are open, the answer is NO - say when we open "
             f"again. Bookings for future days are still fine. {_HOURS_SENTENCE}" + ahead)
 
 def normalize_phone(phone: str) -> str:
@@ -4794,16 +5460,32 @@ def quotable_words(messages: list) -> str:
     return " ".join((messages[0] or "").split()) if messages else ""
 
 
+# [R3 fix, W-1] a deadline / money buzz's reason (settle_promise_call, the stalled-staff sweep): why it buzzed and the
+# customer's words in “…” - or, for an attachment-only run (W-6), the attachments in words ("🎤 a voice note") - then
+# the bot's or the sweep's long tail after " — "
+_BUZZ_REASON_RE = re.compile(r"(⏰ asked again, with a deadline|asked again about money|still waiting in a colleague's chat)"
+                             r": (?:“([^”]*)”|([^“”—]{1,60}?)(?= — |$))")
+
+
 def _headline_detail(reason: str, last_words: str) -> str:
     """What the headline says after the type: the reason with its fixed prefix
     taken off, or - when the reason is one of the bot's generic ones - the
-    customer's own words, quoted."""
+    customer's own words, quoted. [R3 fix, W-1] A buzz reason stops at the customer's
+    closing quote (the tail - "the bot told them…", "They wrote…" - stays on the What's
+    wrong line), their words cut on a word with '…'."""
     r = " ".join((reason or "").split())   # one line: it goes into the email subject
     if r and not _GENERIC_REASON_RE.match(r):
         for prefix, _name in _TOPIC_PREFIXES:
             if r.lower().startswith(prefix):
                 r = r[len(prefix):].lstrip(" -—–:|")
                 break
+        m_ = _BUZZ_REASON_RE.match(r)
+        if m_ and m_.group(2) is None:
+            return f"{m_.group(1)}: {m_.group(3).strip()}"      # the attachments in words (W-6), no quotes
+        if m_:
+            most = max(20, 76 - len(m_.group(1)))
+            inner = m_.group(2)
+            return f"{m_.group(1)}: " + (f"“{inner}”" if len(inner) <= most else stall_quote(inner.rstrip("…"), most))
         return r[:80].rstrip() + ("…" if len(r) > 80 else "")
     w = " ".join((last_words or "").split())
     if not w:
@@ -4838,9 +5520,101 @@ def _last_customer_messages(user: str, limit: int = 4) -> list:
         return []
 
 
+def alert_since_ts(user: str, ts: float, conn=None) -> float:
+    """[R2 fix, RT-1 / R2C-F1] When this customer started waiting on their alert raised at `ts`: the time they
+    wrote, for an alert the stalled-staff sweep raised an hour or more later (an overnight question, raised by
+    the morning briefing's own pass) - alert_owner's since_ts, kept as alert_since:<user> = '<alert ts>|<their
+    time>' and read only while that alert is the row's (any later alert has another ts) - else ts. For what
+    staff READ (the waiting lists' order and 'waiting Nh', the chase note's hours, the ask line's 'waiting
+    since'): every clock (the ladder, the chase, the F3 window, the ask chain) stays on the alert's own ts."""
+    try:
+        key = f"alert_since:{user}"
+        if conn is None:
+            v = get_setting(key, "")
+        else:
+            r = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            v = (r[0] if r else "") or ""
+        a, _, s = (v or "").partition("|")
+        if a and s and abs(float(a) - float(ts or 0)) < 0.001 and 0 < float(s) < float(ts or 0):
+            return float(s)
+    except Exception:
+        pass
+    return ts
+
+
+def buzz_keep_row(conn, user: str):
+    """[R2 fix, R2C-F2] This customer's alert row when a repeat's deadline / money buzz can be an extra post ON it,
+    keeping its clocks: open (no Done), not sorted (alert_resolved), not chased yet (its own chase - and live's
+    'sorry for the wait' to the customer - still to come), on Telegram (copies a Done can close) and inside the
+    chase's 24-hour reach. Else None: a buzz on a chased, closed or untracked row raises a new alert with a fresh
+    ladder, as before. Never raises (unsure: None)."""
+    try:
+        r = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(chased_ts, 0), COALESCE(tg_msgs, ''),"
+                         " COALESCE(first_ts, 0), COALESCE(ask_count, 0), COALESCE(ask_ts, 0),"
+                         " COALESCE(chain_ts, 0), COALESCE(kind, '') FROM alerts WHERE wa_user = ?",
+                         (user,)).fetchone()
+        if not r or not r[0]:
+            return None
+        ts = r[0]
+        if ((r[1] or 0) >= ts or (r[2] or 0) >= ts or not r[3] or time.time() - ts >= 24 * 3600
+                or alert_resolved(conn, user, ts)):
+            return None
+        return {"ts": ts, "first_ts": r[4] or ts, "ask_count": int(r[5] or 0), "ask_ts": r[6] or 0.0,
+                "chain_ts": r[7] or 0.0, "kind": r[8] or ""}
+    except Exception:
+        return None
+
+
+def buzz_onto_row(user: str, alert_ts: float, handles: list, tg_text: str, headline: str, topic: str,
+                  category: str, fold_clock: bool) -> bool:
+    """[R2 fix, R2C-F2] The buzz's post joins the open alert raised at alert_ts: its Telegram copies are added (a
+    Done edits them all), the alert now reads as the buzz (text, headline, topic, category), and ts, the 30-min
+    repost, the 2-h owner ping, the chase, the ask chain, the claim and the kind are left alone. fold_clock: the
+    quiet fold the buzz stands in for moved the chase's 'did the bot really answer?' clock (fold_ts) - so does
+    this ('covered' / the sweep's fold; not 'fold_only' / open_older). The burst guard then measures from this
+    buzz (buzz_ts:<user>, repeat_must_buzz), and the sweep sees the message on the alert (mark_fold_seen).
+    False when the row changed meanwhile (the post went out on its own)."""
+    now = time.time()
+    h = ",".join(handles or [])
+    with closing(db()) as conn, conn:
+        try:
+            hit = conn.execute(
+                "UPDATE alerts SET tg_msgs = CASE WHEN COALESCE(tg_msgs, '') = '' THEN ? WHEN ? = '' THEN tg_msgs"
+                " ELSE tg_msgs || ',' || ? END, tg_text = ?, headline = ?, topic = ?, category = ?,"
+                " fold_ts = CASE WHEN ? THEN ? ELSE fold_ts END WHERE wa_user = ? AND ts = ?"
+                " AND COALESCE(closed_ts, 0) < ts",
+                (h, h, h, tg_text, headline, topic, category, 1 if fold_clock else 0, now, user,
+                 alert_ts)).rowcount
+        except sqlite3.OperationalError as e:
+            if "no such column" not in str(e):
+                raise
+            # [SN11 style] no fold_ts column (the column loop in db() failed): the post joins the row as before
+            hit = conn.execute(
+                "UPDATE alerts SET tg_msgs = CASE WHEN COALESCE(tg_msgs, '') = '' THEN ? WHEN ? = '' THEN tg_msgs"
+                " ELSE tg_msgs || ',' || ? END, tg_text = ?, headline = ?, topic = ?, category = ?"
+                " WHERE wa_user = ? AND ts = ? AND COALESCE(closed_ts, 0) < ts",
+                (h, h, h, tg_text, headline, topic, category, user, alert_ts)).rowcount
+    if not hit:
+        return False
+    try:
+        set_setting(f"buzz_ts:{user}", repr(now))
+        mark_fold_seen(user)
+    except Exception:
+        log.exception("Could not note the buzz for %s", user)
+    return True
+
+
 def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = True,
-                kind: str = "") -> None:
-    """Send the owner (and manager, if set) a short note plus the conversation."""
+                kind: str = "", keep_clock: bool = False, fold_clock: bool = False,
+                since_ts: float = 0.0) -> None:
+    """Send the owner (and manager, if set) a short note plus the conversation.
+    [R2 fix, R2C-F2] keep_clock (a repeat's deadline / money buzz): when this customer's alert is still open,
+    unsorted, not chased and on Telegram (buzz_keep_row), the buzz is an extra LOUD post on THAT alert - its own
+    Done button closes it, the e-mail goes - and the row keeps its clocks (buzz_onto_row): a new alert would
+    restart the repost, the owner ping, the chase and the F3 window, and delay or lose live's ping and customer
+    chase. fold_clock: see buzz_onto_row. No such alert: a new one, as before. [R2 fix, RT-1 / R2C-F1]
+    since_ts: when the customer wrote, for an alert raised an hour or more after it (the stalled-staff sweep) -
+    alert_since_ts; the alert's own clocks stay on its own time."""
     recipients = [n for n in (OWNER_WHATSAPP, MANAGER_WHATSAPP) if n]
     recipients = list(dict.fromkeys(recipients))  # de-duplicate, keep order
     # No early return when there are no WhatsApp recipients — Telegram and email
@@ -4858,19 +5632,41 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
         log.exception("Could not type the alert for %s", user)
     # Fix 1: which ask of a chain is this? ("🔁 3rd ask · waiting since Mon 09:10")
     alert_ts = time.time()
+    # [R2 fix, R2C-F2] a buzz onto the open alert: that row's ts, chain and clocks stay as they are
+    kept = None
+    if keep_clock and needs_reply:
+        try:
+            with closing(db()) as conn:
+                kept = buzz_keep_row(conn, user)
+        except Exception:
+            log.exception("Could not read the open alert for %s - a new alert instead", user)
+            kept = None
     chain = (alert_ts, 0, 0.0)
     ask_note = ""
-    if needs_reply:
+    if kept:
+        chain = (kept["first_ts"], kept["ask_count"], kept["ask_ts"])
+        ask_note = ask_note_for_row(kept["ts"], alert_since_ts(user, kept["first_ts"]), kept["ask_count"],
+                                    kept["chain_ts"], alert_ts)
+    elif needs_reply:
         try:
             chain = _ask_chain_for(user, kind, alert_ts)
-            ask_note = ask_line(chain[0], chain[1], alert_ts)
+            # [R2 fix, RT-1 / R2C-F1] "waiting since" the customer's own time when the chain began at an alert the
+            # stalled-staff sweep raised later (display only: the chain itself is unchanged)
+            ask_note = ask_line(alert_since_ts(user, chain[0]), chain[1], alert_ts)
         except Exception:
             log.exception("Ask line failed for %s", user)
             chain, ask_note = (alert_ts, 0, 0.0), ""
+    # [R2 fix, RT-5] the line the customer really uses: the webhook's (the one it arrived on), else the one they
+    # last wrote to (the stalled-staff sweep, the morning briefing and the ladder have no message context), else
+    # the default send line
+    try:
+        came_on = line_label(_ctx_phone_id.get() or phone_id_for_customer(user))
+    except Exception:
+        came_on = line_label()
     if ask_note and chain[1] >= 3:
-        parts = [ask_note, headline, f"From: {label}", f"Came in on: {line_label()}"]
+        parts = [ask_note, headline, f"From: {label}", f"Came in on: {came_on}"]
     else:
-        parts = [headline] + ([ask_note] if ask_note else []) + [f"From: {label}", f"Came in on: {line_label()}"]
+        parts = [headline] + ([ask_note] if ask_note else []) + [f"From: {label}", f"Came in on: {came_on}"]
     if reason:
         parts.append(f"What's wrong: {reason}")
     excerpt = conversation_excerpt(user)
@@ -4924,7 +5720,7 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
             tg_text += f"\n\n\U0001F64B Already with {prev[1]}"
     try:
         if needs_reply:
-            tg_handles = send_telegram_buttons(tg_text, user, alert_ts,
+            tg_handles = send_telegram_buttons(tg_text, user, kept["ts"] if kept else alert_ts,   # [R2 fix, R2C-F2]
                                                claimed=bool(keep_claim[0]))
         else:
             send_telegram(tg_text)
@@ -4941,7 +5737,11 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
     # finished the conversation) must not join the waiting list or get chased:
     # they made closed conversations look unanswered and triggered pointless
     # check-ins to happy customers.
-    if needs_reply:
+    if needs_reply and kept:
+        # [R2 fix, R2C-F2] the row keeps its clocks; the post's copies join it
+        if not buzz_onto_row(user, kept["ts"], tg_handles, tg_text, headline, topic, category, fold_clock):
+            log.warning("Buzz for %s: the open alert changed meanwhile - the post went out on its own", user)
+    elif needs_reply:
         with closing(db()) as conn, conn:
             try:
                 conn.execute(
@@ -4980,6 +5780,12 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
                 "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts, kind)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (user, alert_ts, headline, keep_claim[0], keep_claim[1], kind))
+        if since_ts and 0 < since_ts < alert_ts:
+            # [R2 fix, RT-1 / R2C-F1] the waiting lists age and order this alert by when the customer wrote
+            try:
+                set_setting(f"alert_since:{user}", f"{alert_ts!r}|{since_ts!r}")
+            except Exception:
+                log.exception("Could not keep when %s wrote", user)
         if chain[1] == 3 and chain[2] == alert_ts:
             _ask3_ping(user, headline, label, alert_ts, chain[0])
         mark_person_promised(user, "alert:" + (kind or "?"))
@@ -5076,9 +5882,25 @@ def ask_note_for_user(user: str, now: float = 0.0) -> str:
         with closing(db()) as conn:
             r = conn.execute("SELECT ts, COALESCE(first_ts, 0), COALESCE(ask_count, 0), COALESCE(chain_ts, 0)"
                              " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
-        return ask_note_for_row(r[0] or 0.0, r[1], r[2], r[3], now) if r else ""
+        # [R2 fix, RT-1 / R2C-F1] display only: a chain that began at a stalled-chat alert is "waiting since" they wrote
+        return ask_note_for_row(r[0] or 0.0, alert_since_ts(user, r[1]) if r[1] else r[1], r[2], r[3], now) if r else ""
     except Exception:
         return ""
+
+
+# [Fix 1b item 5, S1-07] A "sorry for the wait" the customer has SEEN, in any of our languages: two
+# a minute apart (the van customer, 2 Oct 13:52 and 13:53) were one ask, so the 16:33 chase was the
+# third apology in under three hours. v2 (CRITIQUE 11): an apology FOR THE WAIT ("for the wait /
+# delay", "to keep you waiting", "taking so long"), never "sorry, I can't say how long", "sorry to hear
+# it's still on so long after" or "the long weekend".
+SORRY_WAIT_RE = re.compile(
+    r"\b(?:sorry|apologi[sz]e|apologies)\b[^.!?\n]{0,30}?\b(?:for (?:the |your |all the |this )?(?:long |late )?"
+    r"(?:wait(?:ing)?|delay)|(?:to keep|for keeping|for making|we['’]ve kept|we have kept|i['’]ve kept) you waiting"
+    r"|(?:it['’]s|it is|this is|that it['’]s|that this is|it['’]s been) taking (?:so )?long"
+    r"|about the (?:wait|delay)|for not (?:getting back|replying|coming back))"
+    r"|\bизвин\w*[^.!?\n]{0,40}(?:ожидан|ждать|задержк)"
+    r"|\bscuz\w*[^.!?\n]{0,40}(?:a[șs]tept|[îi]nt[âa]rzier)"
+    r"|\batsipra[šs]\w*[^.!?\n]{0,40}(?:lauk|v[ėe]lav)", re.IGNORECASE)
 
 
 def unanswered_promises(conn, user: str, since: float) -> int:
@@ -5090,8 +5912,17 @@ def unanswered_promises(conn, user: str, since: float) -> int:
     last one counted. A real staff answer (D4) or the owner's own Telegram reply resets the
     count. A reply the customer never got does not count: NOT DELIVERED, or [R2 fix, S2] a text
     send_whatsapp held back as a duplicate - the same text sent by the bot in the 15 minutes
-    before (any gap), or by staff 5 s to 15 minutes before, exactly its two checks."""
-    n, last_counted = 0, None
+    before (any gap), or by staff 5 s to 15 minutes before, exactly its two checks.
+    [Fix 1b item 5] Every "sorry for the wait" the customer saw counts too (each chase, each
+    delivered promise reply that apologises for the wait), reset by the same answers: the
+    larger count wins (SORRY_COUNT), so a chase is never the third apology."""
+    n, sorry = unanswered_promise_parts(conn, user, since)
+    return max(n, sorry) if SORRY_COUNT else n
+
+
+def unanswered_promise_parts(conn, user: str, since: float) -> tuple:
+    """(asks, apologies seen) for unanswered_promises."""
+    n, last_counted, sorry = 0, None, 0
     seen = []      # (ts, role, text) of every earlier line, for send_whatsapp's dedupe
     for ts, role, content, kind in conn.execute(
             "SELECT ts, role, content, COALESCE(kind, '') FROM messages WHERE wa_user = ? AND ts >= ?"
@@ -5106,18 +5937,20 @@ def unanswered_promises(conn, user: str, since: float) -> int:
             continue          # only there for the dedupe
         if role == "staff":
             if is_real_staff_text(c):
-                n, last_counted = 0, None
+                n, last_counted, sorry = 0, None, 0
             continue
         if kind in ("owner_tg", "owner_book"):
-            n, last_counted = 0, None
+            n, last_counted, sorry = 0, None, 0
         elif c.startswith(UNDELIVERED_PREFIX) or held:
             pass              # the customer never got it, or saw it once already
         elif kind == "chase":
-            n, last_counted = n + 1, ts
+            n, last_counted, sorry = n + 1, ts, sorry + 1
         elif kind in ("", "ack") and is_promise_text(c):
+            if SORRY_WAIT_RE.search(c):
+                sorry += 1    # [Fix 1b item 5] an apology for the wait they have seen
             if last_counted is None or ts - last_counted >= ASK_GAP_MINUTES * 60:
                 n, last_counted = n + 1, ts
-    return n
+    return n, sorry
 
 
 def _ask3_owner_chat() -> tuple:
@@ -5195,6 +6028,9 @@ def chase_preview(user: str, nowts: float) -> tuple:
                     return False, "the bot answered since (the day's last pass)"
             elif moved:
                 return False, "the bot really answered their newest message"
+        if alert_kind(user, alert_ts) == STALL_KIND:
+            return False, ("a colleague was handling this chat (staff_stalled) - staff are told, "
+                           "the customer is not messaged. The note: " + stall_chase_outcome(user, alert_ts, nowts))
         try:
             with closing(db()) as conn:
                 last_in = conn.execute(
@@ -5233,7 +6069,8 @@ def _ask3_ping(user: str, headline: str, label: str, alert_ts: float, first_ts: 
         now = time.time()
         if _ask3_ping_gate(first_ts, now):
             return
-        ok = send_telegram_private(f"{ask_line(first_ts, 3, now)} — nobody has replied yet\n"
+        # [R3 fix, RT-1 twin] 'waiting since' when the customer wrote (the gate's 7 days stay on first_ts)
+        ok = send_telegram_private(f"{ask_line(alert_since_ts(user, first_ts), 3, now)} — nobody has replied yet\n"
                                    f"{headline}\n{label}\nReply: https://wa.me/{user}")
         if ok:
             with closing(db()) as conn, conn:
@@ -5265,6 +6102,11 @@ def alerted_recently(user: str) -> bool:
         took_after = _echo_after(conn, user, row[0]) if row else 0
     if not row or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600:
         return False
+    if row[3] == STALL_KIND:
+        # O1: the stalled-chat alert asked staff to answer an earlier message. It never mutes this
+        # check - in a chat a colleague holds, the only one that sees a turn for the worse as it
+        # happens (the unhappy alert then takes its place, "🔁 2nd ask").
+        return False
     if ((row[1] or 0) < (row[0] or 0) and not staff_after and not booked_after
             and not took_after):
         return True  # still open: nobody has written to them or booked them in since
@@ -5289,6 +6131,10 @@ def alert_dealt_with_at(user: str) -> float:
     if (not row or _is_unhappy_alert(row[2], row[3])
             or time.time() - (row[0] or 0) >= ALERT_COOLDOWN_HOURS * 3600):
         return 0.0
+    if row[3] == STALL_KIND and (row[1] or 0) < (row[0] or 0):
+        # O1: an open stalled-chat alert already put everything before it in front of staff:
+        # judge only what the customer said since (an earlier complaint is not flagged again).
+        return float(row[0] or 0)
     # Before Stage 2a the FIRST colleague echo after the alert (a "Hi" or a 👍 too) or
     # any booking closed it, and a later Done or real reply did not move that point
     # ("Already closed"). Mark the same point: just before that echo, which was saved
@@ -5500,7 +6346,8 @@ def _maybe_courtesy_close(user: str) -> str | None:
     # NEVER reach the customer: a SKIP verdict anywhere in the text (it once put
     # '**SKIP**' at the END of its reasoning and the reasoning got sent), a reply
     # that is one big parenthesised note, or talk about its own internal rules.
-    if (not reply or len(reply) > 600
+    reply = strip_markup_debris(reply)       # [Fix 1b, s6-01] never a reply with no words in it
+    if (not reply or len(reply) > 600 or not reply_has_words(reply)
             or re.search(r"\bSKIP\b", reply)
             or (reply.startswith("(") and reply.endswith(")"))
             or re.search(r"SPECIAL SITUATION|customer's last message|the colleague is handling",
@@ -5538,8 +6385,9 @@ def _maybe_courtesy_close(user: str) -> str | None:
                     "Sent while a colleague was handling the chat - please correct it.", kind="fabricated")
     if not turn_already_alerted(user):
         promise_call = promise_alert_decision(reply, user, raw)
-        if promise_call == "covered" and not note_quiet_repeat(user, _recent_customer_words(user, 1)):
-            promise_call = "alert"
+        if promise_call and assist_fix1b_only(reply, user, raw):
+            promise_call = ""     # [R1 fix, N-2] a deferral to a statement in a colleague's chat: nothing, as live
+        promise_call = settle_promise_call(promise_call, user)   # F3, Fix 1b item 4
         if promise_call == "alert":
             notify_owner_handover(user, {"reason": "the bot told this customer that a "
                                                    "person would come back to them"})
@@ -5800,8 +6648,8 @@ WELCOME_HINT = (
     "\n\nThis is the customer's FIRST message to us here.\n"
     "IF their message is just a greeting or vague (\"hi\", \"hello\", \"are you open?\"), "
     "reply with ONE short friendly welcome line in this style (in their language): "
-    "\"Hi \U0001F44B Welcome to NCTPass! Just message us here anytime and I'll help "
-    "you right here \U0001F44D — a service, NCT repair, or a quick question?\"\n"
+    "\"Hi \U0001F44B Welcome to NCTPass! Message us here anytime and I'll help "
+    "\U0001F44D — a service, NCT repair, or a quick question?\"\n"
     "BUT IF their first message already tells you what they want — especially if they "
     "mention an existing booking, an appointment, a car they've dropped in, or any "
     "specific question — do NOT use that welcome line at all. It makes us look like we "
@@ -7979,9 +8827,10 @@ def _finish_reply(user: str, answer: str) -> str:
             and not (ack_turn and open_alert_for_ack(user))):
         promise_call = promise_alert_decision(answer or "", user, raw_answer)
         # F3: a trusted open alert covers this repeat - update it quietly; if that
-        # fails, raise the alert (never quiet by accident).
-        if promise_call == "covered" and not note_quiet_repeat(user, _recent_customer_words(user, 1)):
-            promise_call = "alert"
+        # fails, raise the alert (never quiet by accident). [Fix 1b item 4] A repeat only the
+        # Fix 1 list sees is folded in quietly too ('fold_only': nothing if that fails), and a
+        # repeat with a deadline or about money raises its own alert that says why ('buzz:').
+        promise_call = settle_promise_call(promise_call, user)
     if promise_call == "alert":
         log.warning("Reply to %s promised a person with no HANDOVER marker — alerting anyway", user)
         try:
@@ -8017,6 +8866,21 @@ def _finish_reply(user: str, answer: str) -> str:
         log.warning("Reply for %s looked like internal deliberation — dropped: %r",
                     user, answer[:200])
         answer = ""
+    # [Fix 1b, s6-01] Markup debris never goes out, and a reply with no words in it ("</![CDATA[",
+    # garage …4459, 2 Oct) is never sent: with a HANDOVER on this turn (its alert is already raised)
+    # the holding line goes, with no second alert; on a thank-you turn the short close in their
+    # language (Fix 1's thank-you rule: no new promise, and no alert - live sent the junk with none);
+    # on any other turn it is a blank reply: the fallback line and the blank alert below.
+    if answer.strip() and not reply_has_words(answer):
+        log.warning("Reply for %s had no words in it - not sent: %r", user, answer[:120])
+        if handover is not None:
+            answer = BLANK_REPLY_FALLBACK
+        elif ack_turn:
+            answer = ack_short_close(user, raw_answer)
+        else:
+            answer = ""
+    else:
+        answer = strip_markup_debris(answer)
     if not answer.strip():
         log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
                     user, (raw_answer or "")[:300])
@@ -8332,8 +9196,15 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
         if r.status_code >= 300 or '"error"' in (r.text or ""):
             log.warning("WhatsApp send to %s: HTTP %s %s", to, r.status_code, (r.text or "")[:400])
         r.raise_for_status()
-    except Exception:
+    except Exception as exc:
         log.exception("Failed to send WhatsApp message to %s", to)
+        return _o2_failed_send(exc)   # O2: "" = it never got there, O2_UNSURE = it may have
+    # O2: the message id ("" = refused in the 200 body), remembered so that a refusal on the
+    # statuses webhook marks THIS line (report_failed_delivery). Callers that ignore it are
+    # unchanged; None still means nothing went (an empty or a duplicate text).
+    wamid = _o2_wamid(r)
+    _o2_remember(to, text, wamid)
+    return wamid
 
 def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
     """send_whatsapp for a message the owner approved in Telegram: the same checks and
@@ -8382,6 +9253,7 @@ def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
             wamid = ((r.json().get("messages") or [{}])[0].get("id") or "")
         except Exception:
             wamid = ""
+        _o2_remember(to, text, wamid)   # O2: a refusal marks this line
         return wamid or "sent", ""
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         log.exception("Owner's message to %s failed", to)
@@ -8390,6 +9262,796 @@ def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
         # A read timeout or a dropped connection: the request may already be with WhatsApp.
         log.exception("Owner's message to %s failed", to)
         return "", "unsure: " + type(exc).__name__
+
+# ---------------------------------------------------------------- O2: the 24-hour window
+# WhatsApp delivers a free-form text only within 24 hours of the customer's OWN last message.
+# A caller who has only ever phoned has no window at all: every written phone-booking
+# confirmation since refusals were first marked (16 Sep: 23 of 23 in the chats) and every
+# missed-call text-back on 1-2 Oct (7 of 7) was refused with 131047, and all a person got was
+# one plain "NOT DELIVERED - please ring them" Telegram line, with no booking and no Done
+# button. O2 step 1 (owner, 2 Oct 2026): never send what WhatsApp will refuse - tell a person
+# what to do instead. The window is judged from their own last message, as the chase and the owner's
+# Telegram replies judge it (_owner_window_problem; a phone message the voice agent took does not
+# count) - [R3 fix, U-1] but on WhatsApp's real 24 hours less 2 minutes of clock skew
+# (O2_WINDOW_SECONDS), not the chase's 15-minute margin: in that margin WhatsApp still delivers, and
+# O2 withholds only what WhatsApp would REFUSE (owner, 2 Oct). The two real waiting-list offers live
+# delivered since refusals were marked (…690, …811, 3-5 Oct) were both 23.9 h after the waiter's last
+# message. A refusal in the last minutes is still caught by report_failed_delivery (live's NOT
+# DELIVERED line; a read-back for a phone confirmation).
+# CALLER_WINDOW_CHECK=0 sends every one of these texts as before and drops the read-back task
+# and the status lines. WAMID_MATCH=0 marks a refused line as before (the newest bot line of
+# the last 15 minutes). VOICE_CAR_TIDY=0 keeps the phone agent's car field as it came. All
+# three at 0 = today's behaviour. The template names stay empty until Meta approves the
+# templates (step 2): with one set, a closed window gets that template instead.
+CALLER_WINDOW_CHECK = _env_on("CALLER_WINDOW_CHECK")
+O2_WINDOW_SECONDS = 24 * 3600 - 120      # [R3 fix, U-1] WhatsApp's own 24 h, less 2 min of clock skew
+# A WhatsApp CALL to us may itself open the 24-hour window - not verified: every refusal in
+# the chats followed a phone-network (Retell) call. So the WhatsApp-call text-back goes as
+# before until a delivery check shows it is refused; WA_CALL_WINDOW_CHECK=1 then judges it too.
+WA_CALL_WINDOW_CHECK = os.environ.get("WA_CALL_WINDOW_CHECK", "0").strip().lower() in (
+    "1", "on", "true", "yes")
+WAMID_MATCH = _env_on("WAMID_MATCH")
+VOICE_CAR_TIDY = _env_on("VOICE_CAR_TIDY")
+PHONE_CONFIRM_TEMPLATE = os.environ.get("PHONE_CONFIRM_TEMPLATE", "").strip()
+MISSED_CALL_TEMPLATE = os.environ.get("MISSED_CALL_TEMPLATE", "").strip()
+O2_TEMPLATE_LANG = os.environ.get("O2_TEMPLATE_LANG", "en").strip() or "en"
+# The read-back is a TASK (the Stage 1c tasks table, kind phone_confirm): one row per phone
+# and booking day, its own Done button, never touched by the customer's alerts row (a phone
+# message or a handover for the same caller cannot overwrite it, nor it them). Posted 8am-8pm
+# (a night booking at 8am). Its reminder ladder starts at 8am on the
+# PHONE_CONFIRM_LADDER_DAYS-th working day before the drop-off (1 = the last working day
+# before it; Sundays and bank holidays skipped, Saturday until 2pm): raised before that day,
+# ONE "still not read back - they come in tomorrow" repost then; raised on or after it, the
+# 30-minute repost and the 2-hour owner ping of every alert. -1 = never a reminder.
+PHONE_CONFIRM_LADDER_DAYS = _env_int("PHONE_CONFIRM_LADDER_DAYS", 1)
+READBACK_KIND = "phone_confirm"
+READBACK_HEADLINE = "📞 PHONE BOOKING — ring them to read it back"
+READBACK_AUTO = ("the day has passed", "the booking is no longer in the diary")
+# [R1 fix, R-3] closures that are nobody's read-back: the read-back's own (READBACK_AUTO), those live's task
+# ticker writes if O2 is ever reverted (_task_settled, _task_called_off) and the rollback runbook's 'reverted'
+READBACK_NOT_A_PERSON = READBACK_AUTO + ("it's in the diary now", "no date", "they said they're not coming that day",
+                                          "a colleague told them no", "reverted")
+O2_TEMPLATE_SENT = "template"
+O2_UNSURE = "unsure"       # a send that may have reached WhatsApp (a timeout, a 5xx)
+_O2_SENT: dict = {}        # wamid -> (number, sent ts, hash of the words, kind)
+_O2_SENT_LOCK = threading.Lock()
+_O2_SENT_KEEP = 6 * 3600
+_O2_COUNTS: collections.Counter = collections.Counter()   # how refusals were matched
+_O2_EVENING_TOLD: dict = {}   # evening reg check: number -> the evening a person was told
+
+
+def o2_switches() -> dict:
+    """The O2 switches as this process read them at start (for ?action=windowcheck)."""
+    return {"CALLER_WINDOW_CHECK": CALLER_WINDOW_CHECK, "WA_CALL_WINDOW_CHECK": WA_CALL_WINDOW_CHECK,
+            "WAMID_MATCH": WAMID_MATCH, "VOICE_CAR_TIDY": VOICE_CAR_TIDY,
+            "PHONE_CONFIRM_TEMPLATE": PHONE_CONFIRM_TEMPLATE,
+            "MISSED_CALL_TEMPLATE": MISSED_CALL_TEMPLATE, "O2_TEMPLATE_LANG": O2_TEMPLATE_LANG,
+            "PHONE_CONFIRM_LADDER_DAYS": PHONE_CONFIRM_LADDER_DAYS}
+
+
+def caller_window_problem(number: str) -> str:
+    """Why WhatsApp would refuse a free-form text to this number now - "" = it will take it.
+    Always "" while CALLER_WINDOW_CHECK=0 (send, as before). Never raises: unsure counts as
+    closed, so a person rings rather than a text going nowhere. The number in any format
+    ("087...", "+353 87...") is judged on the key the chats use (normalize_phone)."""
+    if not CALLER_WINDOW_CHECK:
+        return ""
+    digits = normalize_phone(number)
+    if not digits:
+        return "there is no number to text"
+    try:
+        blocked = is_blocked(digits)
+    except Exception:
+        blocked = False
+    if blocked:
+        # [R2 fix, P2-1] the bot drops a blocklisted number's messages unsaved, so its window always looked closed
+        # ("they last wrote <weeks ago>"): say why instead. A person still rings and reads it back.
+        return ("this number is on the bot's block list, so the bot never sees their WhatsApp messages and cannot "
+                "tell if a text would reach them - the team deals with them directly")
+    try:
+        return _owner_window_problem(digits, O2_WINDOW_SECONDS)     # [R3 fix, U-1]
+    except Exception:
+        log.exception("Window check failed for %s", digits)
+        return "I couldn't check when they last wrote"
+
+
+_O2_COLOUR = (r"black|white|silver|grey|gray|red|blue|green|yellow|orange|gold|brown|beige|"
+              r"maroon|navy|purple|bronze|champagne|burgundy|cream")
+_O2_COLOUR_EDGE_RE = re.compile(
+    rf"^(?:(?:dark|light|metallic)\s+)?(?:{_O2_COLOUR})\s*,?\s+"
+    rf"|\s*,?\s+(?:(?:dark|light|metallic)\s+)?(?:{_O2_COLOUR})(?:\s+metallic)?$", re.IGNORECASE)
+
+
+def voice_car(car: str) -> str:
+    """The phone agent's car field as make and model: one stand-alone colour at the start or
+    the end goes ("Volkswagen Passat black", 2 Oct, went into the diary, the calendar, the
+    evening report and the reminder). Never empties the field; "Black Edition", "Bluemotion",
+    "Greenline", "Blue Lion" and a car called just "Red" stay as they are."""
+    c = " ".join(str(car or "").split())
+    if not VOICE_CAR_TIDY or not c:
+        return str(car or "").strip()
+    return _O2_COLOUR_EDGE_RE.sub("", c).strip(" ,") or c
+
+
+def _o2_words_hash(text: str) -> str:
+    """The words of a line, whitespace and the NOT DELIVERED mark ignored."""
+    flat = " ".join(str(text or "").split())
+    mark = " ".join(UNDELIVERED_PREFIX.split())
+    if flat.startswith(mark):
+        flat = flat[len(mark):].strip()
+    return hashlib.sha1(flat.encode("utf-8")).hexdigest()[:16]
+
+
+def _o2_wamid(r) -> str:
+    """What a send's reply says: the message id; "sent" when WhatsApp took it with no id in
+    the reply; "" when it was refused (an error in the 200 body - Chakra answers 200 for
+    those - or a 3xx/4xx); O2_UNSURE for a 5xx gateway error (it may already be through)."""
+    body = r.text or ""
+    if r.status_code >= 500:
+        return O2_UNSURE
+    if r.status_code >= 300 or '"error"' in body:
+        return ""
+    try:
+        return (r.json().get("messages") or [{}])[0].get("id") or "sent"
+    except Exception:
+        return "sent"
+
+
+def _o2_failed_send(exc) -> str:
+    """A send that raised, read as send_whatsapp_checked reads it: "" = WhatsApp certainly does
+    not have it (it never reached Chakra, or a 3xx/4xx refusal); O2_UNSURE = it may well have
+    it (a read timeout, a dropped connection, a 5xx). Unsure is never marked NOT DELIVERED."""
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return ""
+    code = getattr(getattr(exc, "response", None), "status_code", 0) or 0
+    if 300 <= code < 500:
+        return ""
+    return O2_UNSURE
+
+
+def _o2_remember(to: str, text: str, wamid: str, kind: str = "") -> None:
+    """Remember a send WhatsApp took, so its refusal (a minute later, on the statuses webhook)
+    marks THIS line. Memory only: a restart forgets the last few hours, which then fall back
+    to the rule before O2."""
+    if not wamid or wamid in ("sent", O2_UNSURE):
+        return
+    now = time.time()
+    with _O2_SENT_LOCK:
+        if len(_O2_SENT) > 500:
+            for k in [k for k, v in _O2_SENT.items() if now - v[1] > _O2_SENT_KEEP]:
+                _O2_SENT.pop(k, None)
+        _O2_SENT[wamid] = ("".join(ch for ch in str(to) if ch.isdigit()), now,
+                           _o2_words_hash(text), kind)
+
+
+def o2_sent(wamid, kind: str):
+    """Tag a send just made (phone_confirm, phone_regcheck, textback; "nosave" for a text that
+    is never saved as a chat line) so a refusal is reported as what it was. Returns wamid."""
+    if wamid:
+        with _O2_SENT_LOCK:
+            v = _O2_SENT.get(wamid)
+            if v:
+                _O2_SENT[wamid] = v[:3] + (kind,)
+    return wamid
+
+
+def _o2_sent_kind(wamid: str) -> str:
+    v = _O2_SENT.get(wamid or "")
+    return v[3] if v else ""
+
+
+def o2_saved_text(text: str, wamid) -> str:
+    """The words to save for a send: as sent - or marked NOT DELIVERED when WhatsApp certainly
+    did not take it ("" back: no statuses webhook will ever mark it). None (nothing sent: an
+    empty or a duplicate text) and O2_UNSURE (it may be through) save the words, as before."""
+    if wamid == "" and WAMID_MATCH:
+        return UNDELIVERED_PREFIX + text
+    return text
+
+
+def _o2_refused_row(conn, digits: str, wamid: str):
+    """The saved bot line WhatsApp just refused, as (id, content), or None.
+    By the message id when this process sent it: the line saved with the same words within
+    15 minutes of the send, else the nearest line saved within 2 minutes of it that no OTHER
+    remembered send owns - so a phone confirmation and its reg check refused together are BOTH
+    marked (21 Sep: only the second was), and the bot's answer next to a refused text that is
+    never saved (the evening reg check: kind "nosave") is not. A refused day-before reminder
+    marks no chat line (the retry below handles it). Otherwise - sent before a restart, from
+    the app, or WAMID_MATCH=0 - the rule before O2: the newest non-reminder bot line of 15 min."""
+    sent = _O2_SENT.get(wamid) if (WAMID_MATCH and wamid) else None
+    if sent:
+        num, sent_ts, words, kind = sent
+        if kind == "nosave":
+            _O2_COUNTS["by_id_nosave"] += 1
+            return None
+        rows = conn.execute(
+            "SELECT id, content, ts FROM messages WHERE wa_user = ? AND role = 'assistant'"
+            " AND COALESCE(kind,'') <> 'reminder' AND ts >= ? AND ts <= ? ORDER BY id",
+            (digits, sent_ts - 900, sent_ts + 900)).fetchall()
+        with _O2_SENT_LOCK:
+            others = {v[2] for k, v in _O2_SENT.items()
+                      if k != wamid and v[0] == num and abs(v[1] - sent_ts) <= 900}
+        same = [r for r in rows if _o2_words_hash(r[1]) == words]
+        near = [r for r in rows if abs((r[2] or 0) - sent_ts) <= 120
+                and _o2_words_hash(r[1]) not in others]
+        pick = same or near
+        _O2_COUNTS["by_id" if same else ("by_id_nearest" if near else "by_id_no_line")] += 1
+        if not pick:
+            return None
+        best = min(pick, key=lambda r: abs((r[2] or 0) - sent_ts))
+        return best[0], best[1]
+    if WAMID_MATCH and wamid and conn.execute(
+            "SELECT 1 FROM bookings WHERE COALESCE(reminder_wamid, '') = ? LIMIT 1", (wamid,)).fetchone():
+        _O2_COUNTS["reminder"] += 1
+        return None
+    _O2_COUNTS["fallback"] += 1
+    return conn.execute(
+        "SELECT id, content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+        " AND COALESCE(kind,'') <> 'reminder'"
+        " AND ts > ? ORDER BY id DESC LIMIT 1",
+        (digits, time.time() - 900)).fetchone()
+
+
+def _send_o2_template(to: str, name: str, params: list, saved_text: str = "") -> str:
+    """An approved WhatsApp template - the only message that reaches a number outside the
+    24-hour window (step 2; dormant while the name is empty). The message id, "" when it is
+    switched off or refused, O2_UNSURE when the reply never said. As _send_reminder_in, from
+    the line they last used, else the text-back line; each value one line, never empty (Meta
+    refuses blank or multi-line ones)."""
+    if not name:
+        return ""
+    vals = [(" ".join(str(p or "").split())[:100] or "-") for p in params]
+    try:
+        url, tok = send_endpoint(phone_id_for_customer(to) or TEXTBACK_PHONE_ID)
+        body = {"name": name, "language": {"code": O2_TEMPLATE_LANG}}
+        if vals:
+            body["components"] = [{"type": "body",
+                                   "parameters": [{"type": "text", "text": v} for v in vals]}]
+        r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
+                       json={"messaging_product": "whatsapp", "to": to, "type": "template",
+                             "template": body}, timeout=30)
+        wamid = _o2_wamid(r)
+        if wamid in ("", O2_UNSURE):
+            log.warning("Template %s to %s refused or unsure: HTTP %s %s", name, to, r.status_code,
+                        (r.text or "")[:300])
+        _o2_remember(to, saved_text, wamid, "template")
+        return wamid
+    except Exception as exc:
+        log.exception("Template %s to %s failed", name, to)
+        return _o2_failed_send(exc)
+
+
+def _o2_day_label(day: str) -> str:
+    try:
+        return date.fromisoformat(day).strftime("%a %d %b")
+    except (TypeError, ValueError):
+        return day or "no date"
+
+
+def send_phone_confirm_template(fields: dict) -> bool:
+    """Step 2: the written confirmation as the approved template. False while
+    PHONE_CONFIRM_TEMPLATE is empty (step 1), when it is refused, or when the reply never
+    said (then a person reads it back as well - a call too many, never one too few)."""
+    phone = normalize_phone(fields.get("phone"))
+    if not (PHONE_CONFIRM_TEMPLATE and phone):
+        return False
+    car = clean_car(fields.get("car", "")) or "your car"
+    reg = clean_reg(fields.get("reg", "")) or "not captured"
+    job = " ".join(str(fields.get("need") or "").split())[:60] or "the job we discussed"
+    day = _o2_day_label(fields.get("date", ""))
+    saved = (f"[Template: phone booking confirmation] Car: {car}, Reg: {reg}, Job: {job}, "
+             f"Date: {day}, drop-off between 9 and 11am")
+    wamid = _send_o2_template(phone, PHONE_CONFIRM_TEMPLATE,
+                              [_reminder_name(fields.get("name", "")), car, reg, job, day], saved)
+    if wamid and wamid != O2_UNSURE:
+        try:
+            save_message(phone, "assistant", saved)
+        except Exception:
+            # [R1 fix, R-2] the template has gone: a failed chat-history write must not fail the phone call
+            log.exception("Saving the phone-confirm template line failed for %s", phone)
+        return True
+    return False
+
+
+def send_missed_call_template(digits: str) -> bool:
+    """Step 2: "sorry we missed your call" as the approved template. False while
+    MISSED_CALL_TEMPLATE is empty (step 1), when it is refused or when the reply never said."""
+    if not MISSED_CALL_TEMPLATE:
+        return False
+    saved = "[Template: sorry we missed your call] " + MISSED_CALL_TEXT
+    wamid = _send_o2_template(digits, MISSED_CALL_TEMPLATE, [], saved)
+    if wamid and wamid != O2_UNSURE:
+        save_message(digits, "assistant", saved, kind="textback")
+        return True
+    return False
+
+
+def phone_confirm_blocked(fields: dict) -> str:
+    """Before the written phone-booking confirmation: "" = send it as before (the window is
+    open, the switch is off, or a landline - that keeps its own ring-them line); else why a
+    person must ring them and read it back instead. With the template switched on (step 2) a
+    closed window gets the template, and O2_TEMPLATE_SENT comes back when it went."""
+    phone = normalize_phone(fields.get("phone"))
+    if not phone or not is_mobile(phone):
+        return ""
+    why = caller_window_problem(phone)
+    if why and send_phone_confirm_template(fields):
+        return O2_TEMPLATE_SENT
+    return why
+
+
+def _readback_why_line(why: str) -> str:
+    """[R3 fix, W-5] The read-back's reason line, by what really happened: "Not texted" only when no text went (a
+    closed window, the block list, an unreadable window); a send WhatsApp refused is "Not delivered"; an unsure send
+    (a timeout / 5xx) says it was sent; a refused reg check says the confirmation went - the person ringing is never
+    told a customer has nothing in writing when they have."""
+    w = " ".join(str(why or "").split()).rstrip(".")
+    if w.startswith("WhatsApp may not have taken"):
+        return f"Texted, but not sure it arrived: {w}."
+    if w.startswith(("WhatsApp did not take the reg check", "WhatsApp refused the reg check")):
+        return f"Confirmation texted; {w} — check the reg on the call."
+    if w.startswith(("WhatsApp did not take", "WhatsApp refused")):
+        return f"Not delivered: {w}."
+    return f"Not texted: {w}."
+
+
+def _readback_lines(fields: dict, why: str, calendar_missed: bool = False) -> list:
+    """What the person who rings needs: the booking, why it was not texted, what to do."""
+    name = (fields.get("name") or "").strip()
+    if bad_customer_name(name):
+        name = ""
+    car_reg = " ".join(f"{clean_car(fields.get('car', '')) or '(no car)'} "
+                       f"{clean_reg(fields.get('reg', '')) or '(no reg)'}".split())
+    job = " ".join(str(fields.get("need") or "").split())[:80] or "(no job given)"
+    lines = [f"{name or '(no name)'} — {car_reg} — {job}",
+             f"Booked for {_o2_day_label(fields.get('date', ''))}, drop-off 9-11am.",
+             _readback_why_line(why),      # [R3 fix, W-5]
+             "Ring them, read back the car, reg, JOB and day, then press Done."]
+    if reg_needs_confirming(fields.get("reg", "")):
+        lines.append("⚠️ The reg looks unusual — check it on the call.")
+    if fields.get("wanted"):
+        lines.append(f"📋 They wanted {_o2_day_label(fields['wanted'])} — on the cancellation list.")
+    if calendar_missed:
+        lines.append("⚠️ The calendar did NOT take it — please add it by hand.")
+    return lines
+
+
+def _readback_text(user: str, day: str, sentence: str) -> tuple:
+    """(headline, full Telegram text) of a read-back task."""
+    return READBACK_HEADLINE, (f"{READBACK_HEADLINE}\n{customer_label(user)}\n{sentence}\n"
+                               f"☎️ +{user}\nChat: https://wa.me/{user}")
+
+
+def phone_readback(fields: dict, why: str, voice_cal=None, reopen: bool = True) -> bool:
+    """The caller could not be sent the written confirmation, so a person rings them and
+    reads it back: ONE task (kind phone_confirm) per phone and booking day, with its own Done
+    button and ladder (tick_readbacks). Only a database write here - it runs inside the live
+    phone call; the Telegram goes from the next minute's tick. An open one for that day is
+    left as it is (one task per booking: a second refusal folds into it); one closed earlier
+    opens again for a new booking of that day (reopen). True when a person is told. Never
+    raises: if the task cannot be written, the text goes as a plain Telegram line now."""
+    if not why or why == O2_TEMPLATE_SENT or not CALLER_WINDOW_CHECK:
+        return False
+    phone = normalize_phone(fields.get("phone"))
+    day = str(fields.get("date") or "").strip()
+    if not phone:
+        return False
+    try:
+        missed = voice_cal is not None and calendar_enabled() and not voice_cal
+    except Exception:
+        missed = False
+    try:
+        sentence = "\n".join(_readback_lines(fields, why, missed))
+    except Exception:
+        log.exception("Read-back lines failed for %s", phone)
+        sentence = f"Booked for {day or 'a day'} by phone.\n{_readback_why_line(why)}"   # [R3 fix, W-5]
+    now = time.time()
+    try:
+        with closing(db()) as conn, conn:
+            row = conn.execute("SELECT id, COALESCE(closed_ts, 0) FROM tasks WHERE kind = ?"
+                               " AND wa_user = ? AND date = ?", (READBACK_KIND, phone, day)).fetchone()
+            if not row:
+                conn.execute(   # OR IGNORE: two refusals at once find one row (idx_task_key)
+                    "INSERT OR IGNORE INTO tasks (kind, wa_user, date, how, source, sentence,"
+                    " created_ts, due_ts, said_ts) VALUES (?, ?, ?, ?, 'voice', ?, ?, ?, ?)",
+                    ("phone_confirm", phone, day, why[:200], sentence, now, now, now))
+            elif row[1] and reopen:
+                conn.execute(
+                    "UPDATE tasks SET closed_ts = 0, closed_by = '', created_ts = ?, due_ts = ?,"
+                    " said_ts = ?, posted_ts = 0, escalated_ts = 0, owner_ts = 0, tg_msgs = '',"
+                    " tg_text = '', headline = '', how = ?, sentence = ? WHERE id = ?",
+                    (now, now, now, why[:200], sentence, row[0]))
+        log.warning("Read-back task for %s on %s: %s", phone, day, why)
+        return True
+    except Exception:
+        log.exception("Read-back task failed for %s - plain line instead", phone)
+        try:
+            send_telegram(f"{READBACK_HEADLINE}\n+{phone}\n{sentence}")
+        except Exception:
+            log.exception("Read-back plain line failed for %s", phone)
+        return True
+
+
+def readback_open(phone: str, day: str) -> bool:
+    """Is there an open read-back task for this phone and booking day?"""
+    try:
+        with closing(db()) as conn:
+            return bool(conn.execute(
+                "SELECT 1 FROM tasks WHERE kind = ? AND wa_user = ? AND date = ?"
+                " AND COALESCE(closed_ts, 0) = 0", (READBACK_KIND, normalize_phone(phone),
+                                                    str(day or "").strip())).fetchone())
+    except Exception:
+        return False
+
+
+def readback_add_line(phone: str, day: str, line: str) -> bool:
+    """Put one more thing for the caller onto their open read-back task (the register
+    mismatch), instead of a separate Telegram line the person ringing may not see. Edits the
+    posted copies in place (a Telegram edit never buzzes; the Done button stays). False when
+    there is no open task - the caller then sends its own line. Never raises."""
+    try:
+        user = normalize_phone(phone)
+        with closing(db()) as conn, conn:
+            row = conn.execute(
+                "SELECT id, sentence, posted_ts, tg_msgs, created_ts FROM tasks WHERE kind = ?"
+                " AND wa_user = ? AND date = ? AND COALESCE(closed_ts, 0) = 0",
+                (READBACK_KIND, user, str(day or "").strip())).fetchone()
+            if not row:
+                return False
+            tid, sentence, posted, tg_msgs, created = row
+            sentence = (sentence or "") + "\n" + line
+            conn.execute("UPDATE tasks SET sentence = ? WHERE id = ?", (sentence, tid))
+        if posted and tg_msgs:
+            _h, text = _readback_text(user, day, sentence)
+            _edit_alert_copies(tg_msgs, text, task_keyboard(tid, created or 0))
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE tasks SET tg_text = ? WHERE id = ?", (text, tid))
+        return True
+    except Exception:
+        log.exception("Could not add to the read-back of %s", phone)
+        return False
+
+
+def phone_readback_after_refusal(digits: str, kind: str, detail: str) -> bool:
+    """WhatsApp refused a phone-booking confirmation (or its reg check) that went out with the
+    window open: the read-back task for that booking, once - the second refusal finds it open,
+    and one a person already pressed Done on stays done. False = no booking found, so the
+    generic NOT DELIVERED line goes instead."""
+    if not CALLER_WINDOW_CHECK or not digits:
+        return False
+    phone = normalize_phone(digits)
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT name, car, reg, need, date, COALESCE(created_ts, 0) FROM bookings WHERE"
+                " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+                " AND COALESCE(created_ts, 0) > ? ORDER BY created_ts DESC, id DESC LIMIT 1",
+                ("%" + phone[-9:], time.time() - 6 * 3600)).fetchone()
+            # [R1 fix, R-1] the read-back already there for this phone and day: one closed for THIS booking
+            # (Done pressed, then the reg check's refusal came) stays done; one left from an EARLIER booking
+            # of that day (cancelled or moved, then booked again) is raised again for this one - live told
+            # a person ("NOT DELIVERED - please ring them")
+            old = conn.execute("SELECT COALESCE(created_ts, 0), COALESCE(closed_ts, 0) FROM tasks WHERE kind = ?"
+                               " AND wa_user = ? AND date = ?",
+                               (READBACK_KIND, phone, str(row[4] or "").strip())).fetchone() if row else None
+    except Exception:
+        log.exception("Could not find the phone booking of %s", phone)
+        return False
+    if not row:
+        return False
+    fields = dict(zip(("name", "car", "reg", "need", "date"), row[:5]))
+    fields["phone"] = phone
+    what = "the written confirmation" if kind == "phone_confirm" else "the reg check"
+    again = bool(old and old[1] and (old[0] or 0) < (row[5] or 0))
+    return phone_readback(fields, f"WhatsApp refused {what} ({detail})", reopen=again)
+
+
+def _o2_work_day(d) -> bool:
+    """A day somebody is at work to ring: not a Sunday, not a bank holiday we are shut."""
+    return d.weekday() != 6 and not bank_holiday_shut(d)
+
+
+def _o2_working(ts: float) -> bool:
+    """Working time for the read-back ladder: 8am-8pm (the alert ladder's hours), Saturday
+    8am-2pm (we close at 2), never a Sunday or a bank holiday."""
+    local = datetime.fromtimestamp(ts, now_local().tzinfo)
+    if not _o2_work_day(local.date()):
+        return False
+    return 8 <= local.hour < (14 if local.weekday() == 5 else 20)
+
+
+def _o2_ladder_from(day: str, posted: float) -> float:
+    """When the read-back's ladder starts: 8am on the PHONE_CONFIRM_LADDER_DAYS-th working day
+    before the drop-off, or the post if that is later. 0 = never (-1)."""
+    if PHONE_CONFIRM_LADDER_DAYS < 0:
+        return 0.0
+    try:
+        d = date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return posted or 0.0
+    x, k, guard = d, 0, 0
+    while k < PHONE_CONFIRM_LADDER_DAYS and guard < 400:
+        x -= timedelta(days=1)
+        guard += 1
+        if _o2_work_day(x):
+            k += 1
+    start = datetime(x.year, x.month, x.day, 8, 0, tzinfo=now_local().tzinfo).timestamp()
+    return max(posted or 0.0, start)
+
+
+def _readback_settled(user: str, day: str, today, booked: set) -> str:
+    """Why an open read-back can close by itself ("" = still open): only hard facts. A day
+    that cannot be read closes nothing - then only Done does (it has the full ladder).
+    booked = {(day, last 9 digits of the phone)} of the diary from yesterday on."""
+    try:
+        if date.fromisoformat(day) < today:
+            return "the day has passed"
+    except (TypeError, ValueError):
+        return ""
+    return "" if (day, user[-9:]) in booked else "the booking is no longer in the diary"
+
+
+def _o2_when(day: str, today) -> str:
+    try:
+        n = (date.fromisoformat(day) - today).days
+    except (TypeError, ValueError):
+        return day or "soon"
+    return "today" if n == 0 else "tomorrow" if n == 1 else _o2_day_label(day)
+
+
+def _o2_for(secs: float, since: float) -> str:
+    """[R3 fix, W-3] How long a read-back has waited, as a mechanic reads it: '95 min', then '43h (since Sat 13:01)'
+    and '2 days (since Sat 13:01)' - the ladder skips Sundays and bank holidays, so it can be days, never '2580 min'."""
+    mins = int(max(0.0, secs or 0.0) / 60)
+    if mins < 120:
+        return f"{mins} min"
+    hrs = mins // 60
+    try:
+        when = " (since " + datetime.fromtimestamp(since, now_local().tzinfo).strftime("%a %H:%M") + ")"
+    except Exception:
+        when = ""
+    return (f"{hrs}h" if hrs < 48 else f"{hrs // 24} days") + when
+
+
+def tick_readbacks() -> None:
+    """Every minute, with tick_tasks: the phone-booking read-backs (tasks of kind
+    phone_confirm). Closes those the diary settled (the day has passed, the booking is gone),
+    posts new ones 8am-8pm with their Done button, then the ladder in working time: a
+    read-back raised before its ladder day gets ONE "still not read back - they come in
+    tomorrow" repost on that day; one raised on or after it (today's or tomorrow's drop-off)
+    the 30-minute repost and the 2-hour owner ping, as every alert. Never a chase note: there
+    is nobody to chase on WhatsApp."""
+    now = time.time()
+    local = now_local()
+    today = local.date()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, wa_user, date, sentence, created_ts, due_ts, posted_ts, escalated_ts,"
+            " owner_ts FROM tasks WHERE kind = ? AND COALESCE(closed_ts, 0) = 0"
+            " AND created_ts > ?", (READBACK_KIND, now - 60 * 86400)).fetchall()
+        # One read of the diary per tick, not one connection per read-back.
+        booked = {(str(d or ""), "".join(ch for ch in str(p or "") if ch.isdigit())[-9:])
+                  for d, p in conn.execute("SELECT date, phone FROM bookings WHERE date >= ?",
+                                           ((today - timedelta(days=1)).isoformat(),)).fetchall()}
+    for tid, user, day, sentence, created, due, posted, esc, own in rows:
+        try:
+            why = _readback_settled(user, day, today, booked)
+            if why == "the day has passed" and not posted:
+                # [R2 fix, P2-3] a read-back nobody was ever shown is never closed unseen: once to the staff chats
+                try:
+                    _h, text = _readback_text(user, day, (sentence or "") + "\n⚠️ Their booked day has passed and "
+                                              "nobody read it back — ring them to rebook.")
+                    send_telegram(text)
+                    with closing(db()) as conn, conn:
+                        conn.execute("UPDATE tasks SET posted_ts = ? WHERE id = ?", (now, tid))
+                except Exception:
+                    log.exception("Read-back %s: the last post failed", tid)
+            if why:
+                _toast, after = close_task(tid, why, auto=True)
+                if after:
+                    after()
+                continue
+            if not posted:
+                # [R2 fix, P2-3] 8am-8pm, except a booking for today (or a day already gone): it posts at any hour - a
+                # same-day phone booking after 20:00 would otherwise close at midnight unseen (live's instant PHONE
+                # BOOKING note is suppressed because this read-back was raised). A day that cannot be read waits.
+                # [R3 fix, D-1 = B-3] ...once that day is past 20:00: an evening booking for TOMORROW (and one taken
+                # 00:00-08:00 for that morning) waits for 08:00, before the 9-11 drop-off - O2's "a night booking at
+                # 8am" - instead of a midnight post with its ladder counted from midnight
+                today_iso = today.isoformat()
+                due_now = bool(re.match(r"\d{4}-\d{2}-\d{2}$", str(day or ""))) and (
+                    str(day) < today_iso or (str(day) == today_iso and local.hour >= 20))
+                if now < (due or 0) or (not (8 <= local.hour < 20) and not due_now):
+                    continue
+                headline, text = _readback_text(user, day, sentence or "")
+                handles = send_telegram_buttons(text, user, created or now,
+                                                keyboard=task_keyboard(tid, created or now))
+                if not handles and TELEGRAM_BOT_TOKEN and telegram_chat_ids():
+                    # As tick_tasks: try again in 5 minutes; after 3 goes, the owner's
+                    # private chat and email get it, so it is never lost.
+                    key = f"task_try:{tid}"
+                    tries = int(get_setting(key) or 0) + 1
+                    set_setting(key, str(tries))
+                    if tries < 3:
+                        with closing(db()) as conn, conn:
+                            conn.execute("UPDATE tasks SET due_ts = ? WHERE id = ?", (now + 300, tid))
+                        continue
+                    send_telegram_private(text)
+                    try:
+                        send_email(headline, text, OWNER_EMAIL or BOOKING_EMAIL_TO)
+                    except Exception:
+                        log.exception("Could not email read-back %s", tid)
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE tasks SET posted_ts = ?, tg_msgs = ?, tg_text = ?,"
+                                 " headline = ? WHERE id = ?",
+                                 (now, ",".join(handles), text, headline, tid))
+                    later = conn.execute("SELECT sentence FROM tasks WHERE id = ?", (tid,)).fetchone()
+                if later and (later[0] or "") != (sentence or "") and handles:
+                    # A line added while this was being posted (the register check runs
+                    # alongside): the copies get it too.
+                    _h, text = _readback_text(user, day, later[0] or "")
+                    _edit_alert_copies(",".join(handles), text, task_keyboard(tid, created or now))
+                continue
+            start = _o2_ladder_from(day, posted)
+            if not start or not _o2_working(now):
+                continue
+            far = posted < start
+            if not esc and now >= start + CLAIM_ESCALATE_MIN * 60:
+                # [R2 fix, RT-4] what the person ringing reads back: the booking line (name — car reg — JOB) and every
+                # ⚠️ warning of the task (the reg, the calendar, a register mismatch added since) - the first post can
+                # be days and hundreds of posts back
+                sl = [x for x in (sentence or "").split("\n") if x.strip()]
+                extra = "\n".join(sl[:1] + [x for x in sl[1:] if x.startswith("⚠️")])
+                handles = send_telegram_buttons(
+                    f"⏰ Phone booking still not read back {CLAIM_MANAGER_MENTION} — they come in "
+                    f"{_o2_when(day, today)}\n{READBACK_HEADLINE}\n{customer_label(user)}\n"
+                    + (extra + "\n" if extra else "")
+                    + "Ring them and read it back — then press Done", user, created or now,
+                    keyboard=task_keyboard(tid, created or now))
+                with closing(db()) as conn, conn:
+                    conn.execute(
+                        "UPDATE tasks SET escalated_ts = ?, owner_ts = ?, tg_msgs = CASE WHEN"
+                        " COALESCE(tg_msgs,'') = '' THEN ? ELSE tg_msgs || ',' || ? END"
+                        " WHERE id = ?", (now, now if far else 0, ",".join(handles),
+                                          ",".join(handles), tid))
+            elif (esc and not own and not far
+                    and now - esc >= (CLAIM_OWNER_MIN - CLAIM_ESCALATE_MIN) * 60):
+                send_telegram_private(
+                    f"\U0001F6A8 Nobody has read back this phone booking for "
+                    f"{_o2_for(now - posted, posted)} — they come in {_o2_when(day, today)}\n"   # [R3 fix, W-3]
+                    f"{customer_label(user)}\nChat: https://wa.me/{user}")
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE tasks SET owner_ts = ? WHERE id = ?", (now, tid))
+        except Exception:
+            log.exception("Read-back %s tick failed", tid)
+
+
+def open_readback_lines(limit: int = 10) -> list:
+    """The 08:00 briefing's read-back section ([] when there are none)."""
+    today = now_local().date().isoformat()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT wa_user, date, COALESCE(sentence, ''), COALESCE(how, '') FROM tasks WHERE kind = ?"
+            " AND COALESCE(closed_ts, 0) = 0 AND date >= ? ORDER BY date, id", (READBACK_KIND, today)).fetchall()
+    if not rows:
+        return []
+    # [R3 fix, W-5] no claim that none of them got a written confirmation: an unsure send went, and a refused reg
+    # check came after an accepted confirmation - those rows say so
+    lines = [f"📞 PHONE BOOKINGS NOT READ BACK ({len(rows)}) — a person must ring them:"]
+    for user, day, sentence, how in rows[:limit]:
+        # [R2 fix, RT-4] the job too (the booking line is 'name — car reg — job'): what the person ringing reads back
+        first = (sentence or "").split("\n", 1)[0]
+        job = first.split(" — ", 2)[2].strip() if first.count(" — ") >= 2 else ""
+        h_ = _readback_why_line(how)
+        tag = (" (texted, not sure it arrived)" if h_.startswith("Texted") else
+               " (confirmation texted; the reg not checked)" if h_.startswith("Confirmation texted") else "")
+        lines.append(f"  • {customer_label(user)} — {_o2_day_label(day)}" + (f" — {job}" if job else "") + tag)
+    if len(rows) > limit:
+        lines.append(f"  +{len(rows) - limit} more")
+    lines.append("  Ring them, read it back — then press Done on the alert.")
+    return lines
+
+
+def _o2_readback_flag(phone: str, day: str, booked_ts: float = 0.0) -> str:
+    """The 18:00 bookings report: this booking's read-back, and whether a person did it. [R2 fix, P2-2] booked_ts:
+    when this booking was saved - a read-back written before it (less a minute) belongs to an EARLIER booking of
+    that day (read back and Done, then cancelled and booked again): no flag. A read-back is always written after
+    its own booking (the same call, a refusal later, or a reopen, which sets created_ts again)."""
+    user = normalize_phone(phone)
+    if not user or not day:
+        return ""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(closed_ts, 0), COALESCE(closed_by, ''), COALESCE(created_ts, 0) FROM tasks"
+                " WHERE kind = ? AND wa_user = ? AND date = ? ORDER BY id DESC LIMIT 1",
+                (READBACK_KIND, user, day)).fetchone()
+    except Exception:
+        return ""
+    # [R3 fix, D-4] ...for a CLOSED one only: an OPEN read-back of this phone and day is this booking's (one booking
+    # per phone per day; phone_readback leaves an open task as it is, so its created_ts can be an earlier booking's)
+    if not row or (row[0] and booked_ts and (row[2] or 0) < booked_ts - 60):
+        return ""
+    if not row[0]:
+        return " \U0001F4DE NOT read back yet — ring them"
+    if row[1] in READBACK_NOT_A_PERSON:      # [R1 fix, R-3] "read back ✅" only for a person's Done
+        return f" \U0001F4DE read-back closed ({row[1]})"
+    return " \U0001F4DE read back ✅ " + (row[1] or "").strip()
+
+
+def _o2_untexted_note(bid) -> str:
+    """The evening reg check could not text this booking (O2): the "still no reg" line two
+    days before says so, instead of "they were texted for it and never answered"."""
+    why = (get_setting(f"o2_untexted:{bid}") or "").strip()
+    return f"We could not text them for it: {why}. Please ring them." if why else ""   # [R3 fix, W-4]
+
+
+def missed_call_status_line(status: str) -> str:
+    """One line for the Retell PHONE CALL report: what happened to the hang-up text-back."""
+    if not CALLER_WINDOW_CHECK or not status or status == "cooldown":
+        return ""
+    if status == "texted":
+        return "💬 Text-back sent on WhatsApp (they wrote to us in the last 24 hours)."
+    if status == O2_TEMPLATE_SENT:
+        return "💬 Text-back sent as the approved template."
+    if status == "refused":
+        return "⚠️ WhatsApp did NOT take the text-back — ring them back if you want the job."
+    if status == O2_UNSURE:
+        return "⚠️ Not sure WhatsApp took the text-back (no answer) — ring them back if you want the job."
+    if status == "colleague":
+        return "👤 No text-back: a colleague has this chat."
+    if status.startswith("no_window:"):
+        # [R3 fix, W-4] the reason after a colon: it ends in its own brackets ("…(they last wrote Sat 03 Oct 09:28)")
+        return (f"📵 No text-back: {status.split(':', 1)[1]}. "
+                "Ring them back if you want the job.")
+    return ""
+
+
+def missed_call_report(digits: str, why: str) -> str:
+    """A missed WhatsApp call that cannot get the text-back (WA_CALL_WINDOW_CHECK=1): one
+    Telegram line instead of a text that bounces and a NOT DELIVERED line a minute later."""
+    return (f"📞 Missed WhatsApp call — {customer_label(digits)}\n"
+            f"📵 No text-back: {why}.\nRing them back if you want the job.")   # [R3 fix, W-4]
+
+
+def o2_windowcheck(number: str) -> dict:
+    """?action=windowcheck (read-only): the switches, how refusals were matched since start,
+    and for one number what each O2 path would do now and its open read-backs. Sends and
+    saves nothing."""
+    out = {"switches": o2_switches(), "remembered_sends": len(_O2_SENT),
+           "refusals_matched": dict(_O2_COUNTS)}
+    if not number:
+        return out
+    last = _owner_last_typed(number)
+    why = caller_window_problem(number)
+    mobile = is_mobile(number)
+    with closing(db()) as conn:
+        rb = conn.execute("SELECT date, posted_ts, escalated_ts FROM tasks WHERE kind = ?"
+                          " AND wa_user = ? AND COALESCE(closed_ts, 0) = 0 ORDER BY date",
+                          (READBACK_KIND, number)).fetchall()
+    out.update({
+        "number": "…" + number[-4:],
+        "last_typed": ("never" if last is None else "unreadable" if last < 0 else
+                       datetime.fromtimestamp(last, now_local().tzinfo).strftime("%a %d %b %H:%M")),
+        "window_open": not why, "why": why, "mobile": mobile, "blocked": is_blocked(number),   # [R2 fix, P2-1]
+        "phone_booking_confirmation": (
+            "landline - the ring-them-back line, as before" if not mobile else
+            "free-form text, as before" if not why else
+            "the approved template" if PHONE_CONFIRM_TEMPLATE else
+            "NOT sent - a 'ring them to read it back' task with a Done button"),
+        "phone_hangup_text_back": (
+            "free-form text, as before" if not why else
+            "the approved template" if MISSED_CALL_TEMPLATE else
+            "NOT sent - a status line on the PHONE CALL report"),
+        "whatsapp_call_text_back": (
+            "free-form text, as before (WA_CALL_WINDOW_CHECK is off)" if not WA_CALL_WINDOW_CHECK else
+            "free-form text, as before" if not why else
+            "the approved template" if MISSED_CALL_TEMPLATE else
+            "NOT sent - one Telegram line"),
+        "open_readbacks": [{"day": d, "posted": bool(p), "reminded": bool(e)} for d, p, e in rb],
+    })
+    return out
+
 
 # ---------------------------------------------------------------- reminders
 def _send_reminder_in(to: str, params: list, lang_code: str) -> str:
@@ -9426,7 +11088,7 @@ def booking_report_lines(until_ts: float = 0.0) -> list:
         since_ts = until_ts - 24 * 3600
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT name, car, reg, need, date, phone FROM bookings"
+            "SELECT name, car, reg, need, date, phone, COALESCE(created_ts, 0) FROM bookings"
             " WHERE COALESCE(created_ts, 0) >= ? AND COALESCE(created_ts, 0) < ?"
             " ORDER BY created_ts, id", (since_ts, until_ts)).fetchall()
     tz = ZoneInfo("Europe/Dublin")
@@ -9438,7 +11100,7 @@ def booking_report_lines(until_ts: float = 0.0) -> list:
     else:
         when = since.strftime("%a %d %b %H:%M")
     lines = [f"\U0001F4C5 Bookings taken since {when}: {len(rows)}"]
-    for name, car, reg, need, day, phone in rows[:BOOKING_REPORT_MAX_LINES]:
+    for name, car, reg, need, day, phone, booked_ts in rows[:BOOKING_REPORT_MAX_LINES]:
         try:
             day_label = datetime.strptime(day or "", "%Y-%m-%d").strftime("%a %d %b")
         except ValueError:
@@ -9449,6 +11111,7 @@ def booking_report_lines(until_ts: float = 0.0) -> list:
         if reg_needs_confirming(reg or ""):
             digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
             flag = " \u26a0\ufe0f check the reg" + (f" wa.me/{digits}" if digits else "")
+        flag += _o2_readback_flag(phone, day, booked_ts)   # O2: the read-back task and who did it [R2 fix, P2-2]
         lines.append(f"\u2022 {day_label} \u2014 {(name or '').strip() or '(no name)'} "
                      f"\u2014 {car_reg} \u2014 {job}{flag}")
     if len(rows) > BOOKING_REPORT_MAX_LINES:
@@ -9574,7 +11237,8 @@ def _make_followup(user: str) -> str:
                            "reply SKIP if a follow-up is not appropriate, otherwise write it.)"}]
     raw = _call_claude(messages, FOLLOWUP_SYSTEM) or ""
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
-    if (not text or re.search(r"\bSKIP\b", text)
+    text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a follow-up with no words in it
+    if (not text or re.search(r"\bSKIP\b", text) or not reply_has_words(text)
             or (text.startswith("(") and text.endswith(")"))):
         return ""
     # It runs 9-20h every day, so often while we are closed (28 Sep review).
@@ -9595,7 +11259,8 @@ CHASE_SYSTEM = (
     "morning', 'shortly', 'soon', 'right with you', 'right away', 'first thing' or 'at "
     "9am'. NEVER name anyone (no Vlad, no Dima, no 'he' or 'she') and never say 'urgent' - "
     "even if earlier messages in this chat did. NEVER quote a price, never promise a date "
-    "or a specific answer, never invent anything, and never mention systems, alerts or "
+    "or a specific answer (never 'with that quote', 'with the price' or 'with your refund' - "
+    "the answer may be a no), never invent anything, and never mention systems, alerts or "
     "colleagues being busy. If a follow-up would be inappropriate (they already said "
     "they're not interested, the matter is clearly closed, or it was a complaint that "
     "needs a person not a bot), reply with exactly SKIP."
@@ -9612,89 +11277,841 @@ def _make_chase(user: str) -> str:
     if raw.startswith(MODEL_FAILED_PREFIX):
         return ""    # never send the outage line as a holding message; the staff note says "NOT messaged"
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
-    if not text or text.upper().startswith("SKIP"):
+    text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a chase with no words in it
+    if not text or text.upper().startswith("SKIP") or not reply_has_words(text):
         return ""
     return fix_weekday_mentions(strip_phone_readback(text))
 
 STAFF_STALL_HOURS = float(os.environ.get("STAFF_STALL_HOURS", "1"))
+# O1 (owner, 2 Oct 2026): nothing is lost in a chat a colleague is handling. Daniel's "Thanks
+# when can we do?" (21:25, after the colleague's quote) waited 21.5 h and the 8am briefing said
+# "all clear"; the Golf customer's "How much?" (18:11) 19 h; Nic's comeback line (Fri 17:14) went
+# nowhere. The sweep looked only at messages 1-2 h old, only 09-20 h, only while the 3 h hold
+# lasted, and sent a one-off line with no Done button. Now what is waiting is looked at once,
+# from STAFF_STALL_HOURS old to STALL_LOOKBACK_HOURS old (2-48, default 24), whether the hold
+# has lapsed or not, and staff get a tracked alert for a question.
+# STALL_ALERTS=0: today's one-off "⏳ stalled" line instead of the alert (never silence), and [R3 fix, K-1]
+# live's assist whole - every pass 09-20 h, whatever the run (stall_assist_gate).
+STALL_LOOKBACK_HOURS = max(2, min(48, _env_int("STALL_LOOKBACK_HOURS", 24)))
+STALL_ALERTS = _env_on("STALL_ALERTS")
+STALL_KIND = "staff_stalled"
+STALL_BUSY_SECONDS = 600     # a colleague wrote in the last 10 minutes: they are in the chat
+STALL_GAP_HOURS = 3          # the sweep did not run for this long (a rollback, an outage, the bot off): a gap
+STALL_FOLD_SAID = "the bot told them nothing: a colleague had this chat"
+# The alerts that stand for a waiting message: the ones that ask a person to answer the customer,
+# and the assist path's own two (it nearly confirmed a booking / it claimed it looked at the car).
+# Anything else raised since (a phone booking read-back, a closed-date note) asks nobody to answer.
+# [R3 fix, C-1] ...and the crash alert (the handler failed on their message; a person must read it in the app): it
+# stands for the message - never replaced by a staff_stalled alert, so its own chase (live's) still comes.
+STALL_COVER_KINDS = frozenset(ASK_KINDS | {"assist_booking", "fabricated", "crash"})
+# A waiting message ASKS a person for something (the owner's "stalled staff-held QUESTIONS", 2 Oct)
+# when it has a question mark; is a photo, video, document or voice note sent for a person to look
+# at; opens a sentence with a question word or "can you / is it / do you ..."; has a request, a
+# booking, a go-ahead or a still-waiting phrase anywhere; or is in a script these words cannot read
+# (Greek, Arabic, Hindi, Chinese... - read as asking; Cyrillic too, unless every word is a plain
+# "ok / thanks / see you tomorrow / on my way"). Anything else ("5 mins", "Thanks see tomorrow",
+# "I'll be there at 6", a supplier's auto-reply) is a statement: today's one-off ⏳ line under
+# today's conditions, never an alert.
+_STALL_QMARK_RE = re.compile(r"[?\uff1f\u061f]")
+_STALL_MEDIA_RE = re.compile(r"\[Customer sent (?:a|an|\d+) (?:photo|video|document|voice|audio)", re.IGNORECASE)
+_STALL_AUTOREPLY_RE = re.compile(
+    r"\b(?:thank you for (?:contacting|your message|messaging|getting in touch)|auto-?(?:matic )?reply"
+    r"|automated (?:reply|message|response)|out of (?:the )?office"
+    r"|we will (?:get back to|respond to|reply to) you (?:shortly|as soon as|soon))\b", re.IGNORECASE)
+_STALL_ASKS_RE = re.compile(
+    r"[?\uff1f\u061f]"
+    r"|^\[Customer sent (?:a|an|\d+) (?:photo|video|document|voice|audio)"
+    r"|(?:^|[.!,;:…\n]\s*|\b(?:hi|hello|hey|ok|okay|thanks|thank you|sorry|morning|grand|great|perfect)(?:\s+\w+)?\W+)"
+    r"(?:when|what|where|which|why|how|who|any (?:news|update|word|chance)"
+    r"|(?:can|could|would|will|shall|should|do|does|did|is|are|am|was|have|has)\s+(?:i|you|u|ye|yous|we|they|it|he"
+    r"|she|someone|anyone|there|the|my|this|that|these|those)\b)"
+    r"|\b(?:are|do|did|can|could|would|will|have) (?:you|u|ye|yous)\b"
+    r"|\b(?:please|pls|plz|kindly|let me know|lmk|tell me|can i|could i|how much|how long"
+    r"|waiting(?! for (?:the |a |my )?(?:bus|train|taxi|lift|luas|dart)\b)"
+    r"|still (?:not|no|nothing|waiting|haven['’]?t|hasn['’]?t|isn['’]?t|doesn['’]?t|won['’]?t)"
+    r"|not working|isn['’]?t working|stopped working"
+    r"|(?<!no )need(?:a|s|ed)?(?! to (?:go|run|leave|dash|rush|head) (?:now|home|off|out)\b)"
+    r"|wondering|want(?:ed)? to know"
+    r"|is (?:that|it) ok|suits? (?:you|u)|works? for (?:you|u)|ok (?:with|for) (?:you|u)|call me|ring me|phone me"
+    r"|give me a (?:shout|call|ring|bell)|get back to me|refund|warranty|guarantee"
+    r"|price(?! (?:is|was|['’]s) (?:fine|grand|ok|okay|good|great|perfect)\b)|quote"
+    r"|cancel\w*|reschedul\w*|postpon\w*|can['’]?t make it|won['’]?t make it|not able to (?:come|make it)"
+    r"|(?<!no )(?<!not a )(?<!not an )problems?|(?<!no )(?<!not a )(?<!not an )issues?"
+    r"|not (?:right|fixed|sorted)|same (?:problem|issue|noise|fault)"
+    r"|(?:noise|light|leak|fault)s? (?:is |are )?(?:back|again|still)"
+    r"|book(?:ed|ing)? (?:me|it|us|her|him|them|the car|the van|in)|go ahead|proceed"
+    r"|(?:yes|ok|okay),? do it|order (?:it|them|the parts?)"
+    r"|(?:is|are|works?) (?:good|fine|grand|ok|okay|perfect) (?:for|with) me|ready yet|(?:just )?checking in"
+    r"|c[aâ]nd|c[aâ]t cost[aă]|pre[tț]|v[aă] rog|pute[tț]i|vreau|rambursa\w*|kada|kiek|pra[sš]au|kaina|noriu"
+    r"|kiedy|ile kosztuje|prosz[eę]|chc[eę]"
+    r"|quanto|quando|pode|cu[aá]nto|cu[aá]ndo|precio|pre[cç]o|cik maks\w*|l[uū]dzu|skol'?ko|kogda|mo[zž]no)\b"
+    r"|\bagain\b.{0,30}\b(?:noise|light|leak|fault|problem|issue)"
+    r"|\b(?:noise|light|leak|fault)\b.{0,30}\bagain\b"
+    r"|\bif (?:that['’]?s|it['’]?s|thats|its|that is|it is) (?:ok|okay|alright|fine|all right)\b"
+    # [R1 fix, G-2] a booking asked for in a statement: "Give me the appointment" (the 21 Sep replay's
+    # …523), "I'd like to book a service", "I would like to bring the car", "I want an appointment for
+    # Friday", "Put me down for Monday", "Give me a slot next week"
+    r"|\b(?:give|get|find|send) (?:me|us) (?:an?|the|my|our|another|your) (?:(?:earliest|first|next|free|available"
+    r"|new) )?(?:appointment|slot|booking|date)s?\b"
+    r"|\b(?:i|we)(?:['’]?d| would) like (?:to (?:book|bring|drop|come|have|get|make|arrange)\b"
+    r"|an? (?:appointment|slot|booking|service|quote)\b|the (?:appointment|slot|booking)\b)"
+    r"|\b(?:i|we) (?:want|wanted|wanna) (?:to (?:book|bring|drop)\b|an? (?:appointment|slot|booking)\b"
+    r"|the (?:appointment|slot|booking)\b)"
+    r"|\bput (?:me|us|it|him|her|the car|the van|my car|my van) (?:down|in) for\b"
+    # ...and "Looking to book a service", "I just want to book", "Any available slot", "The earliest slot
+    # possible", "If you can arrange appointment at 1pm" (corpus: r1fix/g2_scan.out, every hit a booking request)
+    r"|\b(?:looking|hoping|trying|want|wanted|wanting|wanna) to (?:book|bring|drop|get (?:it|the car|my car|the van"
+    r"|him|her) (?:in|booked))\b"
+    r"|\bany (?:available |free |earlier |other |more )?(?:slots?|appointments?|availability)\b"
+    r"|\b(?:earliest|soonest|next available|first available|next free|first free) (?:slot|appointment|date|day|time"
+    r"|booking)s?\b"
+    r"|\b(?:(?:arrange|schedule|set up) (?:an? |the |another |a new )?|make (?:an? |another |a new )?)(?:appointment"
+    r"|booking)\b",
+    re.IGNORECASE)
+_STALL_NONLATIN_RE = re.compile(r"[\u0370-\u03ff\u0400-\u04ff\u0590-\u06ff\u0900-\u097f\u0e00-\u0e7f"
+                                r"\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]")
+_STALL_WORD_RE = re.compile(r"[^\W\d_]+")
+# Cyrillic (RU/UA) words that ask nobody anything: a message made ONLY of these is a statement.
+_STALL_STATEMENT_WORDS = frozenset((
+    "хорошо", "ок", "окей", "ладно", "понял", "поняла", "понятно", "договорились", "спасибо", "спс",
+    "благодарю", "большое", "до", "завтра", "встречи", "свидания", "буду", "будем", "еду", "едем", "скоро",
+    "уже", "на", "месте", "в", "через", "минут", "мин", "утром", "вечером", "я", "мы", "да", "и", "ага",
+    "добре", "дякую", "гаразд", "зрозумів", "зрозуміла", "зустрічі", "їду", "вже", "так", "ok", "okay",
+    "thanks"))
 
-def sweep_stalled_staff_chats() -> None:
-    """Owner's rule: an hour after a staff conversation stalls with the customer
-    still waiting — finish it if it's simple, otherwise remind the owner.
 
-    Runs hourly; each stalled message is acted on once (the window check keeps it
-    from re-firing every hour for the same message)."""
+# [R1 fix, N-5] "Ah yes you found the issue", "All good Dyma I found the problem thanks": a problem the
+# customer says is SOLVED asks nobody anything - unless it is conditional or negated ("If you found the
+# problem", "so the problem hasn't been fixed"), still or back again, or something else in the message asks
+_STALL_RESOLVED_RE = re.compile(
+    r"\b(?:found|fixed|sorted|solved|resolved) (?:the|that|this|my|your) (?:problem|issue)s?\b"
+    r"|\b(?:problem|issue)s? (?:is|was|has been|have been|are|were) (?:fixed|sorted|solved|resolved|gone)\b",
+    re.IGNORECASE)
+_STALL_RESOLVED_BUT_RE = re.compile(r"\bif\b|\bor not\b|\bnot\b|n['’]t\b|\bnever\b|\bstill\b|\bagain\b|\bback\b",
+                                    re.IGNORECASE)
+
+
+def stall_resolved(text: str) -> bool:
+    """[R1 fix, N-5] The customer says the problem is solved, and nothing else in the message asks."""
+    t = " ".join((text or "").split())
+    if not _STALL_RESOLVED_RE.search(t) or _STALL_RESOLVED_BUT_RE.search(t) or _STALL_QMARK_RE.search(t):
+        return False
+    return not _STALL_ASKS_RE.search(_STALL_RESOLVED_RE.sub(" ", t))
+
+
+def stall_media(text: str) -> bool:
+    """O1: a photo, video, document or voice note the customer sent (the saved placeholder)."""
+    return bool(_STALL_MEDIA_RE.match((text or "").strip()))
+
+
+_STALL_MEDIA_PARTS_RE = re.compile(r"\s*\[Customer sent (a|an|\d+) (photo|video|document|voice|audio)s?\b[^\]]*\]\s*(.*)",
+                                   re.IGNORECASE | re.DOTALL)
+_STALL_MEDIA_NAMES = {"photo": ("📷", "a photo", "photos"), "video": ("🎥", "a video", "videos"),
+                      "document": ("📄", "a document", "documents"), "voice": ("🎤", "a voice note", "voice notes")}
+
+
+def stall_media_words(texts: list, plain: bool = False) -> str:
+    """[R3 fix, W-6] The attachments among these waiting messages in counted words for staff - "🎤 a voice note",
+    "📷 2 photos", "📷 a photo + 🎥 a video" (plain: no emoji, for a sentence) - instead of the saved placeholder in
+    quotes as if the customer had written "[Customer sent a voice]". A caption or file name sent with one is kept, in
+    quotes. '' when there is none."""
+    counts, notes = {}, []
+    for t in texts or []:
+        m_ = _STALL_MEDIA_PARTS_RE.match(t or "")
+        if not m_:
+            continue
+        what = "voice" if m_.group(2).lower() == "audio" else m_.group(2).lower()
+        counts[what] = counts.get(what, 0) + (int(m_.group(1)) if m_.group(1).isdigit() else 1)
+        if m_.group(3).strip():
+            notes.append(m_.group(3).strip())
+    parts = []
+    for what, n in counts.items():
+        icon, one, many = _STALL_MEDIA_NAMES[what]
+        parts.append(("" if plain else icon + " ") + (one if n == 1 else f"{n} {many}"))
+    out = (" and " if plain else " + ").join(parts)
+    if out and notes:
+        out += " " + stall_quote(" ".join(reversed(notes)), 60)
+    return out
+
+
+def stall_asks(text: str) -> bool:
+    """O1: does this waiting customer message ask a person for something (see _STALL_ASKS_RE)?"""
+    t = " ".join((text or "").split())
+    if not t:
+        return False
+    if not _STALL_QMARK_RE.search(t) and _STALL_AUTOREPLY_RE.search(t):
+        return False     # a supplier's or partner's auto-reply asks nobody anything
+    if stall_resolved(t):
+        return False     # [R1 fix, N-5] "you found the issue": an acknowledgement
+    if _STALL_ASKS_RE.search(t):
+        return True
+    if _STALL_NONLATIN_RE.search(t):
+        words = _STALL_WORD_RE.findall(t.lower())
+        return not (words and all(w in _STALL_STATEMENT_WORDS for w in words))
+    return False
+
+
+# [R2 fix, R2C-F4] "Ok thanks keep me posted please!", "Thanks, let me know", "No problem.. just let me know..
+# thanks": a thanks / ok whose only ask is a please / let me know / keep me posted
+_STALL_ACK_WORD_RE = re.compile(
+    r"\b(?:thanks|thank you|thank u|thankyou|thx|ty|cheers|ok|okay|okey|oki|grand|perfect|great|lovely|brilliant"
+    r"|no worries|no problem|no bother|nice one)\b", re.IGNORECASE)
+_STALL_ACK_CUE_RE = re.compile(r"\b(?:please|pls|plz|let me know|lmk|keep me (?:posted|updated|informed|in the loop))\b",
+                               re.IGNORECASE)
+_STALL_ACK_NOT_RE = re.compile(
+    r"\bif\b|\bbefore\b|\bdon['’]?t forget\b|\bremember\b|\bwhen\b|\bprice|\bpricing\b|\bcost|\bquote|€|\d"
+    r"|\b(?:today|tomorrow|tonight|morning|afternoon|evening|week|weekend|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|\bbook|\bslot|\bavailab|\bappointment|\bcollect|\bready\b|\bpick(?:ing)? (?:it |the car |her |him )?up\b",
+    re.IGNORECASE)
+# [R3 fix, D-2] the acknowledgement's own cue must be there: "let me know" / "lmk" / "keep me posted|updated|informed|in
+# the loop" - a "please" alone is a request ("Ok please", "Thanks. Call please", "Ok thanks. Invoice please")
+_STALL_ACK_NEED_RE = re.compile(r"\b(?:let me know|lmk|keep me (?:posted|updated|informed|in the loop))\b", re.IGNORECASE)
+# [R3 fix, D-2 / REVERIFY N-2] a consent or go-ahead is never an acknowledgement: "Yes please, thank you", "Ok yes
+# please", "Please do thanks", "Go ahead thanks", "Grand, please", "Perfect please do" ("Ok please let me know" and
+# "Please do keep me posted" are still acknowledgements)
+_STALL_ACK_CONSENT_RE = re.compile(
+    r"\b(?:yes|yeah|yep|yea|yup)\b|\bgo ahead\b|\bdo it\b|\bplease do\b(?!\s+(?:let me know|lmk|keep me)\b)"
+    r"|\b(?:ok|okay|okey|oki|k|grand|perfect|great|lovely|brilliant|fine|sound)[\s,.!]*(?:please|pls|plz)\b"
+    r"(?![\s,.!]*(?:let me know|lmk|keep me)\b)", re.IGNORECASE)
+# [R3 fix, D-2] the one Name comes right after a thanks / ok word, in the same sentence ("Thanks Vlad, keep me
+# posted") - a phone capitalises every sentence's first word ("Ok thanks. Update, let me know")
+_STALL_ACK_NAME_AFTER = frozenset((
+    "thanks", "thank", "you", "u", "thankyou", "thx", "ty", "cheers", "ok", "okay", "okey", "oki", "grand", "perfect",
+    "great", "lovely", "brilliant", "hi", "hello"))
+# ...and nothing but these words in it (a name aside): "Ok thanks, please send me the invoice" still asks
+_STALL_ACK_FILLER = frozenset((
+    "ok", "okay", "okey", "oki", "k", "thanks", "thank", "thankyou", "thx", "ty", "you", "u", "ya", "cheers", "grand",
+    "perfect", "great", "lovely", "brilliant", "nice", "one", "no", "problem", "worries", "worry", "bother", "just",
+    "so", "and", "then", "a", "lot", "very", "much", "mill", "million", "guys", "lads", "lad", "mate", "man", "again",
+    "all", "the", "for", "that", "this", "it", "will", "do", "i", "ll", "we", "please", "pls", "plz", "let", "me",
+    "know", "lmk", "keep", "posted", "updated", "informed", "in", "loop", "yes", "yeah", "yep", "alright", "right",
+    "fine", "appreciated", "appreciate", "x", "xx", "hi", "hello", "wait", "hear", "from", "back", "to"))
+
+
+def stall_ack(text: str) -> bool:
+    """[R2 fix, R2C-F4] A short thanks / ok whose ONLY ask is a please / let me know / keep me posted (under 80
+    characters, no "?", no condition, reminder, money, day, booking or collection word, nothing else that asks, and
+    no other word than those - a name aside): stall_pending reads it as a statement right after a colleague's real
+    answer - it acknowledges that answer. "Let me know the price as well", "Ok for Wednesday but let me know if you
+    availability today", "Yes please", "Book it. Please", "Ok thanks, please send me the invoice" and "please don't
+    forget about the noise… Thanks" still ask."""
+    t = " ".join((text or "").split())
+    # [R3 fix, D-2] the let-me-know cue itself (a please alone is a request), and never a consent / go-ahead
+    if not t or len(t) > 80 or _STALL_QMARK_RE.search(t) or not _STALL_ACK_NEED_RE.search(t):
+        return False
+    if not _STALL_ACK_WORD_RE.search(t) or _STALL_ACK_NOT_RE.search(t) or _STALL_ACK_CONSENT_RE.search(t):
+        return False
+    words = list(_STALL_WORD_RE.finditer(t))
+    rest = [k for k, w in enumerate(words) if w.group().lower() not in _STALL_ACK_FILLER]
+    if len(rest) > 1:
+        return False     # another word than thanks / ok / let me know ... (one Name is fine: "Thanks Vlad")
+    if rest:
+        k = rest[0]
+        w = words[k].group()
+        if not (w[:1].isupper() and w[1:].islower()) or k == 0 \
+                or words[k - 1].group().lower() not in _STALL_ACK_NAME_AFTER \
+                or re.search(r"[.!?…;\n]", t[words[k - 1].end():words[k].start()]):
+            return False     # [R3 fix, D-2] a Name only right after a thanks / ok word, in the same sentence
+    return not _STALL_ASKS_RE.search(_STALL_ACK_CUE_RE.sub(" ", t))
+
+
+def assist_fix1b_only(reply: str, user: str, own: str = "") -> bool:
+    """[R1 fix, N-2] At the assist (a colleague holds the chat): True when the bot's line is a promise only
+    to a Fix 1b phrase - a deferral ("A colleague will check on that and come back to you here", "we'll
+    check what we can source and get back to you"), a special-request hand-over or the night line; none of
+    the lists that alerted before Fix 1b sees it - and none of this turn's customer messages (since the
+    bot's or a colleague's last line) asks a person anything (stall_asks: the address the colleague asked
+    for, a supplier's "Sorry don't have"). The assist then raises nothing, as live: the colleague is in
+    the chat, and O1's statement rule applies. Unsure: False (the decision stands, the alert fires)."""
+    try:
+        t = older_lists_text(reply, own)
+        if (_CLAIMS_A_PERSON_RE.search(t) or _HOUSE_HANDOVER_RE.search(t)
+                or (_CLAIMS_A_PERSON_MORE_RE.search(t) and claims_a_person(t, user)) or not fix1b_phrase(t)):
+            return False
+        with closing(db()) as conn:
+            last = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE wa_user = ? AND role IN"
+                                " ('assistant', 'staff')", (user,)).fetchone()[0] or 0
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND id > ?"
+                                " ORDER BY id DESC LIMIT 6", (user, last)).fetchall()
+        said = [r[0] or "" for r in rows] or [_recent_customer_words(user, 1)]
+        return not any(stall_asks(w) for w in said)
+    except Exception:
+        log.exception("Assist promise check failed for %s - the alert decision stands", user)
+        return False
+
+
+def alert_kind(user: str, alert_ts: float) -> str:
+    """The kind of this customer's alert raised at alert_ts ('' when the row is gone, was
+    raised again since, or cannot be read - the caller then does what it did before O1)."""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT COALESCE(kind, '') FROM alerts WHERE wa_user = ? AND ts = ?",
+                             (user, alert_ts)).fetchone()
+        return (r[0] or "") if r else ""
+    except Exception:
+        return ""
+
+
+def _open_now(now) -> bool:
+    """The team is in right now (OPEN_HOURS, never a Sunday or a bank holiday)."""
+    h = hours_on(now.date())
+    return bool(h) and h[0] <= now.hour + now.minute / 60 < h[1]
+
+
+# [R3 fix, D-3] a bot answer that hands back to the customer: a question, an offer, a "just to confirm"
+_STALL_BOT_ASKS_BACK_RE = re.compile(
+    r"[?？؟]|\bjust to confirm\b|\bshall i\b|\bwould you like\b|\bdo you want\b|\bwant me to\b"
+    r"|\bcan you confirm\b|\bcould you\b|\blet me know (?:if|when|which|what)\b", re.IGNORECASE)
+
+
+def stall_after_answer(r) -> bool:
+    """[R3 fix, D-3] Is this row (role, content, ts, kind) - the one a waiting run stopped at - a real ANSWER, after
+    which a short thanks / let me know (stall_ack) acknowledges it? A colleague's real WhatsApp answer (R2C-F4); the
+    owner's own Telegram reply (owner_tg / owner_book - a ?action=sendmsg line is saved as owner_tg too) when it is a
+    real answer, not a holding line ("I've passed it on"); the bot's own real answer in the colleague's chat - no
+    promise or deferral (is_promise_text) and no question or offer back to them. Unsure: False (it asks)."""
+    try:
+        role, content, _ts, kind = r
+        c = (content or "").strip()
+        if role == "staff":
+            return is_real_staff_text(c)
+        if role != "assistant" or not c:
+            return False
+        if kind in ("owner_tg", "owner_book"):
+            return is_real_staff_text(c) and not _OWNER_HOLD_RE.search(c)
+        return (not kind and not c.startswith(UNDELIVERED_PREFIX) and not is_promise_text(c)
+                and not _STALL_BOT_ASKS_BACK_RE.search(c))
+    except Exception:
+        return False
+
+
+def stall_pending(conn, user: str):
+    """O1: what is still waiting in a chat a colleague was handling, or None. Newest first, these
+    are looked past: a colleague's message that is not an answer (a 👍 reaction, "Hi", "give me
+    5 min" - classify_staff), a line the bot started itself (a reminder, chase, nudge, the claim
+    note, an undelivered row), and the customer's own 👍 / ok / thanks / sticker together with the
+    bot's closing line to it - a filler is never what they are waiting on (filler_tail says one
+    came after it; the sweep then never answers it late). While a colleague held the chat the
+    bot (the assist) answers only the message right before its line: its warm line to a statement
+    ("I'll drop it Thursday") is looked past with that statement, and its "thanks" for a photo,
+    video or voice note it cannot see leaves the attachment waiting. Every other customer message
+    is collected - the whole unanswered run, not only the newest - until a real colleague answer
+    or a real bot reply. The run waits when a colleague held the chat as the newest was written (a
+    colleague wrote less than AUTO_RESUME_HOURS before it) or has written since. As before, a
+    colleague's 👍 reaction after their newest message IS the reply to plain statements (and to a
+    photo); a question in words,
+    with or without a "?", is not answered by one. Returns the newest asking message as `text`
+    (`quote_ts`), the newest of the run's times as `ts` (the act-once key), `asks`, `media`, `n`
+    (messages in the run) and `assist_ok` (only the newest can ask, and no attachment - the
+    assist answers the last message only)."""
+    rows = conn.execute("SELECT role, content, ts, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                        " ORDER BY id DESC LIMIT 20", (user,)).fetchall()
+
+    def staff_nothing(r):
+        return (r[0] == "staff" and not is_real_staff_text(r[1])
+                and (r[1] or "").strip() != STAFF_OLD_PLACEHOLDER)
+
+    def held_at(ts):
+        b = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'staff' AND ts <= ?",
+                         (user, ts)).fetchone()[0] or 0.0
+        return bool(b) and ts - b < AUTO_RESUME_HOURS * 3600
+
+    skipped, run, filler_tail, i = [], [], False, 0
+    while i < len(rows):
+        role, content, ts, kind = rows[i]
+        c = (content or "").strip()
+        if role == "assistant" and (kind in NOT_AN_ANSWER_KINDS or c.startswith(UNDELIVERED_PREFIX)
+                                    or c.startswith("[Template")):
+            i += 1
+            continue
+        if staff_nothing(rows[i]):
+            skipped.append((content, ts or 0.0))
+            i += 1
+            continue
+        if role == "user" and is_filler_customer_text(content):
+            filler_tail = filler_tail or not run
+            i += 1
+            continue
+        if role == "assistant":
+            if kind:
+                # [R1 fix, R1-1] a bot row with a kind that gets here is not the assist's own warm line
+                # (saved with none; the bot's own reminders, chases... were looked past above): the
+                # owner's Telegram reply (owner_tg / owner_book) - a real answer to what came before it
+                break
+            j = i + 1
+            while j < len(rows) and staff_nothing(rows[j]):
+                j += 1
+            prev = rows[j] if j < len(rows) else None
+            if prev and prev[0] == "user" and is_filler_customer_text(prev[1]):
+                # "You're welcome - message us any time" answered their "Thanks", not the question
+                # before it: look past the pair
+                filler_tail = filler_tail or not run
+                i = j + 1
+                continue
+            if prev and prev[0] == "user" and held_at(ts or 0.0):
+                if stall_media(prev[1]):
+                    run.append((prev[1] or "", prev[2] or 0.0))
+                    i = j + 1
+                    continue
+                if not stall_asks(prev[1]) and not stall_resolved(prev[1]):
+                    # [R1 fix, N-5] ...but its reply to "you found the issue" is the answer to it (looking
+                    # past the pair would dig up the photo before it, garage …7438)
+                    i = j + 1
+                    continue
+            break        # a real bot reply: they got their answer
+        if role == "user":
+            run.append((content or "", ts or 0.0))
+            i += 1
+            continue
+        break            # a real colleague answer
+    if not run:
+        return None
+    # [R2 fix, R2C-F4] right after a colleague's real answer ("We need to replace the abs pump … only Monday"), a
+    # short thanks / ok whose only ask is a please / let me know / keep me posted (stall_ack: "Ok thanks keep me
+    # posted please!") is the reply to that answer: the statement path (today's one-off ⏳ line), never a full
+    # staff_stalled ladder. A question in the same run still asks.
+    # [R3 fix, D-3] ...and after the owner's own Telegram reply or the bot's own real answer, as after a colleague's
+    after_answer = i < len(rows) and stall_after_answer(rows[i])
+
+    def asks(t):
+        return stall_asks(t) and not (after_answer and stall_ack(t))
+    newest, newest_ts = run[0]
+    worded = [t for t, _ in run if asks(t) and not stall_media(t)]
+    after = [s for s, ts in skipped if ts > newest_ts]     # what a colleague did AFTER their newest message
+    if after and not worded and all(classify_staff(s) in ("reaction", "placeholder") for s in after):
+        return None
+    if not any(ts > newest_ts for _, ts in skipped) and not held_at(newest_ts):
+        return None      # the bot had this chat when they wrote: its own paths answer it
+    asking = [r for r in run if asks(r[0])]
+    quote, quote_ts = asking[0] if asking else run[0]
+    # [R2 fix, R2C-F3] what staff read first (the alert's first line, the briefing, the digest): the newest WORDED
+    # question of the run, not a photo or video sent after it - `text` / `quote_ts` stay the newest asking message
+    # (the cover decision's and the act-once keys' message)
+    say, say_ts = next(((t, ts) for t, ts in asking if not stall_media(t)), (quote, quote_ts))
+    media = any(stall_media(t) for t, _ in run)
+    return {"text": quote, "ts": newest_ts, "quote_ts": quote_ts, "newest": newest, "n": len(run),
+            "asks": bool(asking), "media": media, "filler_tail": filler_tail, "run": run,
+            "say": say, "say_ts": say_ts,
+            "assist_ok": not media and not any(asks(t) for t, _ in run[1:])}
+
+
+def _stall_num(s) -> float:
+    try:
+        return float(s or 0)
+    except ValueError:
+        return 0.0
+
+
+def stall_floor() -> tuple:
+    """O1: (since, gaps) - what the sweep never reaches back to (no burst): anything written before
+    its first pass after the deploy minus 2 h (since), and anything written while it had not run for
+    over STALL_GAP_HOURS - a rollback and a later redeploy, an outage, the bot switched off - up to
+    2 h before it ran again (gaps: (from, to] pairs, the look-back's worth). What was already waiting
+    when it last ran before such a gap is still its job."""
+    gaps = []
+    for g in (get_setting("stall_sweep_gap", "") or "").split(","):
+        a, _, b = g.partition("-")
+        if _stall_num(b) > _stall_num(a):
+            gaps.append((_stall_num(a), _stall_num(b)))
+    return _stall_num(get_setting("stall_sweep_since", "")), tuple(gaps)
+
+
+def stall_decision(conn, user: str, nowts: float, took_ts: float, since_ts: float,
+                   gaps: tuple = ()) -> dict:
+    """O1, read-only (the sweep and ?action=stalltest): what is waiting in this chat, and
+    whether the sweep acts on it now ("act") or why not ("why")."""
+    p = stall_pending(conn, user)
+    if not p:
+        return {"user": user, "act": False, "why": "nothing waiting"}
+    d = dict(p, user=user, act=False, why="")
+    age = nowts - p["ts"]
+    try:
+        done = float(get_setting(f"stall_swept:{user}", "0") or 0)
+    except ValueError:
+        done = 0.0
+    # a waiting run counts from its first message the sweep is answerable for (not before the
+    # first pass after the deploy, not written while the sweep was away)
+    mine = [ts for _, ts in p["run"] if ts > since_ts and not any(a < ts <= b for a, b in gaps)]
+    if age < STAFF_STALL_HOURS * 3600:
+        d["why"] = "too fresh - a colleague may still answer"
+    elif age >= STALL_LOOKBACK_HOURS * 3600:
+        d["why"] = f"older than {STALL_LOOKBACK_HOURS} h"
+    elif not mine and p["ts"] <= since_ts:
+        d["why"] = "written before the first pass after the deploy"
+    elif not mine:
+        d["why"] = "written while the sweep was not running (an outage, a rollback, the bot switched off)"
+    elif done >= p["ts"]:
+        d["why"] = "already acted on"
+    elif nowts - (took_ts or 0) < STALL_BUSY_SECONDS:
+        d["why"] = "a colleague wrote in the last 10 minutes - the next pass decides"
+    else:
+        d["act"] = True
+    return d
+
+
+def stall_open_kind(conn, user: str, nowts: float) -> str:
+    """[R1 fix, S-1] This customer's alert row's kind when its OWN chase is still to come - open, not
+    sorted, not a staff_stalled one (that chase is a staff-only note), not chased yet and under 24 h old
+    (the chase's reach) - else ''. A staff_stalled alert never takes that row's place: its chase is the
+    customer's "sorry for the wait" (owner Q3: kept as today)."""
+    r = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(kind, ''), COALESCE(chased_ts, 0)"
+                     " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    if not r:
+        return ""
+    ts = r[0] or 0.0
+    if (r[1] or 0) >= ts or (r[3] or 0) >= ts or r[2] == STALL_KIND or nowts - ts >= 24 * 3600:
+        return ""
+    if alert_resolved(conn, user, ts):
+        return ""
+    return r[2] or "handover"
+
+
+def stall_cover(conn, user: str, msg_ts: float, newest_ts: float = 0.0) -> str:
+    """O1: does an alert already stand for this waiting message (written at msg_ts)?
+    'covered' - an open alert raised for it or after it that asks a person to answer them
+    (STALL_COVER_KINDS: the assist's assist_booking / fabricated / promise alert, the unhappy check,
+    the outage's blank alert, an earlier pass) and still has its ladder: no second alert;
+    'handled' - such an alert was then Done or sorted; 'fold' - an older open alert is a trusted
+    F3 cover (open_alert_within: under WIDE_QUIET_MINUTES, asks a person, not booking-closable,
+    on Telegram): a quiet '➕ wrote again' edit; 'alert' - raise one. Done on an OLDER alert says
+    nothing about this newer message, and a later alert of another kind (a phone booking
+    read-back, a closed-date note) asks nobody to answer it: both 'alert'. [R1 fix, N-3] 'covered' too when
+    the run (newest_ts = its newest message) was already folded into the open older alert (fold_ts), and
+    the F3 window is also measured at the time they wrote (msg_ts), not only at this pass. [R1 fix, S-1]
+    'open_older' - an older open alert of another kind whose own chase is still to come
+    (stall_open_kind): never replaced by a staff_stalled one."""
+    row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(kind, ''), COALESCE(escalated_ts, 0),"
+                       " COALESCE(owner_ts, 0), COALESCE(chased_ts, 0) FROM alerts WHERE wa_user = ?",
+                       (user,)).fetchone()
+    if not row:
+        return "alert"
+    ts, closed, kind = row[0] or 0.0, row[1] or 0.0, row[2] or ""
+    if ts >= msg_ts:     # raised once this message was saved
+        if kind not in STALL_COVER_KINDS or any(x and abs(x - ts) < 1 for x in (row[3], row[4], row[5])):
+            return "alert"      # not one that asks a person to answer, or its ladder was used up as it was raised
+        return "handled" if (closed >= ts or alert_resolved(conn, user, ts)) else "covered"
+    if closed >= ts or alert_resolved(conn, user, ts):
+        return "alert"     # an older alert, Done or sorted: this is a new ask
+    try:
+        x = conn.execute("SELECT COALESCE(fold_ts, 0), COALESCE(topic, ''), COALESCE(tg_msgs, ''),"
+                         " COALESCE(claimed_by, '') FROM alerts WHERE wa_user = ? AND ts = ?", (user, ts)).fetchone()
+    except sqlite3.OperationalError:
+        x = None       # no fold_ts column (SN11): as before
+    # [R1 fix, N-3] the run is already on this open alert (a '➕ wrote again' fold at or after its newest
+    # message - the chase-clock fold_ts, or a bot-reply fold that leaves that clock alone: mark_fold_seen): no
+    # second alert for the same moment
+    folded = max((x[0] or 0) if x else 0.0, _stall_num(get_setting(f"fold_seen:{user}", "")))
+    if folded >= (newest_ts or msg_ts) > 0:
+        return "covered"
+    if open_alert_within(user, WIDE_QUIET_MINUTES * 60):
+        return "fold"
+    # [R1 fix, N-3] the F3 window at the time they WROTE (the sweep reads a message an hour or more later):
+    # open_alert_within's other tests, without its age-at-now one
+    # [R2 fix, R4.3] ...and never into a CLAIMED alert: its owner ping never fires (escalate_unclaimed_alerts skips
+    # claimed rows), so the fold would last until the chase - staff get live's ⏳ line instead (open_older)
+    if (x and msg_ts - ts < WIDE_QUIET_MINUTES * 60 and kind in ASK_KINDS and kind not in BOOKING_CLOSES_KINDS
+            and x[1] not in BOOKING_CLOSES_TOPICS and x[2] and (row[4] or 0) < ts and (row[5] or 0) < ts
+            and not (x[3] or "").strip()):
+        return "fold"
+    # [R1 fix, S-1] an older open alert whose own chase is still to come is never replaced
+    return "open_older" if stall_open_kind(conn, user, time.time()) else "alert"
+
+
+def stall_older_done(user: str, d: dict) -> bool:
+    """[R2 fix, RT-2 / ST-1] True when this waiting run (d) was folded into an older open alert by the sweep's
+    open_older pass - its '➕ wrote again … Press Done only when this is sorted too' edit landed (stall_older_on:
+    <user> = '<run ts>|<alert ts>|<when>') - and a PERSON then pressed Done on that same alert: staff sorted it (they
+    rang the customer), as the ➕ asked, so no staff_stalled alert follows for the same messages (the F3 fold twin is
+    silent after Done too, as live). Never for an auto-close (a booking, a WhatsApp reply), a Done before the fold, a
+    row raised again since, a message written after it or an edit that never landed. Unsure: False (the alert
+    fires)."""
+    try:
+        parts = ((get_setting(f"stall_older_on:{user}", "") or "").split("|") + ["", "", ""])[:3]
+        run_ts, a_ts, fold_at = (_stall_num(x) for x in parts)
+        if not (a_ts and fold_at and run_ts >= d["ts"]):
+            return False
+        with closing(db()) as conn:
+            r = conn.execute("SELECT ts, COALESCE(closed_ts, 0) FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+            if not r or abs((r[0] or 0) - a_ts) > 0.001 or (r[1] or 0) < fold_at:
+                return False
+            c = conn.execute("SELECT COALESCE(closed_by, '') FROM claim_log WHERE wa_user = ? AND alert_ts = ?"
+                             " ORDER BY id DESC LIMIT 1", (user, r[0])).fetchone()
+        who = ((c[0] if c else "") or "").strip()
+        return bool(who) and who not in ("replied in WhatsApp", "sorted (booked or replied)")
+    except Exception:
+        return False
+
+
+def stall_fold_buzz(conn, user: str, d: dict) -> str:
+    """O1 + Fix 1b item 4 (owner, 2 Oct): a repeat with a deadline or about money buzzes instead of
+    folding quietly. Fix 1b's repeat_must_buzz judges the waiting words written since the open alert
+    (the attachments' placeholders left out): 'deadline' / 'money' / '' (fold)."""
+    since = stall_buzz_floor(conn, user)       # [R3 fix, REVERIFY N-1]
+    words = " ".join(t for t, ts in d.get("run", []) if ts > since and not stall_media(t))
+    return repeat_must_buzz(user, words) if words.strip() else ""
+
+
+def stall_buzz_floor(conn, user: str) -> float:
+    """[R3 fix, REVERIFY N-1] The words a sweep buzz judges (and quotes) are those written after this: the open alert,
+    or its last buzz (buzz_ts:<user>, R2C-F2) - a kept alert keeps its ts, so the deadline already buzzed onto it is
+    not judged, posted and e-mailed again for a later "Hello?? any news"."""
+    r = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    a_ts = (r[0] or 0.0) if r else 0.0
+    b = conn.execute("SELECT value FROM settings WHERE key = ?", (f"buzz_ts:{user}",)).fetchone()
+    return max(a_ts, _stall_num(b[0] if b else ""))
+
+
+def stall_chase_outcome(user: str, alert_ts: float, nowts: float) -> str:
+    """O1 E5, [R1 fix, T-7]: the words of the staff-only chase note of a staff_stalled alert. The customer is
+    never messaged by it; the note says what the bot DID tell them since the alert - its "the team will
+    reply" lines (folded into the alert as '➕') - instead of claiming the bot said nothing. Unsure: the
+    plain line."""
+    p, last = 0, 0.0
+    try:
+        with closing(db()) as conn:
+            p = unanswered_promises(conn, user, max(alert_ts - 180, nowts - 7 * 86400))
+            if p:
+                for ts, content, kind in conn.execute(
+                        "SELECT ts, content, COALESCE(kind, '') FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                        " AND ts >= ? ORDER BY id DESC LIMIT 20", (user, alert_ts - 180)).fetchall():
+                    c = (content or "").strip()
+                    if kind in ("", "ack", "chase") and not c.startswith(UNDELIVERED_PREFIX) and is_promise_text(c):
+                        last = ts or 0.0
+                        break
+    except Exception:
+        p = 0
+    if p >= 1:
+        at = (f" (last at {datetime.fromtimestamp(last, ZoneInfo('Europe/Dublin')).strftime('%H:%M')})"
+              if last else "")
+        return (f"A colleague was handling this chat. The bot has told them {p}× since the alert that the team "
+                f"will reply{at}, so it sent no 'sorry for the wait' — please reply to them yourself.")
+    return ("A colleague was handling this chat, so the bot sent them no 'sorry for the wait' — "
+            "please reply to them.")
+
+
+def stall_assist_gate(d: dict, now, open_now: bool) -> bool:
+    """[R3 fix, K-1] May the sweep let the bot finish this waiting run itself (the assist, _maybe_courtesy_close)?
+    O1 (STALL_ALERTS on): only in opening hours, only a simple run (assist_ok: the newest message alone asks, no
+    attachment) and never after a 👍 / ok / thanks (filler_tail) - anything else gets the staff_stalled alert.
+    STALL_ALERTS=0 raises no such alert, so live's assist comes back whole: every pass 09-20 h, whatever the run - with
+    its own assist_booking / fabricated / promise alerts, their ladder and the customer's chase (live's)."""
+    if not STALL_ALERTS:
+        return 9 <= now.hour < 20
+    return bool(open_now and d.get("assist_ok") and not d.get("filler_tail"))
+
+
+def stall_mark_acted(user: str, d: dict) -> None:
+    """[R3 fix, B-2] The sweep's act-once mark for this waiting run (stall_swept:<user>), written once its outcome is
+    durable: the post sent, the alert row written, the assist answered, or nothing due."""
+    set_setting(f"stall_swept:{user}", str(d["ts"]))
+
+
+def stall_sweep_failed(user: str, d: dict) -> None:
+    """[R3 fix, B-2] The sweep raised on this waiting run: the next pass tries once more (a locked database, a network
+    blip); a second failure on the same run marks it acted on - never an hourly repeat of a post that went out before
+    the failure. A process that dies (a redeploy, a crash) writes nothing: the next pass acts again. Never raises."""
+    try:
+        key = f"stall_fail:{user}"
+        if _stall_num(get_setting(key, "")) >= d["ts"]:
+            stall_mark_acted(user, d)
+        else:
+            set_setting(key, str(d["ts"]))
+    except Exception:
+        log.exception("Stalled-chat sweep: could not note the failure for %s", user)
+
+
+def sweep_stalled_staff_chats(from_briefing: bool = False) -> None:
+    """Owner's rule (12 Aug), O1 (2 Oct): a customer message left waiting in a chat a colleague
+    is handling is never lost. Once it is STAFF_STALL_HOURS old (and under STALL_LOOKBACK_HOURS):
+    in opening hours, while the colleague still holds the chat, the bot may still finish a simple
+    one (the assist rules, as before - never an attachment, never when an earlier message of the
+    run asks too); otherwise staff get ONE tracked 'staff_stalled' alert - Done button, ladder,
+    the morning briefing, the 18:00 digest, a staff-only chase note - or a quiet '➕ wrote again'
+    edit of a fresh open alert (F3), unless the repeat is about money or a deadline (Fix 1b's
+    repeat_must_buzz: then a new alert). Never a second alert where one stands, never an answer to
+    a 👍 / ok / thanks, never a message to the customer after hours. What is waiting is acted on
+    once (stall_swept:<user>). Runs hourly 08-20 h, and from the morning briefing first
+    (from_briefing - whatever DAILY_BRIEF_HOUR is), so a question asked overnight is on that list."""
     if not bot_enabled():
         return
-    now = now_local()
-    if not (9 <= now.hour < 20):
-        return
     nowts = time.time()
-    lo = nowts - 2 * STAFF_STALL_HOURS * 3600   # act once: 1h-2h old only
-    hi = nowts - STAFF_STALL_HOURS * 3600
+    seen_ts = _stall_num(get_setting("stall_sweep_seen", ""))
+    set_setting("stall_sweep_seen", str(nowts))      # every call, day and night (reminder_loop is hourly)
+    if not get_setting("stall_sweep_since", ""):
+        # the first pass after the deploy: today's 2 h reach back, never further - no burst
+        set_setting("stall_sweep_since", str(nowts - 2 * STAFF_STALL_HOURS * 3600))
+    elif seen_ts and nowts - seen_ts > STALL_GAP_HOURS * 3600:
+        # it did not run for a while (a rollback and a later redeploy, an outage, the bot switched
+        # off): what was written meanwhile, up to today's 2 h reach, is not swept - no burst
+        keep = [f"{a:.0f}-{b:.0f}" for a, b in stall_floor()[1] if b > nowts - (STALL_LOOKBACK_HOURS + 1) * 3600]
+        set_setting("stall_sweep_gap", ",".join(keep + [f"{seen_ts:.0f}-{nowts - 2 * STAFF_STALL_HOURS * 3600:.0f}"]))
+    since_ts, gaps = stall_floor()
+    now = now_local()
+    if not (from_briefing or 8 <= now.hour < 20):
+        return       # the night's messages wait for the morning pass (the alert ladder's hours)
+    open_now = _open_now(now)
+    todo = []
     with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT ht.wa_user, ht.ts FROM human_takeover ht WHERE ht.ts >= ?",
-            (nowts - AUTO_RESUME_HOURS * 3600,)).fetchall()
-        stalled = []
-        for user, staff_ts in rows:
-            # Skipping reminders: one landing on a chat a colleague has gone
-            # quiet on would make the newest row an assistant one, and the
-            # customer's question would never be swept back to the bot.
-            recent = conn.execute(
-                "SELECT role, content, ts FROM messages WHERE wa_user = ? "
-                "AND COALESCE(kind,'') <> 'reminder' "
-                "ORDER BY id DESC LIMIT 10", (user,)).fetchall()
-            # A colleague's 👍 reaction or "Hi" after the customer's question is not
-            # an answer (Stage 2a): look past it to what the customer is waiting on.
-            skipped, last = [], None
-            for r in recent:
-                # (An old "[colleague replied in the app]" row, saved before Stage 2a,
-                # may have been a photo or a voice-note answer: read as before.)
-                if (r[0] == "staff" and not is_real_staff_text(r[1])
-                        and (r[1] or "").strip() != STAFF_OLD_PLACEHOLDER):
-                    skipped.append(r)
-                    continue
-                last = r
-                break
-            if not last or last[0] != "user":
-                continue  # nothing pending from the customer
-            # ...but a 👍 on a thank-you or a plain statement IS the reply. Only a
-            # question is left hanging by one.
-            if skipped and (is_filler_customer_text(last[1]) or (
-                    "?" not in (last[1] or "")
-                    and all(classify_staff(s[1]) in ("reaction", "placeholder") for s in skipped))):
+        rows = conn.execute("SELECT wa_user, ts FROM human_takeover WHERE ts >= ?",
+                            (nowts - (STALL_LOOKBACK_HOURS + AUTO_RESUME_HOURS) * 3600,)).fetchall()
+        for u, t in rows:
+            try:
+                d = stall_decision(conn, u, nowts, t or 0.0, since_ts, gaps)
+            except Exception:
+                log.exception("Stalled-chat sweep could not read %s - skipped this pass", u)
                 continue
-            if not (lo <= (last[2] or 0) < hi):
-                continue  # too fresh, or already swept in an earlier pass
-            stalled.append((user, last[1] or ""))
-    for user, last_text in stalled:
+            if d["act"]:
+                todo.append(d)
+    for d in todo:
+        user = d["user"]
         try:
-            if is_blocked(user) or is_paused(user):
+            if is_blocked(user) or is_paused(user) or (OWNER_WHATSAPP and user == OWNER_WHATSAPP):
                 continue
-            before = None
+            # [R1 fix, S-1] whether this run's one-off ⏳ line already went under an older alert whose own chase is
+            # still to come (open_older, below)
+            older_done = _stall_num(get_setting(f"stall_older:{user}", "")) >= d["ts"]
+            # [R3 fix, B-2] the act-once mark (stall_swept:<user>) is written once the outcome is durable - after the
+            # post, the alert row, the assist's answer, or a decision that nothing is due (stall_mark_acted) - never
+            # before the work: a restart (a redeploy, a crash) between the mark and the alert row lost the question for
+            # good. A restart now acts again on the next pass (at least once, as live); an exception is retried once.
+            # The customer side, as before but only in opening hours, only while the colleague
+            # still holds the chat (the assist prompt says so), never on a 👍 / ok / thanks, never
+            # for an attachment, and never when an earlier message of the run asks too (the assist
+            # answers the last message only). [R3 fix, K-1] With STALL_ALERTS=0: live's assist, 09-20 h, any run.
+            if stall_assist_gate(d, now, open_now) and not older_done and human_handling(user):
+                try:
+                    with closing(db()) as conn:
+                        before = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
+                                              "role = 'assistant'", (user,)).fetchone()[0]
+                    if _maybe_courtesy_close(user) == "alerted":  # answers the simple thing, or does nothing
+                        # Fix 1 [R1 N4]: the model was down; the blank alert covering this message
+                        # already told staff - a stalled alert too would be a second post
+                        log.info("Stalled staff chat %s: model outage, the blank alert covers it", user)
+                        stall_mark_acted(user, d)     # [R3 fix, B-2]
+                        continue
+                    with closing(db()) as conn:
+                        after = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
+                                             "role = 'assistant'", (user,)).fetchone()[0]
+                    if after > before:
+                        log.info("Stalled staff chat finished by bot: %s", user)
+                        stall_mark_acted(user, d)     # [R3 fix, B-2]
+                        continue
+                except Exception:
+                    log.exception("Stalled staff chat %s: the assist step failed - staff are told instead", user)
+            # Read again just before telling staff: a colleague may have answered (or the customer
+            # written again) while the earlier chats were being handled.
             with closing(db()) as conn:
-                r = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
-                                 "role = 'assistant'", (user,)).fetchone()
-                before = r[0]
-            if _maybe_courtesy_close(user) == "alerted":  # answers the simple thing, or does nothing
-                # Fix 1 [R1 N4]: the model was down; the blank alert covering this message
-                # already told staff - a "⏳ stalled" note too would be a second post
-                log.info("Stalled staff chat %s: model outage, the blank alert covers it", user)
+                again = stall_pending(conn, user)
+            if not again or again["ts"] != d["ts"]:
+                log.info("Stalled staff chat %s: answered or changed meanwhile - nothing sent", user)
+                stall_mark_acted(user, d)     # [R3 fix, B-2]
+                continue
+            hrs = max(1, int((nowts - d["quote_ts"]) / 3600))
+            snippet = " ".join(d["text"].split())[:140]
+            if not (STALL_ALERTS and d["asks"]):
+                # A statement ("5 mins", "Thanks see tomorrow"), or the switch is off: today's one-off
+                # line - for a statement only under today's conditions (09-20 h, the colleague still
+                # holding the chat), never more than before
+                if d["asks"] or (9 <= now.hour < 20 and human_handling(user)):
+                    send_telegram("⏳ Staff conversation stalled — customer waiting "
+                                  f"{hrs}h+\n{customer_label(user)}\n"
+                                  f"Last message: \"{snippet}\"\n"
+                                  f"💬 Reply: https://wa.me/{user}")
+                stall_mark_acted(user, d)     # [R3 fix, B-2] after the line - or when none is due (acted on, as before)
                 continue
             with closing(db()) as conn:
-                r = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
-                                 "role = 'assistant'", (user,)).fetchone()
-            if r[0] > before:
-                log.info("Stalled staff chat finished by bot: %s", user)
+                cover = stall_cover(conn, user, d["quote_ts"], d["ts"])
+                why = stall_fold_buzz(conn, user, d) if cover in ("fold", "open_older") else ""
+                # [R1 fix, S-1] an alert raised over an older open one whose own chase is still to come
+                # (a buzz, or a fold that could not edit it) keeps that one's kind - and so its chase
+                keep = stall_open_kind(conn, user, nowts) if cover in ("fold", "open_older") else ""
+                a_row = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()   # [R2 fix]
+                a_ts = (a_row[0] or 0.0) if a_row else 0.0
+                b_ts = stall_buzz_floor(conn, user) if why else a_ts      # [R3 fix, REVERIFY N-1]
+            if cover in ("covered", "handled"):
+                log.info("Stalled staff chat %s: %s - no new alert", user, cover)
+                stall_mark_acted(user, d)     # [R3 fix, B-2]
                 continue
-            snippet = " ".join(last_text.split())[:140]
-            send_telegram("⏳ Staff conversation stalled — customer waiting "
-                          f"{int(STAFF_STALL_HOURS)}h+\n{customer_label(user)}\n"
-                          f"Last message: \"{snippet}\"\n"
-                          f"💬 Reply: https://wa.me/{user}")
+            if cover == "alert" and older_done and stall_older_done(user, d):
+                # [R2 fix, RT-2 / ST-1] a person pressed Done on the alert that carries this run's ➕ ("Press Done only
+                # when this is sorted too"): sorted, as the fold twin - acted on (stall_swept), no new alert
+                log.info("Stalled staff chat %s: Done on the alert that carries this run's ➕ - sorted", user)
+                stall_mark_acted(user, d)     # [R3 fix, B-2]
+                continue
+            if cover == "fold" and not why and note_quiet_repeat(user, d["text"], said=STALL_FOLD_SAID,
+                                                                 at=d["quote_ts"]):
+                log.info("Stalled staff chat %s: folded into the open alert", user)
+                stall_mark_acted(user, d)     # [R3 fix, B-2]
+                continue
+            if cover == "open_older" and not why:
+                # [R1 fix, S-1] an older open alert (a hand-over, unhappy, blank, assist_booking...) still has
+                # its own chase to come - the customer's "sorry for the wait" (owner Q3: kept). It is never
+                # replaced: staff get live's one-off ⏳ line (09-20 h) and a quiet '➕ wrote again' edit of it
+                # (its chase clock left alone), and nothing is marked acted on - the first pass after that
+                # alert is chased or Done raises the staff_stalled alert as designed. Its own act-once:
+                # stall_older:<user>.
+                # [R3 fix, B-2] (stall_swept was never written for this run: nothing to put back)
+                if older_done or not (9 <= now.hour < 20):
+                    continue
+                if note_quiet_repeat(user, d["text"], chase_clock=False, said=STALL_FOLD_SAID, at=d["quote_ts"]):
+                    # [R2 fix, RT-2 / ST-1] the ➕ landed on that alert: a person's Done on it now sorts this run too
+                    set_setting(f"stall_older_on:{user}", f"{d['ts']!r}|{a_ts!r}|{time.time()!r}")
+                send_telegram("⏳ Staff conversation stalled — customer waiting "
+                              f"{hrs}h+\n{customer_label(user)}\n"
+                              f"Last message: \"{snippet}\"\n"
+                              f"💬 Reply: https://wa.me/{user}")
+                set_setting(f"stall_older:{user}", str(d["ts"]))     # [R3 fix, B-2] its own act-once, once the line went
+                log.info("Stalled staff chat %s: an older open alert's own chase is still to come - the ⏳ line", user)
+                continue
+            # [R2 fix, R2C-F3] the words staff read first: the run's newest WORDED question (say), with a photo /
+            # video sent after it named in the reason; d["text"] / d["quote_ts"] stay the cover's and act-once keys'
+            say, say_ts = d.get("say") or d["text"], d.get("say_ts") or d["quote_ts"]
+            run_ = d.get("run", [])
+            also = ""
+            if say != d["text"] and stall_media(d["text"]):
+                # [R3 fix, W-6] the attachments after it in words: "a voice note", "2 photos"
+                mw_ = stall_media_words([t for t, ts in run_ if ts > say_ts], plain=True)
+                also = f" They also sent {mw_ or 'an attachment'} after it."
+            when = datetime.fromtimestamp(say_ts, ZoneInfo("Europe/Dublin")).strftime("%a %H:%M")
+            said_hrs = max(1, int((nowts - say_ts) / 3600))
+            last = ""
+            if d["quote_ts"] != d["ts"]:
+                # [R3 fix, W-2] how many of what, and their words cut on a word with '…' (an attachment in words)
+                nw_ = d["newest"]
+                last = (f" Their last message ({d['n']} messages waiting): "
+                        f"{stall_media_words([nw_], plain=True) if stall_media(nw_) else stall_quote(nw_, 80)}.")
+            # [R3 fix, D-6 / REVERIFY N-1] a money / deadline buzz quotes the words that carry it, written since the alert
+            # or its last buzz (attachments left out) - on the kept kind's row (RT-3) and on an open staff_stalled row
+            # alike; the reason leads with why it buzzed (said once: no closing "They asked again ..." sentence)
+            lead = {"money": "asked again about money",
+                    "deadline": "⏰ asked again, with a deadline"}.get(why, "still waiting in a colleague's chat")
+            bq_ = (repeat_buzz_quote(user, why, [t for t, ts in run_ if ts > b_ts and not stall_media(t)])
+                   if why else "")
+            # [R3 fix, W-6] an attachment-only run is described ("🎤 a voice note", "📷 2 photos"), not quoted as words
+            shown = stall_media_words([t for t, _ts in run_]) if stall_media(say) else ""
+            # [R2 fix, RT-6] a short prefix (the lists cut the line at 60-70 characters) and their words cut on a
+            # word with '…'
+            headline = f"⏳ COLLEAGUE'S CHAT — {bq_ or shown or stall_quote(say)}"
+            reason = (f"They wrote {when} ({said_hrs}h ago) while a colleague was handling the chat. "
+                      "Nobody has answered it, and the bot does not answer for a colleague." + also + last)
+            # [R2 fix, R2C-F2] a money / deadline repeat over an open, unchased alert is an extra loud post on IT (its
+            # clocks kept; fold_clock as the fold it stands in for); [R2 fix, RT-1] since_ts: when they wrote
+            if keep:
+                # [R1 fix, S-1] typed as that kind, the headline is the reason's first words ("🙋 FOLLOW UP — ...") -
+                # they say why and quote the customer, as Fix 1b's own buzz alert does; [R2 fix, RT-3] the buzz quotes
+                # the words that carry the deadline / the money (written since that alert, attachments left out)
+                q_ = bq_ or shown or stall_quote(say, 70)
+                alert_owner(user, headline, f"{lead}: {q_} — " + reason, keep_clock=bool(why),
+                            fold_clock=cover == "fold", since_ts=say_ts, kind=keep)
+            else:
+                alert_owner(user, headline, (f"{lead}: {bq_} — " if why else "") + reason, keep_clock=bool(why),
+                            fold_clock=cover == "fold", since_ts=say_ts, kind="staff_stalled")
+            stall_mark_acted(user, d)     # [R3 fix, B-2] the alert row is written (or the post joined the open one)
+            log.info("Stalled staff chat %s: staff_stalled alert (%dh%s)", user, hrs, ", " + why if why else "")
         except Exception:
             log.exception("Stalled-chat sweep failed for %s", user)
+            stall_sweep_failed(user, d)   # [R3 fix, B-2] retried once at the next pass, then acted on
 
 def _chase_note(user: str, hours: int, outcome: str) -> None:
     """Tell the owner/staff DIRECTLY that a customer is still waiting, and what the
@@ -9777,6 +12194,13 @@ def chase_unresolved_alerts() -> None:
             if resolved or moved:
                 continue
             hours = int((nowts - alert_ts) / 3600)
+            # O1: a message left in a colleague's chat waits for that person, not for the bot:
+            # staff are told again and the customer gets no "sorry for the wait" over them.
+            if alert_kind(user, alert_ts) == STALL_KIND:
+                # [R1 fix, T-7] [R2 fix, RT-1] the hours since they WROTE (the sweep raised it an hour or more later)
+                _chase_note(user, int((nowts - alert_since_ts(user, alert_ts)) / 3600),
+                            stall_chase_outcome(user, alert_ts, nowts))
+                continue
             # WhatsApp's 24h wall: once the customer has been silent longer than the
             # window, Meta silently blocks a normal message. The approved template
             # used to go instead - the "you were asking us yesterday, would you like
@@ -10483,6 +12907,13 @@ def classify_staff(content: str) -> str:
     t = (content or "").strip()
     if not t:
         return "empty"
+    # [Fix 1b item 5, S1-07; v2] "Your address / Send me / Please": a bare "Please" (the word alone -
+    # no emoji, no other word) answers nothing. "Yes please", "please 👍", "Please mate", "Please
+    # send" still answer.
+    # [R3 fix, K-2] ...item 5's own switch: SORRY_COUNT=0 is live here too ("Please" is a real answer). Read with
+    # globals().get: the older suites lift classify_staff on its own (without the switch) - the default then, as before
+    if globals().get("SORRY_COUNT", True) and re.fullmatch(r"(?:please|pls|plz|plse)[\s.!]*", t, re.IGNORECASE):
+        return "holding"
     if t == STAFF_OLD_PLACEHOLDER:
         return "placeholder"
     if t.startswith(_STAFF_MEDIA_PREFIXES):
@@ -10626,9 +13057,10 @@ def is_filler_customer_text(t: str) -> bool:
 
 
 def is_promise_text(t: str) -> bool:
-    """A bot line that promises a person will come back - which is not an answer."""
+    """A bot line that promises a person will come back - which is not an answer. [Fix 1b] + a
+    deferral, a special-request hand-over or (NIGHT_LINE_ALERT=1) the night line (fix1b_phrase)."""
     return bool(_CLAIMS_A_PERSON_RE.search(t or "") or _CLAIMS_A_PERSON_MORE_RE.search(t or "")
-                or _HOUSE_HANDOVER_RE.search(t or "") or wide_promise_phrase(t))
+                or _HOUSE_HANDOVER_RE.search(t or "") or wide_promise_phrase(t) or fix1b_phrase(t))
 
 
 def bot_really_moved_on(conn, user: str, since: float, now: float):
@@ -10942,7 +13374,11 @@ def escalate_unclaimed_alerts() -> None:
                 continue
             mins = int((now - ts) / 60)
             label = customer_label(user)
-            asks = ask_note_for_row(ts, first_ts, n_asks, chain_ts, now)
+            # [R3 fix, RT-1 twin] 'waiting since' when the customer wrote, as the alert's first post says it (display
+            # only: the ladder's clocks stay on the alert's own time)
+            since_ = (alert_since_ts(user, first_ts) if (first_ts and chain_ts == ts and int(n_asks or 0) >= 2)
+                      else first_ts)
+            asks = ask_note_for_row(ts, since_, n_asks, chain_ts, now)
             # [R2 fix, TG2] "➕ wrote again 2× since this alert, last at 10:25: “…”" - the newest words
             more = (tg_text or "").partition(_QUIET_REPEAT_MARK)[2].split(" — the bot told")[0].strip()
             head = headline + ("\n➕ " + more if more else "") + ("\n" + asks if asks else "")
@@ -11551,15 +13987,17 @@ def _owner_last_typed(user: str):
     return float(row[0] or 0) if row else None
 
 
-def _owner_window_problem(user: str) -> str:
+def _owner_window_problem(user: str, limit: float = 0.0) -> str:
     """Why the bot can't message this customer now ("" = it can): WhatsApp's 24-hour
-    window since they last typed, judged exactly as the chase judges it."""
+    window since they last typed, judged exactly as the chase judges it. [R3 fix, U-1] limit: O2's
+    free-form sends pass O2_WINDOW_SECONDS (the real 24 h less 2 min); the owner's replies keep the
+    chase's CHASE_WINDOW_SECONDS (they can go minutes after the draft)."""
     last = _owner_last_typed(user)
     if last is None:
         return "they've only phoned — they have never written to us on WhatsApp"
     if last < 0:
         return "I couldn't check when they last wrote"
-    if time.time() - last > CHASE_WINDOW_SECONDS:
+    if time.time() - last > (limit or CHASE_WINDOW_SECONDS):
         # No "23h ago" here: the bot stops 15 minutes short of the 24 hours, to be safe.
         return ("WhatsApp only lets us message them within 24 hours of their last message, "
                 "and that has run out (they last wrote "
@@ -14016,6 +16454,7 @@ def _task_newer_nearby(tid: int, user: str, day: str, created_ts: float) -> bool
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT date FROM tasks WHERE wa_user = ? AND id <> ? AND created_ts > ?"
+            " AND COALESCE(kind, '') <> 'phone_confirm'"   # O2: a read-back is not a moved day
             " AND (COALESCE(closed_ts, 0) = 0 OR COALESCE(closed_by, '') NOT IN ("
             + ",".join("?" * len(auto)) + "))",
             (user, tid, created_ts or 0, *auto)).fetchall()
@@ -14061,7 +16500,8 @@ def tick_tasks() -> None:
         rows = conn.execute(
             "SELECT id, wa_user, date, how, source, sentence, created_ts, due_ts, posted_ts,"
             " escalated_ts, owner_ts, headline, said_ts FROM tasks"
-            " WHERE COALESCE(closed_ts, 0) = 0 AND created_ts > ?",
+            " WHERE COALESCE(closed_ts, 0) = 0 AND created_ts > ?"
+            " AND COALESCE(kind, '') <> 'phone_confirm'",   # O2: those tick in tick_readbacks
             (now - 60 * 86400,)).fetchall()
     for (tid, user, day, how, source, sentence, created, due, posted,
          esc, own, headline, said) in rows:
@@ -14187,6 +16627,7 @@ def open_task_lines(limit: int = 10) -> list:
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT wa_user, date FROM tasks WHERE COALESCE(closed_ts, 0) = 0 AND date >= ?"
+            " AND COALESCE(kind, '') <> 'phone_confirm'"   # O2: listed on their own
             " ORDER BY date, id", (today,)).fetchall()
     if not rows:
         return []
@@ -14235,6 +16676,10 @@ def telegram_button_loop() -> None:
                 tick_tasks()
             except Exception:
                 log.exception("Task tick error")
+            try:
+                tick_readbacks()   # O2: the phone-booking read-backs
+            except Exception:
+                log.exception("Read-back tick error")
             try:
                 owner_drafts_sweep()   # an owner's ✅ or note lost mid-way (a restart)
             except Exception:
@@ -14291,6 +16736,12 @@ def waiting_alerts(conn, days: int = WAITING_DAYS) -> tuple:
         "SELECT wa_user, ts, COALESCE(label, ''), COALESCE(headline, '') FROM alerts"
         " WHERE ts >= ? ORDER BY ts ASC", (floor,)).fetchall()
     waiting = [r for r in rows if not alert_resolved(conn, r[0], r[1])]
+    # [R2 fix, RT-1 / R2C-F1] aged and ordered by when the customer started waiting: an alert the stalled-staff
+    # sweep raised an hour or more after they wrote (an overnight question, raised by the morning briefing's own
+    # pass) carries their time (alert_since_ts) - never "waiting 0h" at the bottom of "longest-waiting first", or
+    # cut into the "+N more" line. The age floor and alert_resolved read the alert's own ts, as before.
+    waiting = sorted(((u, alert_since_ts(u, ts, conn), label, h) for u, ts, label, h in waiting),
+                     key=lambda r: r[1] or 0)
     rows = conn.execute(   # newest first: the ones that have only just passed the floor
         "SELECT wa_user, ts, COALESCE(label, ''), COALESCE(headline, '') FROM alerts"
         " WHERE ts < ? AND ts >= ? AND COALESCE(closed_ts, 0) < ts ORDER BY ts DESC",
@@ -14418,8 +16869,9 @@ def evening_reg_check() -> None:
                 try:
                     send_telegram(f"📋 Still no {what} for {name or 'a customer'}"
                                   f"{' +' + digits if digits else ''} booked {date_}"
-                                  f" ({car or 'car?'} {reg or 'reg?'}). They were texted "
-                                  "for it and never answered — please ring them.")
+                                  f" ({car or 'car?'} {reg or 'reg?'}). "
+                                  + (_o2_untexted_note(bid)   # O2: never texted, so say so
+                                     or "They were texted for it and never answered — please ring them."))
                 except Exception:
                     log.exception("Reg-still-missing alert failed for booking %s", bid)
                 with closing(db()) as conn, conn:
@@ -14437,9 +16889,23 @@ def evening_reg_check() -> None:
                 date_label = date_
             text = (f"Hi{' ' + name if name else ''} — quick check before your "
                     f"{date_label} booking: could you confirm {' and '.join(what)}? 👍")
+            why = caller_window_problem(digits)   # O2: WhatsApp would refuse it
             try:
-                send_whatsapp(digits, text)
-                flagged += 1
+                if why:
+                    # O2: no text WhatsApp would refuse. One line per number per evening, and
+                    # none while the phone booking's read-back is open (the person ringing
+                    # reads the car and reg back). reg_alerted is NOT set: the "Still no ..."
+                    # line two days before still comes, worded "we could not text them".
+                    set_setting(f"o2_untexted:{bid}", why[:200])
+                    if (_O2_EVENING_TOLD.get(digits) != now.date().isoformat()
+                            and not readback_open(digits, date_)):
+                        _O2_EVENING_TOLD[digits] = now.date().isoformat()
+                        send_telegram(f"📋 {name or 'A customer'} +{digits} booked {date_}: we still "
+                                      f"need {' and '.join(what)} ({car or 'car?'} {reg or 'reg?'}). "
+                                      f"WhatsApp can't reach them: {why}. Please ring them.")   # [R3 fix, W-4]
+                else:
+                    o2_sent(send_whatsapp(digits, text), "nosave")   # O2: this text is never saved
+                    flagged += 1
             except Exception:
                 log.exception("Evening reg-check text failed for booking %s", bid)
         with closing(db()) as conn, conn:
@@ -14563,6 +17029,14 @@ def send_daily_briefing(force: bool = False) -> None:
     if not force and get_setting("last_brief") == now.date().isoformat():
         return  # already sent today
     set_setting("last_brief", now.date().isoformat())
+    if not force:
+        # O1: a question asked overnight in a chat a colleague was handling gets its alert
+        # (Done button, ladder) first, so this list never says "all clear" while they wait -
+        # at DAILY_BRIEF_HOUR, whatever the sweep's own 08-20 h gate says.
+        try:
+            sweep_stalled_staff_chats(from_briefing=True)
+        except Exception:
+            log.exception("Stalled staff chat sweep before the briefing failed")
     today_iso = now.date().isoformat()
     tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
     nowts = time.time()
@@ -14636,6 +17110,14 @@ def send_daily_briefing(force: bool = False) -> None:
     if _task_lines:
         parts.append("")
         parts.extend(_task_lines)
+    try:
+        _rb_lines = open_readback_lines()   # O2: phone bookings nobody has read back
+    except Exception:
+        log.exception("Could not list the open read-backs")
+        _rb_lines = []
+    if _rb_lines:
+        parts.append("")
+        parts.extend(_rb_lines)
     try:
         _hand_lines, _hand_ids, _hand_dropped = hand_followup_lines()
     except Exception:
@@ -14948,6 +17430,8 @@ READ_ONLY_ACTIONS.add("promisetest")
 # Fix 1: the promise safety net and the ask counter - they read, never write or send.
 READ_ONLY_ACTIONS.add("promisefix")
 READ_ONLY_ACTIONS.add("asktest")
+# O1: what the stalled-staff sweep would do now - it reads, never writes, sends or calls the model.
+READ_ONLY_ACTIONS.add("stalltest")
 # The owner's Telegram notes: a dry-run draft, the alert mapper, the drafts list -
 # nothing is saved or sent.
 READ_ONLY_ACTIONS.update({"tgcmdtest", "tgmaptest", "ownerdrafts"})
@@ -14959,6 +17443,9 @@ READ_ONLY_ACTIONS.add("stafftest")
 READ_ONLY_ACTIONS.add("wordingtest")
 # The bank-holiday list and what the rules make of one moment: pure, reads no customer.
 READ_ONLY_ACTIONS.add("holidays")
+# O2: can WhatsApp take a text to this number now, and what would each path do - reads the time
+# of their last message and their open read-backs only; sends and saves nothing.
+READ_ONLY_ACTIONS.add("windowcheck")
 
 
 def review_link_token() -> str:
@@ -15891,7 +18378,9 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         if is_blocked(digits):
             return {"error": "number is blocked"}
         send_whatsapp(digits, text)
-        save_message(digits, "assistant", text)
+        # [R2 fix, R2-REG-1] the owner's own words, as his Telegram reply is saved: a real answer (stall_pending
+        # R1-1), never the assist's warm line - no false STILL WAITING alert in a colleague's chat
+        save_message(digits, "assistant", text, kind="owner_tg")
         return {"sent": True, "to": digits, "text": text}
     if action == "invoicereq":
         # Send a REAL invoice request to the accountant through the normal
@@ -16417,6 +18906,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                     "token_set": bool(TELEGRAM_BOT_TOKEN), "chat_ids": telegram_chat_ids()}
         send_telegram("✅ Test alert from your NCTPass bot. Alerts are working.")
         return {"sent_to": telegram_chat_ids()}
+    if action == "windowcheck":
+        # Read-only (O2): ?need=<number> (or &date=). The switches, how refusals were matched
+        # since start, and what each O2 path would do for that number now.
+        num = "".join(ch for ch in (need or date or "") if ch.isdigit())
+        return o2_windowcheck(normalize_phone(num) if num else "")
     if action == "delivery":
         # What WhatsApp told us about our outgoing messages — read from the
         # persisted log so restarts no longer wipe the answer.
@@ -16618,6 +19112,90 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         # Read-only (Stage 2a). Would this message from a colleague close an alert?
         return {"text": (need or "")[:200], "class": classify_staff(need or ""),
                 "closes_alert": is_real_staff_text(need or "")}
+    if action == "stalltest":
+        # Read-only (O1). What the stalled-staff sweep would do if it ran now: every chat a
+        # colleague touched in the look-back (need=<number>: that one), what is waiting in it and
+        # the step the sweep would take. Nothing is saved, sent or alerted, no model is called,
+        # and the act-once marks are only read. Also the new-code deploy probe.
+        nowts = time.time()
+        now = now_local()
+        num = normalize_phone(need or phone or "") if (need or phone) else ""
+        since_ts, gaps = stall_floor()
+        seen_ts = _stall_num(get_setting("stall_sweep_seen", ""))
+        open_now = _open_now(now)
+        chats = []
+        with closing(db()) as conn:
+            sql = "SELECT wa_user, ts FROM human_takeover WHERE ts >= ?"
+            args = [nowts - (STALL_LOOKBACK_HOURS + AUTO_RESUME_HOURS) * 3600]
+            if num:
+                sql += " AND wa_user = ?"
+                args.append(num)
+            for u, took in conn.execute(sql, args).fetchall():
+                try:
+                    d = stall_decision(conn, u, nowts, took or 0.0, since_ts, gaps)
+                except Exception:
+                    chats.append({"who": "…" + u[-4:], "acts_now": False, "why_not": "could not read", "step": ""})
+                    continue
+                step = ""
+                if d["act"]:
+                    held = human_handling(u)
+                    # [R2 fix, ST-3] the sweep's own marks: this run's ⏳ line already went under an older open alert
+                    older_done = _stall_num(get_setting(f"stall_older:{u}", "")) >= d["ts"]
+                    # [R3 fix, K-1] the sweep's own gate (stall_assist_gate): with STALL_ALERTS=0, live's 09-20 h, any run
+                    first = (("the bot may finish it first (" + ("open" if STALL_ALERTS else "09-20 h, STALL_ALERTS=0")
+                              + ", the colleague still holds the chat), else ")
+                             if stall_assist_gate(d, now, open_now) and held and not older_done
+                             else "")
+                    if not d["asks"]:
+                        step = first + ("the one-off ⏳ line (a statement, as today)" if 9 <= now.hour < 20 and held
+                                        else "nothing (a statement, outside today's ⏳-line conditions)")
+                    elif not STALL_ALERTS:
+                        step = first + "the one-off ⏳ line (STALL_ALERTS=0)"
+                    else:
+                        cover = stall_cover(conn, u, d["quote_ts"], d["ts"])
+                        why = stall_fold_buzz(conn, u, d) if cover in ("fold", "open_older") else ""
+                        keep = stall_open_kind(conn, u, nowts) if cover in ("fold", "open_older") else ""
+                        kept = buzz_keep_row(conn, u) if why else None      # [R2 fix, R2C-F2]
+                        about = f"the repeat is about {'money' if why == 'money' else 'a deadline'}"
+                        if why and kept:
+                            step = first + (f"a loud post on the open {kept['kind'] or 'alert'} alert, its clocks kept "
+                                            f"(ladder, owner ping, chase): {about}")
+                        elif why:
+                            step = first + f"a new {keep or 'staff_stalled'} alert: {about}"
+                        elif cover == "open_older" and older_done:
+                            # [R2 fix, ST-3] as the sweep: nothing more for this run until that alert is chased or Done
+                            step = (f"nothing - the ⏳ line already went for this run under the older open {keep} alert; "
+                                    "the staff_stalled alert comes on the first pass after that alert is chased (or "
+                                    "Done by nobody who saw it)")
+                        elif cover == "open_older" and not 9 <= now.hour < 20:
+                            step = first + ("nothing now (outside 09-20 h) - the one-off ⏳ line and a quiet '➕ wrote "
+                                            f"again' edit of the older open {keep} alert come at the first pass in 09-20 h")
+                        elif cover == "alert" and older_done and stall_older_done(u, d):
+                            step = "nothing - Done (a person's) on the alert that carries this run's ➕ fold: sorted"
+                        else:
+                            step = first + {"covered": "nothing - an open alert raised for it covers it",
+                                            "handled": "nothing - Done or sorted since they wrote",
+                                            "fold": "a quiet '➕ wrote again' edit of the open alert",
+                                            "open_older": (f"the one-off ⏳ line (09-20 h) and a quiet '➕ wrote again' "
+                                                           f"edit of the older open {keep} alert - its own chase is "
+                                                           "still to come"),
+                                            "alert": "a staff_stalled alert"}[cover]
+                chats.append({"who": "…" + u[-4:], "waiting": (d.get("text") or "")[:80],
+                              "written": _fmt_ts(d["quote_ts"]) if d.get("quote_ts") else "",
+                              "messages_waiting": d.get("n", 0), "asks_a_person": bool(d.get("asks")),
+                              "attachment": bool(d.get("media")), "after_a_thumbs_up": bool(d.get("filler_tail")),
+                              "acts_now": d["act"], "why_not": d["why"], "step": step,
+                              "older_line_sent": bool(d["act"]) and _stall_num(get_setting(f"stall_older:{u}", ""))
+                              >= d["ts"]})    # [R2 fix, ST-3]
+        return {"now": _fmt_ts(nowts), "sweep_runs_now": 8 <= now.hour < 20,
+                "briefing_runs_it_at": f"{DAILY_BRIEF_HOUR:02d}:00", "open_now": open_now,
+                "first_pass_floor": _fmt_ts(since_ts) if since_ts else "not set yet (the first pass sets it)",
+                "last_pass": _fmt_ts(seen_ts) if seen_ts else "none yet",
+                "not_swept_gaps": [f"{_fmt_ts(a)} to {_fmt_ts(b)}" for a, b in gaps] or "none",
+                "switches": {"STALL_ALERTS": STALL_ALERTS, "STALL_LOOKBACK_HOURS": STALL_LOOKBACK_HOURS,
+                             "STAFF_STALL_HOURS": STAFF_STALL_HOURS, "AUTO_RESUME_HOURS": AUTO_RESUME_HOURS,
+                             "REPEAT_BUZZ": REPEAT_BUZZ},
+                "chats": chats}
     if action == "version":
         # Read-only: which commit this build was deployed from (Railway sets it on
         # every GitHub deploy), so a deploy can be confirmed by comparing it with
@@ -16642,8 +19220,11 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "old_phrase": old.group(0) if old else "",
                 "new_phrase": more.group(0) if more else "",
                 "wide_phrase": wide_promise_phrase(reply),
+                "fix1b_phrase": fix1b_phrase(reply, every=True),    # [Fix 1b] whatever the switches say
                 "customer_is_a_thank_you": ack,
-                "thank_you_turn_text": (dropped if visible_text(dropped) else "(short close)") if ack else "",
+                "thank_you_turn_text": (dropped if reply_has_words(dropped) else "(short close)") if ack else "",
+                # [Fix 1b] a reply with no words is never sent (s6-01); the markup debris taken out
+                "has_words": reply_has_words(reply), "without_markup_debris": strip_markup_debris(reply)[:500],
                 "closed_now": "is CLOSED" in clock_line(),
                 "after_hours_then_fixed": ahf[:500],
                 # [R3 fix, D3] what goes out with the switches as they stand (PROMISE_FIX=0: the
@@ -16677,6 +19258,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             first = r[4] if (r[4] and r[7] == r[0]) else r[0]
             since = first - 180    # [v2 BR8] same as C6 (the look-back only; first_asked is `first`)
             promised = unanswered_promises(conn, num, max(since, now - 7 * 86400))
+            parts = unanswered_promise_parts(conn, num, max(since, now - 7 * 86400))   # [Fix 1b item 5]
         nxt = _ask_chain_for(num, "handover", now)
         third = nxt[1] == 3 and nxt[2] == now
         gate = _ask3_ping_gate(nxt[0], now) if third else "not a 3rd ask"
@@ -16684,11 +19266,16 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"number": num, "raised": _fmt_ts(r[0]), "kind": r[8], "topic": r[9],
                 "open": r[1] < r[0] and not resolved, "resolved": resolved,
                 "chased": r[2] >= r[0], "owner_pinged": r[3] >= r[0],
-                "chain_current": r[7] == r[0], "first_asked": _fmt_ts(first),
-                "ask_count": r[5] if r[7] == r[0] else None, "ask_line": ask_note_for_row(r[0], r[4], r[5], r[7], now),
-                "if_they_asked_now": {"ask_count": nxt[1], "first_asked": _fmt_ts(nxt[0]), "third_ask": third,
+                # [R3 fix, RT-1 twin] the times staff read: when the customer wrote (alert_since_ts), as the posts say
+                "chain_current": r[7] == r[0], "first_asked": _fmt_ts(alert_since_ts(num, first)),
+                "ask_count": r[5] if r[7] == r[0] else None,
+                "ask_line": ask_note_for_row(r[0], alert_since_ts(num, r[4]) if r[4] else r[4], r[5], r[7], now),
+                "if_they_asked_now": {"ask_count": nxt[1], "first_asked": _fmt_ts(alert_since_ts(num, nxt[0])),
+                                      "third_ask": third,
                                       "ping_now": third and not gate, "ping_blocked_by": gate},
                 "unanswered_promises": promised, "two_promise_rule_blocks_chase": promised >= 2,
+                "unanswered_promise_parts": {"asks": parts[0], "sorry_seen": parts[1]},   # [Fix 1b item 5]
+                "repeat_would_buzz_now": repeat_must_buzz(num),                         # [Fix 1b item 4]
                 "chase_would_message_customer": chase_ok, "chase_blocked_by": chase_why,
                 "f3_cover_now": open_alert_within(num, WIDE_QUIET_MINUTES * 60), **extra}
     if action == "promisetest":
@@ -16706,9 +19293,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "customer_message_lets_new_phrases_count": counts,
                 "wide_phrase": wide_promise_phrase(reply),
                 "wide_alerts_on": PROMISE_WIDE_ALERTS,
+                # [Fix 1b] a phrase Fix 1b added (whatever the switches say / as they stand), whether the
+                # customer's words are a sign-off, and what a repeat would do while a trusted open
+                # alert covers the customer (item 4)
+                "fix1b_phrase": fix1b_phrase(reply, every=True), "fix1b_phrase_counts_now": fix1b_phrase(reply),
+                "customer_is_a_signoff": customer_signoff(cust),
+                "repeat_would_buzz": repeat_buzz_reason(cust) if (REPEAT_BUZZ and not customer_signoff(cust)) else "",
+                "with_an_open_alert": _repeat_preview(reply, cust),
+                "has_words": reply_has_words(reply),
                 "switches": promise_switches(),    # [R3 fix, D3] as this process read them at start
                 "would_alert": bool(old) or ((bool(more) or (PROMISE_WIDE_ALERTS and bool(wide_promise_phrase(reply))))
-                                             and counts),
+                                             and counts)
+                               or (bool(fix1b_phrase(reply)) and not customer_signoff(cust)),     # [Fix 1b]
                 "rule": "old phrases alert on every turn; new ones only after a real message "
                         "(not a bare thank-you). Either way the live bot stays quiet when "
                         "another alert already covers the same customer message (one raised "
@@ -17724,15 +20320,21 @@ _accepted_calls: set = set()
 _missed_calls: dict = {}          # digits -> timestamps of missed calls (24h)
 _missed_call_alerted: dict = {}   # digits -> when the team was last alerted
 
-def handle_missed_call(caller: str, arrived_on: str = "") -> None:
+def handle_missed_call(caller: str, arrived_on: str = "", report: bool = True) -> str:
     """A WhatsApp call rang out unanswered — invite the caller to chat instead.
     A SECOND missed call inside 24h means the text-back did not work for this
     person (3 Sep 2026: three numbers rang 2-4 times and only ever got the auto
     text) — raise a needs-a-person alert so somebody rings them back."""
+    # O2 (2 Oct 2026): WhatsApp refuses the text to anyone who has not written to us in the
+    # last 24 hours (7 of 7 on 1-2 Oct), so then nothing is sent and a person is told instead.
+    # Returns what happened (missed_call_status_line). report=False = the Retell hang-up: the
+    # line goes on its PHONE CALL message. A WhatsApp call (report=True) is judged only with
+    # WA_CALL_WINDOW_CHECK=1 - the call itself may open the window (not verified yet).
     digits = "".join(c for c in caller if c.isdigit())
     if not digits or is_blocked(digits):
-        return
+        return ""
     now = time.time()
+    again_sent = False   # O2: set only once the AGAIN alert really went
     hist = [t for t in _missed_calls.get(digits, []) if now - t < 24 * 3600] + [now]
     _missed_calls[digits] = hist
     if len(hist) >= 2 and now - _missed_call_alerted.get(digits, 0) > 24 * 3600:
@@ -17740,19 +20342,45 @@ def handle_missed_call(caller: str, arrived_on: str = "") -> None:
         try:
             alert_owner(digits, "📞 Missed WhatsApp call AGAIN — please ring them back",
                         f"{len(hist)} missed calls in 24h and nothing typed in the chat", kind="missed_call")
+            again_sent = True
         except Exception:
             log.exception("Missed-call alert failed for %s", digits)
     if now - _missed_call_replied.get(digits, 0) < 3600:
-        return
+        return "cooldown"
     _missed_call_replied[digits] = now
     if arrived_on:
         _ctx_phone_id.set(arrived_on)
     if human_handling(digits):
-        return  # a colleague owns this chat; they saw the call too
-    send_whatsapp(digits, MISSED_CALL_TEXT)
-    save_message(digits, "assistant", MISSED_CALL_TEXT, kind="textback")
+        return "colleague"  # a colleague owns this chat; they saw the call too
+    why = caller_window_problem(digits) if (not report or WA_CALL_WINDOW_CHECK) else ""
+    if why:
+        if send_missed_call_template(digits):
+            mark_person_promised(digits, "missed_call")
+            return O2_TEMPLATE_SENT
+        if report and not again_sent:   # not when the AGAIN alert just went
+            try:
+                send_telegram(missed_call_report(digits, why))
+            except Exception:
+                log.exception("Missed-call note failed for %s", digits)
+        # [R1 fix, R1-2] as live and the template branch: staff are told to ring them back, so the paid
+        # next-day nudge must not reach them first (nudge_blockers: 'promised')
+        mark_person_promised(digits, "missed_call")
+        log.info("Missed call from %s - no text-back (%s)", digits, why)
+        return "no_window:" + why
+    # A Retell hang-up's text-back goes from the line they last wrote on (their window is
+    # there), else as before; a WhatsApp call's from the line they called, as before.
+    wamid = o2_sent(send_whatsapp(
+        digits, MISSED_CALL_TEXT,
+        phone_id_for_customer(digits) if (CALLER_WINDOW_CHECK and not report) else ""), "textback")
+    save_message(digits, "assistant", o2_saved_text(MISSED_CALL_TEXT, wamid), kind="textback")
+    if wamid == "" and report and WA_CALL_WINDOW_CHECK and not again_sent:
+        try:
+            send_telegram(missed_call_report(digits, "WhatsApp did not take it"))
+        except Exception:
+            log.exception("Missed-call note failed for %s", digits)
     mark_person_promised(digits, "missed_call")
     log.info("Missed WhatsApp call from %s — sent chat invitation", digits)
+    return "refused" if wamid == "" else O2_UNSURE if wamid == O2_UNSURE else "texted"
 
 REAL_ATTACHMENTS = {"document", "video", "audio", "voice"}
 # Only answer one sticker/reaction per customer per window, so a burst of them
@@ -18069,7 +20697,7 @@ async def retell_function(request: Request):
         fields = {"name": (args.get("name") or "").strip(),
                   "phone": "".join(ch for ch in str(args.get("phone") or caller)
                                    if ch.isdigit()) or caller,
-                  "car": (args.get("car") or "").strip(),
+                  "car": voice_car(args.get("car") or ""),   # O2: make and model, no colour
                   "reg": (args.get("reg") or "").strip(),
                   "need": (args.get("job") or args.get("need") or "").strip(),
                   "date": (args.get("date") or "").strip(), "time": "", "lang": "",
@@ -18135,6 +20763,17 @@ async def retell_function(request: Request):
             # Owner's rule: voice transcription can mishear a reg, name or date —
             # always text the customer a written confirmation so they can catch
             # and correct any mistake before their actual drop-off day.
+            # O2 (2 Oct 2026): ...but only when WhatsApp will deliver it. A caller who has not
+            # written to us in the last 24 hours - 39 of the 41 phone bookings in the chats -
+            # has no window, and every such text was refused once refusals were marked. Then a
+            # person rings them to read it back (phone_readback, below).
+            try:
+                read_back = phone_confirm_blocked(fields)
+            except Exception:
+                # [R1 fix, R-2] the booking is saved: never fail the Retell call now - a person reads it
+                # back (one call too many, never one too few)
+                log.exception("Phone-confirm window check failed for %s", fields.get("phone"))
+                read_back = "I couldn't check when they last wrote"
             if fields["phone"] and not is_mobile(fields["phone"]):
                 # A landline can never receive the written confirmation or the
                 # reminder, so the ONLY way this customer hears from us again is
@@ -18148,7 +20787,7 @@ async def retell_function(request: Request):
                         f"Please RING THEM BACK to confirm: +{fields['phone']}")
                 except Exception:
                     log.exception("Landline phone-booking alert failed")
-            elif fields["phone"]:
+            elif fields["phone"] and read_back != O2_TEMPLATE_SENT:
                 try:
                     date_label = fields["date"]
                     try:
@@ -18168,28 +20807,47 @@ async def retell_function(request: Request):
                            if fields["wanted"] else "")
                         + "If anything above is wrong, just reply here and we'll fix it 👍"
                     )
-                    send_whatsapp(fields["phone"], confirm_text)
-                    # Owner's rule 2026-08-29: log every outbound voice-booking text
-                    # to the message history too — previously these never showed up
-                    # on the /chats page, so staff looking up a phone-booked customer
-                    # saw nothing even though a confirmation had actually been sent.
-                    save_message(fields["phone"], "assistant", confirm_text)
+                    if read_back:
+                        # [R1 fix, R1-4] the window is closed: nothing is sent (O2), but the confirmation
+                        # goes into the chat history as live ends up with it - marked NOT DELIVERED (the
+                        # owner's 29 Aug rule: staff find a phone-booked customer in /chats, and the model
+                        # sees the booking when they first write). No reg check below: the read-back asks.
+                        save_message(fields["phone"], "assistant", UNDELIVERED_PREFIX + confirm_text)
+                    else:
+                        confirm_wamid = o2_sent(send_whatsapp(fields["phone"], confirm_text), "phone_confirm")
+                        # Owner's rule 2026-08-29: log every outbound voice-booking text
+                        # to the message history too — previously these never showed up
+                        # on the /chats page, so staff looking up a phone-booked customer
+                        # saw nothing even though a confirmation had actually been sent.
+                        save_message(fields["phone"], "assistant", o2_saved_text(confirm_text, confirm_wamid))
+                        if confirm_wamid in ("", O2_UNSURE) and CALLER_WINDOW_CHECK:
+                            read_back = ("WhatsApp did not take the written confirmation"
+                                         if confirm_wamid == "" else "WhatsApp may not have taken "
+                                         "the written confirmation (the send got no answer)")
                     # Owner's rule 2026-08-28: after a voice booking, check the
                     # captured reg for anything that looks garbled by the phone
                     # transcription, and if so send a SEPARATE follow-up asking
                     # the customer to confirm/correct it — not folded into the
                     # main confirmation, so it stands out as needing a reply.
-                    if reg_needs_confirming(fields["reg"]):
+                    # O2: not after a confirmation WhatsApp did not take - the read-back
+                    # task asks the person ringing to check the reg instead.
+                    if reg_needs_confirming(fields["reg"]) and not read_back:
                         reg_check_text = (
                             "One more check — I have your registration down as "
                             f"\"{fields['reg'] or '(nothing captured)'}\", but phone "
                             "calls can sometimes mishear a plate. Could you reply "
                             "with the exact reg so I can make sure the booking is "
                             "correct? 🙏")
-                        send_whatsapp(fields["phone"], reg_check_text)
-                        save_message(fields["phone"], "assistant", reg_check_text)
+                        rc_wamid = o2_sent(send_whatsapp(fields["phone"], reg_check_text), "phone_regcheck")
+                        save_message(fields["phone"], "assistant", o2_saved_text(reg_check_text, rc_wamid))
+                        if rc_wamid == "" and CALLER_WINDOW_CHECK:
+                            read_back = "WhatsApp did not take the reg check"
                 except Exception:
                     log.exception("Voice booking WhatsApp confirmation failed")
+            # O2: no written confirmation possible - ONE read-back task (Done button; the
+            # calendar warning goes on it), raised before the register check below so a
+            # mismatch can go onto it. A database write only: the Telegram goes from the tick.
+            read_back_raised = phone_readback(fields, read_back, voice_cal)
             threading.Thread(target=_register_check_followup,
                               args=(fields, "voice booking"), daemon=True).start()
             # Owner's rule 29 Sep 2026: in the evening report instead (an odd reg
@@ -18201,7 +20859,9 @@ async def retell_function(request: Request):
                 landline = bool(fields["phone"]) and not is_mobile(fields["phone"])
             except Exception:
                 voice_cal_missed, landline = False, False
-            if booking_note_now(fields, voice_cal) and (voice_cal_missed or not landline):
+            # O2: the read-back task carries this booking - not this note as well.
+            if (booking_note_now(fields, voice_cal) and (voice_cal_missed or not landline)
+                    and not read_back_raised):
                 send_telegram("📞 PHONE BOOKING (voice agent)\n"
                               f"{fields['name']} — {fields['car']} {fields['reg']}\n"
                               f"{fields['need']}\nDate: {fields['date']} (9-11am)\n"
@@ -18214,9 +20874,11 @@ async def retell_function(request: Request):
                                  if voice_cal_missed else ""))
             confirm = "Booked. Drop-off between 9 and 11am."
             if fields["wanted"]:
-                confirm += (" Also tell them: they are on our cancellation list — "
-                            "if an earlier slot frees up we'll message them on "
-                            "WhatsApp straight away.")
+                # O2: no channel or person promised. A caller who has not written to us
+                # cannot be messaged when a slot frees (offer_freed_slot then tells staff
+                # to ring them), and anyone's window may have closed by then.
+                confirm += (" Also tell them: they are on our cancellation list for an "
+                            "earlier day.")
             return {"booked": True, "date": fields["date"], "confirm": confirm}
         if fields.get("refused") == "bank_holiday":
             # save_booking pulled a far-off date back a year onto a bank holiday.
@@ -18299,7 +20961,6 @@ async def retell_call_report(request: Request):
     rec = (call.get("recording_url") or "").strip()
     if rec:
         lines.append(f"🎧 Listen: {rec}")
-    send_telegram("\n".join(lines))
     # Hang-ups get a WhatsApp text-back from the 086 line: most callers who bail
     # on the robot in the first seconds will happily type instead — turn the
     # dead call into a chat. Mobiles only; blocklist, staff-owned chats and the
@@ -18310,9 +20971,15 @@ async def retell_call_report(request: Request):
                 and (call.get("duration_ms") or 0) < 20000
                 and (call.get("disconnection_reason") or "") == "user_hangup"
                 and not analysis.get("call_successful")):
-            handle_missed_call(digits, arrived_on=TEXTBACK_PHONE_ID)
+            # O2: decided BEFORE the report goes out, so the report says what happened to
+            # it - one Telegram per call, not the report and a NOT DELIVERED line after it.
+            status = missed_call_status_line(
+                handle_missed_call(digits, arrived_on=TEXTBACK_PHONE_ID, report=False))
+            if status:
+                lines.append(status)
     except Exception:
         log.exception("Hang-up text-back failed")
+    send_telegram("\n".join(lines))
     return {"ok": True}
 
 # Two messages from the same customer landing moments apart (e.g. "yes" then
@@ -18404,11 +21071,8 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
     # the model stops reading it back as something the customer already knows.
     try:
         with closing(db()) as conn, conn:
-            row = conn.execute(
-                "SELECT id, content FROM messages WHERE wa_user = ? AND role = 'assistant'"
-                " AND COALESCE(kind,'') <> 'reminder'"
-                " AND ts > ? ORDER BY id DESC LIMIT 1",
-                (digits, time.time() - 900)).fetchone()
+            # O2: the line sent with THIS message id (_o2_refused_row), not just the newest.
+            row = _o2_refused_row(conn, digits, wamid)
             if row and not str(row[1] or "").startswith(UNDELIVERED_PREFIX):
                 conn.execute("UPDATE messages SET content = ? WHERE id = ?",
                              (UNDELIVERED_PREFIX + str(row[1] or ""), row[0]))
@@ -18469,6 +21133,13 @@ def report_failed_delivery(recipient: str, errs: list, wamid: str = "") -> None:
                 "They have not been told, and nothing else will try again.")
     except Exception:
         log.exception("Could not handle the reminder retry for %s", digits)
+    # O2: a refused phone-booking confirmation (or its reg check) becomes the same "ring them
+    # to read it back" task as a closed window, with the booking on it - not the generic line.
+    _o2_kind = _o2_sent_kind(wamid)
+    if _o2_kind in ("phone_confirm", "phone_regcheck") and phone_readback_after_refusal(
+            digits, _o2_kind, detail):
+        _delivery_alerted[digits] = time.time()
+        return
     # Once per number per day. 131026 is often permanent, so a tighter window
     # would re-alert on every retry until somebody muted the whole thing.
     now = time.time()
