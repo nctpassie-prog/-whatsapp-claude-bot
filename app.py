@@ -1228,6 +1228,8 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
         today = now_local().date().isoformat()
         if not freed_date or freed_date <= today:
             return  # same-day swaps are the team's call, not the bot's
+        if before_open_date(freed_date):
+            return  # before BOOKINGS_FROM: the before-open gate would refuse their YES (12 Oct 2026)
         if not (9 <= now_local().hour < 20):
             return  # never text a waiting customer at night
         skip = "".join(ch for ch in str(skip_phone) if ch.isdigit())[-9:]
@@ -5092,6 +5094,11 @@ def next_day_for_job(need: str, not_before: str = "") -> str:
     'that day is full for this kind of work' message. With not_before (a bank holiday
     somebody asked for), the first such day after it - from today if none in 4 weeks."""
     today = now_local().date()
+    # Never a day before BOOKINGS_FROM (12 Oct 2026): the before-open gate would refuse
+    # the "yes" - offer-then-retract. The search then starts with the opening day.
+    _opens = bookings_open_from()
+    if _opens and _opens - timedelta(days=1) > today:
+        today = _opens - timedelta(days=1)
     try:
         starts = [max(today, date.fromisoformat(not_before)), today] if not_before else [today]
     except ValueError:
@@ -5150,6 +5157,72 @@ def before_open_date(date_str: str) -> bool:
     except Exception:
         return False
 
+def first_bookable_day(opens):
+    """The day a customer hears as "the earliest day I can book you in": BOOKINGS_FROM
+    itself - or, when that is a Sunday, a bank holiday or a day the owner closed, the
+    first day after it that takes bookings (looked for up to two weeks on; 12 Oct 2026)."""
+    d = opens
+    while not day_capacity(d) and d < opens + timedelta(days=14):
+        d += timedelta(days=1)
+    return d if day_capacity(d) else opens
+
+def fully_booked_gap(today) -> "tuple | None":
+    """(first, last, bank holidays) while BOOKINGS_FROM is still ahead: the days before it
+    are OPEN as normal, only FULLY BOOKED (owner, 12 Oct 2026: "we have too many cars, do
+    not take anyone before 19 Oct" - the bot had told a customer "tomorrow is closed").
+    `first` = first_bookable_day(BOOKINGS_FROM). `last` is the last working day before
+    BOOKINGS_FROM - never a Sunday or a bank holiday: they are shut, not full (a day the
+    owner closed is a working day, see hours_on). The bank holidays are those from today
+    to the day before `first`. None when there is nothing to say: no BOOKINGS_FROM, it has
+    come, or the team works no day before it."""
+    opens = bookings_open_from()
+    if not opens or opens <= today:
+        return None
+    last = opens - timedelta(days=1)
+    while last >= today and not hours_on(last):
+        last -= timedelta(days=1)
+    if last < today:
+        return None
+    first = first_bookable_day(opens)
+    return first, last, bank_holidays_between(today, first - timedelta(days=1))
+
+def fully_booked_note(today, voice: bool = False) -> str:
+    """What the chat prompt's opening note - and, voice=True, the voice agent's
+    check_availability note - adds while bookings open later than today: the days before
+    are fully booked, never closed, and no other reason is given. It names no day before
+    the earliest one: "fully booked until Saturday 17 October" reads as an OFFER of the
+    17th, to a caller and to the reply guard alike (12 Oct 2026 review). '' when
+    fully_booked_gap has nothing to say, so both notes are then exactly as before."""
+    gap = fully_booked_gap(today)
+    if not gap:
+        return ""
+    first, _last, hols = gap
+    o = first.strftime("%A %d %B")
+    if voice:
+        out = (f" FULLY BOOKED BEFORE {o}: open_days has nothing before {o} because every "
+               "working day from today until then is fully booked - the garage is open as "
+               "normal on those days. If the caller asks for an earlier day say: the "
+               f"earliest day I can book you in is {o} - we're fully booked until then (if "
+               f"{o} is not in open_days or has no room for their job, name the first day in "
+               "open_days that has). Never say we are closed on those days, never give any "
+               "other reason, and do not name the last full day - just say until then.")
+        if hols:
+            out += " A bank holiday in closed_days is still closed - say so if asked."
+        return out
+    say = f"The earliest day I can book you in is {o} — we're fully booked until then."
+    out = (" The garage is OPEN as normal before then — it is simply FULLY BOOKED: every "
+           "working day from today until then is full. When a customer asks for an "
+           f"earlier day (today, tomorrow, this week, any date before {o}), say plainly: "
+           f'"{say}" (If {o} has no room for their job, name the first day in the list '
+           "below that has, in the same words.) Never say we are closed on those days, "
+           "never give any other reason, and do not name the last full day — just say "
+           "'until then'.")
+    if hols:
+        out += (" Bank holidays stay CLOSED, nobody in — say so if asked, never 'fully "
+                "booked': " + ", ".join(f"{d.strftime('%A %d %B')} ({n})" for d, n in hols)
+                + ".")
+    return out
+
 # Last-resort line when the bot produced no visible answer at all. It hands over to a
 # person (the blank alert goes out with it) and gives no time (Fix 1).
 BLANK_REPLY_FALLBACK = (
@@ -5162,14 +5235,18 @@ BLANK_REPLY_FALLBACK_OLD = (
     "and we'll come straight back to you."
 )
 
+# The days before BOOKINGS_FROM are open as normal, only fully booked (owner, 12 Oct 2026):
+# never "closed" and no other reason - "taking bookings from {date} onwards" read as closed.
+# It names no day as free: {date} itself may be full by now, and an offer of it would be
+# taken back by the capacity gate.
 NOT_OPEN_MSG = {
-    "en": "We're taking bookings from {date} onwards. \U0001F64f Would a day from then suit? "
+    "en": "We're fully booked until {date}. \U0001F64f Would a day from then suit? "
           "Just tell me which day and I'll get you booked in.",
-    "ru": "Мы принимаем записи начиная с {date}. \U0001F64f Подойдёт ли вам день с этой даты? "
+    "ru": "До {date} у нас всё занято. \U0001F64f Подойдёт ли вам день с этой даты? "
           "Напишите, какой день удобен, и я вас запишу.",
-    "lt": "Registruojame nuo {date}. \U0001F64f Ar tiktų diena nuo tada? "
+    "lt": "Iki {date} viskas užimta. \U0001F64f Ar tiktų diena nuo tada? "
           "Parašykite, kuri diena jums tinka, ir jus užregistruosiu.",
-    "ro": "Facem programări începând cu {date}. \U0001F64f V-ar conveni o zi de atunci? "
+    "ro": "Până la {date} suntem complet ocupați. \U0001F64f V-ar conveni o zi de atunci? "
           "Spuneți-mi ce zi vă convine și vă programez.",
 }
 
@@ -5241,6 +5318,8 @@ def availability_block() -> str:
         opening_note = ("\n\nIMPORTANT: we are taking bookings from "
                         f"{opens.strftime('%A %d %B')} onwards — never book anything "
                         "before that date.")
+        # ...and the days before are fully booked, not closed (12 Oct 2026).
+        opening_note += fully_booked_note(today)
     return (today_line + opening_note +
         "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. ANY job can be booked on "
         "ANY open day in this list, up to 4 weeks ahead, within TWO LIMITS. (1) "
@@ -9052,9 +9131,16 @@ def _finish_reply(user: str, answer: str) -> str:
         if not is_owner and not already_booked and before_open_date(booking.get("date", "")):
             opens = bookings_open_from()
             log.info("Booking for %s rejected: before opening date", booking.get("date"))
+            # {date} = the first day that takes bookings: never a Sunday, a bank holiday
+            # or a closed day when BOOKINGS_FROM falls on one (12 Oct 2026).
             answer = NOT_OPEN_MSG.get(
                 reminder_lang_code(booking.get("lang", "")), NOT_OPEN_MSG["en"]
-            ).format(date=opens.strftime("%A %d %B") if opens else "")
+            ).format(date=first_bookable_day(opens).strftime("%A %d %B") if opens else "")
+            # ...but a bank holiday is shut, never "fully booked" (owner, 28 Sep 2026): say
+            # so in the bank-holiday gate's own words, and the customer picks another day.
+            if bank_holiday_shut(booking.get("date", "")):
+                answer = closed_day_msg(reminder_lang_code(booking.get("lang", "")),
+                                        booking.get("date", ""), "")
             # The owner may well want to squeeze this one in — never let a customer
             # who wants us SOONER walk away without him hearing about it.
             try:
@@ -21232,7 +21318,9 @@ async def retell_function(request: Request):
                          "every other repair or check cannot - offer those the nearest "
                          "weekday. "
                          "ONLY offer days from open_days - if the caller wants a "
-                         "later date, take a message.")}
+                         "later date, take a message.")
+                         # Fully booked, not closed, before BOOKINGS_FROM (12 Oct 2026).
+                         + fully_booked_note(today, voice=True)}
 
     if fn == "book_appointment":
         fields = {"name": (args.get("name") or "").strip(),
@@ -21269,6 +21357,15 @@ async def retell_function(request: Request):
         except Exception:
             return {"booked": False, "reason": "date format error — use YYYY-MM-DD"}
         if before_open_date(iso):
+            # A working day before BOOKINGS_FROM is open as normal, only fully booked -
+            # never "closed" (12 Oct 2026). A Sunday or a bank holiday keeps its words.
+            if hours_on(d):
+                _o = bookings_open_from()
+                _until = first_bookable_day(_o).strftime("%A %d %B") if _o else "then"
+                return {"booked": False, "reason": "that day is fully booked - the garage is "
+                        "open as normal, just full: never say we are closed that day. Say "
+                        f"we're fully booked until {_until} and offer the earliest day from "
+                        "check_availability that has room for the job"}
             return {"booked": False, "reason": "we are not taking bookings for that date yet — pick from check_availability"}
         if bank_holiday_shut(d):
             return {"booked": False, "reason": "we are closed that day - it is a bank holiday "
