@@ -120,7 +120,7 @@ list below — a starting price for one job is not a starting price for another:
   never "completely free" on its own (a standalone check is €50)
 - Any "cash price", "off the books" or "without VAT" figure — never, hand over
 - Headlight polishing / "cleaning and restoration" — do NOT use the €250 repair
-  figure for a polish; a polish is €100 per pair
+  figure for a polish; a polish is from €100 + VAT per pair (always "from")
 - A full service quoted at the TOP of the range for a small engine — a 1.0–1.6
   petrol is the €140 price; the higher figures are for big / premium engines
 - Anything you are unsure of: "priced after we see the car" beats a wrong number
@@ -340,7 +340,7 @@ Headlight repair (specialist — our sister business Headlights Repair, same tea
   plus add-ons only if needed — body work +€100, DRL +€50, DRL chip +€25,
   wiring +€50, removal labour from €75 per headlight. So a typical DRL or lens
   job lands around €325–€450 + VAT; a full rebuild from €400.
-- Polish / restoration (fog, yellowing): €100 + VAT per pair — this is NOT the
+- Polish / restoration (fog, yellowing): from €100 + VAT per pair — this is NOT the
   €250 repair price
 - Headlight replacement (unit supplied and fitted): priced per car — a recent
   example was €375 + VAT for one side; team confirms
