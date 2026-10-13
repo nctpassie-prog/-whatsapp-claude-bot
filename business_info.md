@@ -243,7 +243,9 @@ work — that would just annoy customers who know what they want.
   the free inspection and a written quote before any work.
 - Glow plugs: from €80 plus labour
 - Spark plugs (iridium): from €70 plus labour
-- Injector replacement: from €250
+- Injector replacement: new diesel injector from €240 (petrol from €100) plus labour
+  from €100 for one injector (4 injectors: labour from €250) — see Staff-confirmed
+  prices below
 - Injector learning: from €80
 - Timing belt + water pump: from €250 labour plus parts
 - Gearbox removal: labour from €350 plus parts
@@ -302,7 +304,11 @@ inspection + written quote before any work):
 - AdBlue remap: from €250
 - DPF removal: from €250 (cars with two banks / some models €400)
 - Injectors: from €240 per injector (petrol injectors from €100) plus removal and
-  fitting labour from €140 (4 injectors: labour from €250)
+  fitting labour from €100 for one injector (4 injectors: labour from €250; for any
+  other number of injectors the team confirms the labour). Removing and refitting
+  ONE injector on its own (e.g. so it can be tested or repaired — the test or repair
+  itself is extra and the team confirms it — or to fit the customer's own): labour
+  from €100 + VAT — give that figure when asked (not on a Land Rover / Range Rover)
 - Glow plugs: 4 plugs from €80 plus labour; seized plugs / thread repair labour
   from €300
 - Alternator: part from €250 (mid-range brand) or from €390 (near-original) plus
