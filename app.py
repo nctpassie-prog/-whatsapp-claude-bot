@@ -254,9 +254,11 @@ sentences, 3 at the very most, and only ONE question per message. No filler \
 ("Great choice!", "Thanks for reaching out!"), no repeating information you already \
 gave in this chat (address, drop-off window, prices) unless they ask again. \
 Friendly but brief. No markdown headers.
-- If the customer's message already contains several booking details at once \
-(e.g. problem + day + reg), do NOT re-ask what they already told you — go straight \
-to whatever is still missing.
+- NEVER ask again for a detail you already have — whether it is in this message (e.g. \
+problem + day + reg), was given earlier in this chat (a website booking form too), \
+is under WHAT WE ALREADY KNOW below, or is a car you or a colleague already named for \
+them in this chat (e.g. "your Toyota Yaris (12D3456)"). Use it — the read-back lets them \
+correct it — and ask only for what is still missing.
 - NEVER claim a customer's car is at the garage, being worked on, or ready to \
 collect unless a STAFF message in THIS conversation says so. Old 'ready' messages \
 about a previous visit do not count.
@@ -327,7 +329,7 @@ to the manager and a person will get back to them here — no time, no name.
 the team and a person will get back to them here — no time, no name.
 
 BOOKING CAPTURE (internal — never mention or show any of this to the customer):
-A booking needs: what they need, preferred day, car make/model/year, car registration \
+A booking needs: what they need, preferred day, the car make and model, car registration \
 and the customer's name. Ask one question at a time, and ALWAYS IN THIS ORDER — the \
 order matters:
 (1) WHAT THE PROBLEM IS / what they need — ALWAYS FIRST, and COMPLETELY, before any \
@@ -343,12 +345,19 @@ so everything is ready for their day.
 actually available FOR THAT KIND OF JOB. Check that day against the availability list \
 before going further; if it is full (or it is a repair on a Saturday) say so NOW and \
 offer another day — BEFORE asking for any of their details.
-(3) ONLY once the day is agreed and available, ask for the car make/model/year, the \
-reg number AND their name all TOGETHER in ONE message (e.g. "Could I get the car make, \
-model and year, the reg number, and a name for the booking please?") — never spread \
-these over separate questions.
+(3) ONLY once the day is agreed and available, collect what you do NOT already have of: \
+the car make and model, the reg number and their name. First look at what you have — \
+in this chat (their own messages, a website booking form, a car you or a colleague \
+already named) and under WHAT WE ALREADY KNOW (if it is given below) — and ask ONLY for \
+what is still missing, all of it TOGETHER in ONE message (never spread over separate \
+questions). If nothing is missing, skip this step and go straight to the STEP 1 \
+read-back. Never ask for the year when you have the reg (the reg already shows it). If \
+they have more than one car on file: when this chat (or their website booking form) \
+already says which car this request is for, use that one; otherwise ask which one, \
+naming them — never pick one yourself.
 NEVER take the customer's car details or name before the day is settled — if the day \
-turns out to be full they have wasted their time, and so have we. \
+turns out to be full they have wasted their time, and so have we (using details they \
+already gave is fine — this is only about asking for them). \
 Do NOT ask for a phone number: you already have the number they are messaging from.
 
 STEP 1 — CONFIRM BEFORE BOOKING (very important): Once you have ALL the details, do NOT \
@@ -458,6 +467,30 @@ def clean_reg(reg: str) -> str:
     if not cleaned or cleaned in _NOT_A_REG or not any(ch.isdigit() for ch in cleaned):
         return ""
     return cleaned
+
+
+# fix3 round 2 (13 Oct review, real-data F4): the system prompt's own example regs. The model copied "161D22222" into
+# two real read-backs (garage …356 23 Sep, …660 30 Sep). Round 3 (VERIFY V3, as the headlights build): dropped only when
+# THIS customer never typed it - 12D3456 / 161D22222 are valid Irish regs, and round 2 (dropping them everywhere) would
+# have asked a customer who really has one for the reg again and again.
+PROMPT_EXAMPLE_REGS = frozenset({"161D22222", "12D3456"})
+
+
+def example_reg_not_given(user: str, reg: str, staff: bool = False) -> bool:
+    """The reg is one of the prompt's example regs and this customer never typed it in this chat: the model's copy of
+    the example, not their reg. `staff` (round 3b, review R3A-N2 - the watcher, as the headlights build): a colleague
+    who typed it in this chat counts too. Unsure: False."""
+    r = clean_reg(reg)
+    if r not in PROMPT_EXAMPLE_REGS:
+        return False
+    try:
+        with closing(db()) as conn:
+            said = " ".join((x[0] or "") for x in conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND role IN ('user', ?) ORDER BY id DESC LIMIT 300",
+                (user, "staff" if staff else "user")).fetchall())
+    except Exception:
+        return False
+    return r not in re.sub(r"[^0-9A-Z]", "", said.upper())
 
 # Owner's finding 2026-08-31 (James Galagher, 192D8296): the hard "car is
 # required" gate below only checked the field was non-empty, so the model
@@ -2666,10 +2699,14 @@ def turn_already_alerted(user: str) -> bool:
         return True
     try:
         with closing(db()) as conn:
-            row = conn.execute("SELECT ts, COALESCE(closed_ts, 0) FROM alerts WHERE wa_user = ?",
+            row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(kind, '') FROM alerts WHERE wa_user = ?",
                                (user,)).fetchone()
             if (not row or (row[1] or 0) >= (row[0] or 0)
                     or time.time() - (row[0] or 0) >= 120):
+                return False
+            if row[2] == DOUBLE_BOOKING_KIND:
+                # fix3 round 3b (reviews F5 / R3A-4, as the headlights build): the two-bookings warning this very
+                # reply's BOOKING marker raised answers nothing the customer asked - a promised person still alerts
                 return False
             last = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
                                 (user,)).fetchone()
@@ -5048,7 +5085,7 @@ def _colleague_named_saturday(user: str, date_str: str) -> bool:
             continue
         if dated.search(text):
             return True
-        if re.search(r"\bsat(?:urday)?s?\b", text, re.IGNORECASE):
+        if staff_says_saturday(text):   # English, or Romanian "sambata" (fix3, 13 Oct 2026)
             ahead = (d - datetime.fromtimestamp(ts or 0, tz).date()).days
             if 0 <= ahead <= 13:
                 return True
@@ -5212,14 +5249,25 @@ def before_open_date(date_str: str) -> bool:
     except Exception:
         return False
 
-def first_bookable_day(opens):
+def first_bookable_day(opens, need: str = ""):
     """The day a customer hears as "the earliest day I can book you in": BOOKINGS_FROM
     itself - or, when that is a Sunday, a bank holiday or a day the owner closed, the
-    first day after it that takes bookings (looked for up to two weeks on; 12 Oct 2026)."""
-    d = opens
-    while not day_capacity(d) and d < opens + timedelta(days=14):
-        d += timedelta(days=1)
-    return d if day_capacity(d) else opens
+    first day after it that takes bookings (looked for up to two weeks on; 12 Oct 2026).
+    [fix3 ISSUE 3, 13 Oct 2026] A day that is FULL is passed over too - for `need`, a day with no
+    room for that kind of job: the chat note said "the earliest day I can book you in is Monday
+    19 October" while Mon 19 was FULL, the model offered it to a website form, and the day guard
+    swapped in "that day is now fully booked" with no other day (askbot A2). With no day that has
+    room in those two weeks: the first day that takes bookings, as before."""
+    first_open = None
+    for i in range(15):
+        d = opens + timedelta(days=i)
+        if not day_capacity(d):
+            continue
+        if first_open is None:
+            first_open = d
+        if not day_full_reason(d.isoformat(), need):
+            return d
+    return first_open or opens
 
 def fully_booked_gap(today) -> "tuple | None":
     """(first, last, bank holidays) while BOOKINGS_FROM is still ahead: the days before it
@@ -6071,7 +6119,11 @@ def _ask_chain_for(user: str, kind: str, now: float) -> tuple:
             if r:
                 old = {"ts": r[0] or 0.0, "closed_ts": r[1], "first_ts": r[2], "ask_count": r[3],
                        "ask_ts": r[4], "chain_ts": r[5], "kind": r[6]}
-            resolved = bool(old) and old["closed_ts"] < old["ts"] and alert_resolved(conn, user, old["ts"])
+            # [fix3 r3c, VERIFY_FINAL N1 - the headlights r3b twin] an open double_booking row (a diary warning, kept
+            # open until Done or the diary moves) is no ask of the customer's: a new alert after it starts its own
+            # chain, never "waiting since" it
+            resolved = bool(old) and old["closed_ts"] < old["ts"] and (
+                old["kind"] == DOUBLE_BOOKING_KIND or alert_resolved(conn, user, old["ts"]))
             m = conn.execute("SELECT ts, content FROM messages WHERE wa_user = ? AND role = 'user'"
                              " ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         # A call is itself the ask; otherwise a thank-you or a sticker is not a new ask.
@@ -6462,6 +6514,17 @@ def mark_human_reply(user: str, content: str = None) -> None:
                  user, classify_staff(content))
         return
     # A real reply is the best possible "Done" — close the claim alert for them.
+    # fix3 round 3b (review R3A-7): ...except a two-bookings warning - the colleague is in this chat by definition and
+    # both rows are still in the diary; Done or a change in the diary closes it (alert_resolved).
+    try:
+        with closing(db()) as conn:
+            open_ = conn.execute("SELECT COALESCE(kind, '') FROM alerts WHERE wa_user = ?"
+                                 " AND COALESCE(closed_ts, 0) < ts", (user,)).fetchone()
+        if open_ and open_[0] == DOUBLE_BOOKING_KIND:
+            log.info("Staff reply for %s: the two-bookings alert stays open (Done or the diary closes it)", user)
+            return
+    except Exception:
+        log.exception("Could not read the open alert of %s", user)
     try:
         _toast, after = close_alert(user, "replied in WhatsApp", auto=True)
         if after:
@@ -6505,6 +6568,386 @@ _ASSIST_CLAIMS_BOOKED_RE = re.compile(
     r"you are booked|got you booked|booked in for)\b", re.IGNORECASE)
 
 
+# ------------------------------------------- fix3 ISSUE 1: a colleague holds the chat (13 Oct 2026)
+# Garage …195 (Faizan, Tue 13 Oct): a colleague wrote "We can do 27th October". The bot, helping out in
+# the held chat, took that line for its OWN offer (get_history hands every colleague row to the model as
+# "assistant"), offered the 27th, asked for the car and reg, read the booking back ("Just to confirm: ...
+# Shall I book you in?") - and met the customer's "Yes please" with silence: the 16 Sep guard stops an
+# assist "you're booked" (it would reach no diary) and sent nothing in its place. The alert said only
+# "nearly confirmed a booking", and the stalled-staff sweep raised it AGAIN 1 h 45 min later, restarting
+# its clocks. Same shape: garage …946, …935, headlights …532, …864. The owner's decisions: 30 Sep (a) no
+# booking questions or read-backs while a colleague holds the chat, (b) a day the colleague agreed + the
+# car goes into the diary by itself; 3 Oct: no holding line to the customer, staff are alerted.
+#   1A ASSIST_LABEL_STAFF: the assist and the chase see each colleague line as the colleague's.
+#   1B ASSIST_NO_BOOKING_ASK: the assist's booking question / read-back / day offer is not sent.
+#   1C ASSIST_STAFF_DAY_BOOK: a short "yes" to a day a colleague named goes into the diary (staff_day_yes_book).
+#   1D the "nearly confirmed" alert says what to add and what to check, once per "yes".
+# Each switch =0 gives today's behaviour for its part.
+ASSIST_LABEL_STAFF = _env_on("ASSIST_LABEL_STAFF")
+ASSIST_NO_BOOKING_ASK = _env_on("ASSIST_NO_BOOKING_ASK")
+ASSIST_STAFF_DAY_BOOK = _env_on("ASSIST_STAFF_DAY_BOOK")
+# fix3 round 3d (14 Oct, the peer review T-F1 - the headlights switch's garage twin): a Railway lever for the freeze.
+# DOUBLE_BOOKING_ALERT (default on): "THIS CAR NOW HAS TWO BOOKINGS" and the staff-side "Already booked ..." are alerts
+# rows (kind double_booking: the Done button, the ladder, claimstatus); =0: the plain Telegram line with the same
+# words, as before round 3 (raise_diary_alert). It does NOT restore base 03d888e's watcher - see BUILD_ROUND2.md,
+# round 3d (garage), for what can and cannot be switched off.
+DOUBLE_BOOKING_ALERT = _env_on("DOUBLE_BOOKING_ALERT")
+# 1A: the label in front of every colleague row the assist and the chase read. It never goes out: a reply
+# that carries it (or the start of it) is dropped like any other internal deliberation.
+ASSIST_STAFF_LABEL = "[Colleague, typed by hand in the WhatsApp app]: "
+_ASSIST_LABEL_LEAK_RE = re.compile(r"\[\s*colleague\b|typed by hand in the whatsapp app", re.IGNORECASE)
+# fix3 round 2 (review F6): a reply that OPENS with any bracketed tag and a colon ("[Assistant, automatic reply]: ...")
+# copies the label's form - never sent either. (No bot reply in the 13 Oct pull starts that way.) Round 3 (VERIFY V4,
+# as the headlights build): ANY line of it - "Sure!\n[Assistant, automatic reply]: ..." is caught too.
+_ASSIST_TAG_LEAK_RE = re.compile(r"^[^\S\n]*\[[^\]\n]{1,60}\][^\S\n]*:", re.MULTILINE)
+_ASSIST_LABEL_NOTE = (
+    "\n- Lines that start with \"" + ASSIST_STAFF_LABEL.strip() + "\" were typed by a COLLEAGUE (a person), "
+    "not by you: a day, price or arrangement in them is THEIRS - never repeat it, take it over or carry it "
+    "on as if it were your own. Never write that label yourself.")
+_CHASE_LABEL_NOTE = (
+    " Lines that start with \"" + ASSIST_STAFF_LABEL.strip() + "\" were typed by a colleague, not by you; "
+    "never write that label.")
+# 1B (owner, 30 Sep (a)): no booking questions or read-backs while a colleague holds the chat.
+_ASSIST_NO_BOOKING_NOTE = (
+    "\n- NO BOOKING while the colleague has this chat: never offer or suggest a day, never ask 'shall I "
+    "book you in?', never ask for the car, the reg or a name for a booking, and never read a booking back "
+    "('Just to confirm: ...'). The colleague books it.")
+
+
+def assist_while_staff_prompt() -> str:
+    """ASSIST_WHILE_STAFF plus the fix3 notes whose switches are on (all off: today's prompt exactly)."""
+    return (ASSIST_WHILE_STAFF + (_ASSIST_LABEL_NOTE if ASSIST_LABEL_STAFF else "")
+            + (_ASSIST_NO_BOOKING_NOTE if ASSIST_NO_BOOKING_ASK else ""))
+
+
+def _assist_history(user: str, since: float = 0.0, label=None, owner: bool = False) -> list:
+    """get_history for the assist and the chase (fix3 1A): every colleague row starts with
+    ASSIST_STAFF_LABEL. ASSIST_LABEL_STAFF=0: get_history exactly. `since` (the staff-hold "yes"
+    booker, 1C): only the rows written since then (at most 60). `owner` (the 1C watcher only, round 2
+    review INT-2): the owner's Telegram lines (kind owner_tg / owner_book) start with OWNER_TG_LABEL - a
+    person's words, not the automatic assistant's."""
+    if label is None:
+        label = ASSIST_LABEL_STAFF
+    if not label and not since and not owner:
+        return get_history(user)
+    with closing(db()) as conn:
+        if since:
+            rows = conn.execute("SELECT role, content, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                                " AND ts >= ? ORDER BY id DESC LIMIT 60", (user, since)).fetchall()
+        else:
+            rows = conn.execute("SELECT role, content, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                                " ORDER BY id DESC LIMIT ?", (user, MAX_HISTORY)).fetchall()
+    return [{"role": "assistant" if r == "staff" else r,
+             "content": (ASSIST_STAFF_LABEL + (c or "")) if (r == "staff" and label)
+             else (OWNER_TG_LABEL + (c or "")) if (owner and r == "assistant" and k in ("owner_tg", "owner_book"))
+             else c}
+            for r, c, k in reversed(rows)]
+
+
+# 1B: the assist's booking question / read-back, in code (the prompt asks; this makes sure). Narrow on
+# purpose - the bot as the one booking ("shall I book you in", "would you like me to book"), a sentence
+# opening "Just to confirm", the details asked "for the booking", and the Russian / Romanian /
+# Lithuanian read-backs seen in the chats. Measured on all 9,978 bot replies of both bots
+# (fix3/g_stafhold/scan_ask.py, 13 Oct pull): 44 in a chat a colleague held, every one a booking offer,
+# a details request, a read-back or a "just to confirm" question about the colleague's job.
+_ASSIST_BOOKING_ASK_ALTS = (
+    # EN - the bot offers to book: "Shall I book you in for Tuesday?", "Will I get you booked in?"
+    r"\bshall i (?:book|pencil|put|pop) (?:you|it|that|the car|the van|her|him|them)\b",
+    r"\bshall i get (?:you|it|the car|the van) (?:booked|in)\b",
+    r"\bwill i (?:book|pencil|put|pop|get) (?:you|it|the car|the van) (?:in|down|booked)\b",
+    r"\b(?:would|do) you (?:like|want) me to (?:book|pencil|put you|pop you|get you (?:booked|in))\b",
+    r"\bwant me to (?:book|pencil)\b",
+    r"\bbook (?:you|it|the car|the van|her|him|them) in\b[^.!?\n]{0,80}\?",
+    # a read-back: a sentence that opens "Just to confirm" ("Perfect - Wednesday 7 October suits. Just to
+    # confirm: ...", garage …935). Round 2 (reviews H7 / real-data F2): only when a drop-off, a day, a booking, the
+    # reg or a name follows within 300 characters, and never a collection ("Just to confirm — you're collecting your
+    # BMW tomorrow", …438): 64 real "Just to confirm" replies are a question about the job or the car, which the
+    # colleague's chat must still get ("is it an injector replacement, or cleaning?", the timing-belt price).
+    r"(?:^|[.!?]\s+|\n)[^\w\n]{0,6}(?:(?:perfect|great|lovely|brilliant|grand|super|thanks?|thank you|"
+    r"ok(?:ay)?|cool|no problem|sure)\b[^\w\n]{0,4}(?:\w+[^\w\n]{0,3}){0,2})?just to confirm\b"
+    r"(?![^\n]{0,120}?\b(?:you['’]?re collecting|to collect|collection|pick(?:ing)? (?:it |her |him |them "
+    r"|the car |the van )?up)\b)"
+    r"(?=[\s\S]{0,300}?(?:\bdrop(?:-|\s)?off\b|\bbook|\bregistration\b|\breg\b|\bname\b|\bwhat day\b|\bwhich day\b"
+    r"|\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|\bsaturday\b|\bsunday\b|\btomorrow\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)))",
+    # collecting the details for one (round 2: not "thanks for the booking", not "For the booking: just the lamp,
+    # or the whole car?" - a question about the job)
+    r"(?<!thanks )(?<!thank you )\bfor the booking\b(?![^.!?\n]{0,120}?\b(?:whole car|just the (?:head)?(?:light"
+    r"|lamp)s?|(?:head)?lights? only|drl unit)\b)",
+    r"\bto (?:finish|complete|finali[sz]e|make) the booking\b",
+    r"\bjust to get (?:you|it|the car|the van) booked in\b",
+    r"\bshall i keep (?:you|it|the car|the van|the booking)\b",
+    r"\b(?:could|can|may) i (?:get|have|take) (?:the |your )?(?:car(?:'s)? )?make(?:,| and| &) model\b",
+    # RU: "Всё верно, записываю?", "Подтверждаю: VW Caddy ...", "можем записать вас", "Подтверждаете бронь?"
+    r"\bзаписываю\b[^.!\n]{0,60}\?|\bвс[её] верно\W{0,3}записываю\b",
+    r"\b(?:хотите|можем|могу|давайте)\s+(?:вас\s+)?записать\b|\bзаписать вас\b|\bзапишу вас\b"
+    r"|\bхотите записаться\b|\bимя\b[^.!?\n]{0,25}\bдля\s+записи\b",
+    r"(?:^|[.!?]\s+|\n)[^\w\n]{0,6}(?:\w+\W{1,3}){0,3}подтверждаю\s*:|\bподтверждаете\b[^.!\n]{0,40}\?",
+    r"\bчтобы\s+(?:завершить|оформить)\s+запись\b",
+    # RO: "Vrei să confirm programarea pentru joi?", "Confirm programarea: Audi A6 ...", "Vă pot programa?",
+    # "Să te programez?", "Să te trec atunci?", "Pentru a putea finaliza programarea, ... marca, modelul"
+    r"\bs[ăa] (?:v[ăa]|te) programez\b|\bs[ăa]-?(?:[țţt]i|v[ăa]) programez\b|\b(?:v[ăa]|te) (?:pot|putem) programa\b"
+    r"|\bs[ăa] (?:te|v[ăa]) trec\b[^.!\n]{0,40}\?|\bpentru programare\s*\?",
+    r"\b(?:vrei|dori[țţt]i|vre[țţt]i) s[ăa] (?:(?:te|v[ăa]) program[ăa]m|confirm)\b",
+    r"(?:^|[.!?]\s+|\n)[^\w\n]{0,6}(?:\w+\W{1,3}){0,3}confirm programarea\b",
+    r"\bfinaliz(?:a|ez|[ăa]m)\s+programarea\b",
+    # LT: "Ar galiu jus užregistruoti ...?", "Patvirtinu: ..."
+    r"\bu[žz]registruoti\b[^.!\n]{0,80}\?|(?:^|[.!?]\s+|\n)[^\w\n]{0,6}(?:\w+\W{1,3}){0,3}patvirtinu\s*:",
+)
+_ASSIST_BOOKING_ASK_RE = re.compile("|".join(_ASSIST_BOOKING_ASK_ALTS), re.IGNORECASE)
+
+
+def assist_booking_alerted_since_newest(user: str) -> bool:
+    """fix3 1D: was a 'nearly confirmed' (assist_booking) alert raised at or after this customer's newest
+    message - open, Done or sorted? (claim_log keeps every alert; the alerts row only the latest.)"""
+    try:
+        with closing(db()) as conn:
+            last = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                                (user,)).fetchone()
+            newest = (last[0] if last else 0) or 0
+            if not newest:
+                return False
+            if conn.execute("SELECT 1 FROM alerts WHERE wa_user = ? AND kind = 'assist_booking' AND ts >= ?",
+                            (user, newest)).fetchone():
+                return True
+            try:
+                return conn.execute("SELECT 1 FROM claim_log WHERE wa_user = ? AND kind = 'assist_booking'"
+                                    " AND alert_ts >= ? LIMIT 1", (user, newest)).fetchone() is not None
+            except sqlite3.OperationalError:
+                return False
+    except Exception:
+        log.exception("Could not read the assist_booking alerts for %s", user)
+        return False
+
+
+def assist_booking_alerted_since_reply(user: str, iso: str = "") -> bool:
+    """fix3 1D: a 'nearly confirmed' alert was raised in this same moment (24 h at most) - open, Done or sorted
+    (critique #5: a Done must not be followed by a new "nearly confirmed" for the same yes). So a newer message
+    after that "yes" (a sticker, "my wife brings it") that the model again tried to book is logged only: no
+    second post, no clock restart - O1 handles the newer message. (As the headlights build.)
+    Round 2 (13 Oct reviews INT-1 / F2): the moment starts at the NEWEST of the bot's last ordinary reply, the
+    colleague's last REAL message and the owner's last Telegram line (owner_tg / owner_book, as stall_after_answer
+    reads them) - a person who came back, often doing what the alert asks ("or offer another day"), starts a new
+    one; and a booking for ANOTHER day than the standing alert's (`iso`, the marker's date, against the day
+    raise_assist_booking_alert kept) is a new request - raised again (alert_owner replaces the row). No day on
+    either side: the same request, as before."""
+    try:
+        with closing(db()) as conn:
+            b = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                             " AND COALESCE(kind, '') IN ('', 'owner_tg', 'owner_book')", (user,)).fetchone()
+            since = max((b[0] if b else 0) or 0, time.time() - 24 * 3600)
+            for c, ts in conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                      " AND ts > ? ORDER BY id DESC LIMIT 40", (user, since)).fetchall():
+                if is_real_staff_text(c):
+                    since = max(since, ts or 0)
+                    break
+            found = conn.execute("SELECT 1 FROM alerts WHERE wa_user = ? AND kind = 'assist_booking' AND ts >= ?",
+                                 (user, since)).fetchone() is not None
+            if not found:
+                try:
+                    found = conn.execute("SELECT 1 FROM claim_log WHERE wa_user = ? AND kind = 'assist_booking'"
+                                         " AND alert_ts >= ? LIMIT 1", (user, since)).fetchone() is not None
+                except sqlite3.OperationalError:
+                    found = False
+        if found and iso:
+            prev = (get_setting(f"assist_booking_day:{user}") or "").strip()
+            if prev and prev != iso:
+                log.info("Assist booking for %s: a new day (%s, the alert said %s) - a new request", user, iso, prev)
+                return False
+        return found
+    except Exception:
+        log.exception("Could not read the assist_booking alerts for %s", user)
+        return False
+
+
+def assist_booking_headline(user: str, raw: str) -> str:
+    """fix3 1D: the alert's first line names the day (the weekday worked out here) - "🙋 Wants Tue 27 Oct booked —
+    NOT in the diary yet" / "— it's already in the diary"; no readable marker date: today's headline. (Nothing
+    branches on headline text - kinds only.) As the headlights build."""
+    try:
+        d = date.fromisoformat((_assist_marker_fields(raw).get("date") or "").strip()[:10])
+    except ValueError:
+        return "🙋 The bot nearly confirmed a booking while you had this chat"
+    return (f"🙋 Wants {d:%a %d %b} booked — "
+            + ("it's already in the diary" if _has_booking_on(user, d.isoformat()) else "NOT in the diary yet"))
+
+
+# 1D: a Land Rover / Range Rover, and what the garage still does on one (owner, 7-8 Oct: a service,
+# headlights, bulbs, wipers, a battery, tyres, an NCT / CVRT test run - no other repairs)
+_ASSIST_LR_RE = re.compile(r"\b(?:land|range)[\s-]*rover\b|\b(?:landrover|rangerover|evoque|freelander|velar)\b"
+                           r"|\bdiscovery\s+sport\b", re.IGNORECASE)
+_ASSIST_LR_OK_RE = re.compile(r"\bheadl|\bbulbs?\b|\bwipers?\b|\bbatter(?:y|ies)\b|\btyres?\b|\btires?\b"
+                              r"|\b(?:nct|cvrt)\b(?!\s*(?:fail\w*|repair\w*|work|items?|issues?))",
+                              re.IGNORECASE)
+
+
+def _assist_marker_fields(raw: str) -> dict:
+    """The BOOKING marker's fields ({} when there is none)."""
+    m = BOOKING_RE.search(raw or "")
+    out = {}
+    for part in (m.group(1).split("|") if m else []):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def assist_booking_flags(fields: dict, d) -> list:
+    """fix3 1D: what staff should know before they add the day the model wanted - worked out here from the
+    date and the job, never from the model's words."""
+    out = []
+    try:
+        iso = d.isoformat()
+        need = fields.get("need", "") or ""
+        if d < now_local().date():
+            out.append("⚠️ That date has already passed - the bot got the day wrong.")
+        if before_open_date(iso):
+            out.append(f"⚠️ Before {bookings_open_from():%a %d %b}, the first day we take bookings "
+                       "(the diary is full until then).")
+        if d.weekday() == 5 and not saturday_service_only(need):
+            out.append("⚠️ A Saturday - Saturdays are for general services only, and this job isn't one.")
+        elif services_only_window(d) and need and not saturday_service_only(need):
+            out.append(f"⚠️ Before {all_jobs_open_from():%a %d %b} only general services are booked, and this job "
+                       "isn't one.")
+        if d.weekday() == 6:
+            out.append("⚠️ A Sunday - we're closed.")
+        hol = bank_holiday_name(iso)
+        if hol:
+            out.append(f"⚠️ {hol} - a bank holiday, we're closed (the diary won't take it).")
+        if (_ASSIST_LR_RE.search(f"{fields.get('car', '')} {need}")
+                and not (saturday_service_only(need) or _ASSIST_LR_OK_RE.search(need))):
+            out.append("⚠️ A Land Rover / Range Rover - we don't do repairs on these (a service, headlights "
+                       "and small jobs only).")
+    except Exception:
+        log.exception("Assist booking flags failed")
+    return out
+
+
+def assist_booking_reason(user: str, raw: str, reply: str, lead: str = "", tail: str = "") -> str:
+    """fix3 1D: the 'nearly confirmed' alert's reason - what to add and what to check first. From the
+    BOOKING marker (the weekday worked out here), the customer's newest words and the colleague's last
+    REAL message (quoted, never parsed); with no marker, the reply it was about to send. `lead` (round 2,
+    the 1C refusal): the first line instead of "The bot was about to ...". `tail` (round 3, R3-b): the last
+    line instead of the diary one ("Nothing was added. Check which day they mean ...")."""
+    f = _assist_marker_fields(raw)
+    tz = ZoneInfo("Europe/Dublin")
+    try:
+        d = date.fromisoformat((f.get("date") or "").strip()[:10])
+    except ValueError:
+        d = None
+    car = (f.get("car") or "").strip()
+    if car.lower() in _PLACEHOLDER_CAR:
+        car = ""
+    car = " ".join(x for x in (car, clean_reg(f.get("reg", ""))) if x)
+    what = " — ".join(x for x in (car, (f.get("need") or "").strip()[:80], (f.get("name") or "").strip()[:40])
+                      if x)
+    lines = []
+    if lead:
+        lines.append(lead + (f" From the chat: {what}." if what else ""))
+    elif d:
+        lines.append(f"The bot was about to book them in for {d:%a %d %b} ("
+                     + ((f.get("time") or "").strip()[:20] or "drop-off 9-11am") + ")"
+                     + (f": {what}." if what else "."))
+    else:
+        said = " ".join((reply or "").split())
+        lines.append("The bot was about to tell them: “" + said[:160] + ("…" if len(said) > 160 else "") + "”"
+                     + (f" ({what})." if what else "."))
+    try:
+        cust = " ".join(((_last_customer_messages(user, 1) or [""])[0] or "").split())
+        if cust:
+            lines.append("They wrote: “" + cust[:90] + ("…" if len(cust) > 90 else "") + "”.")
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                " ORDER BY id DESC LIMIT 30", (user,)).fetchall()
+        said = next(((c, ts) for c, ts in rows if is_real_staff_text(c)), None)
+        if said:
+            w = " ".join((said[0] or "").split())
+            t = datetime.fromtimestamp(said[1] or 0, tz)
+            when = t.strftime("%a %H:%M") if time.time() - (said[1] or 0) < 6 * 86400 else t.strftime("%d %b %H:%M")
+            lines.append(f"Your colleague last wrote ({when}): “" + w[:90] + ("…" if len(w) > 90 else "") + "”.")
+        else:
+            lines.append("No colleague has written words in this chat yet (only a reaction or a placeholder).")
+    except Exception:
+        log.exception("Assist booking reason: could not read the chat for %s", user)
+    if d:
+        lines += assist_booking_flags(f, d)
+    # round 2 (review F3): no day read - look first. Round 3 (the …791 twin): with a day read too - "Add it in the diary
+    # first" next to a booking they already hold for another day is how a second row gets added by hand.
+    other = _other_booking_date(user, d.isoformat() if d else "")
+    if tail:
+        lines.append(tail)
+    elif d and _has_booking_on(user, d.isoformat()):
+        lines.append("They are ALREADY in the diary that day - nothing to add; just confirm it with them.")
+    elif other and d:
+        lines.append(f"They already have a booking in the diary for {date.fromisoformat(other):%a %d %b} - check "
+                     "which day they mean before you add anything (the same car: move it, don't add a second one).")
+    elif other:
+        lines.append(f"They already have a booking in the diary for {date.fromisoformat(other):%a %d %b} - check "
+                     "it is the one they mean; nothing to add unless it is another visit.")
+    else:
+        lines.append("It is NOT in the diary, and the bot sent them nothing. "
+                     "Add it in the diary first, then tell them - or offer another day.")
+    return "\n".join(lines)
+
+
+def _assist_marker_iso(raw: str) -> str:
+    """The BOOKING marker's date as written ("YYYY-MM-DD"), or "" - as assist_booking_headline reads it."""
+    try:
+        return date.fromisoformat((_assist_marker_fields(raw).get("date") or "").strip()[:10]).isoformat()
+    except ValueError:
+        return ""
+
+
+def _booked_line_covers(user: str, iso: str) -> bool:
+    """fix3 round 2 (review F3): the bot's last ordinary reply already told them they are booked in (the 1C
+    line, BOOKED_LINE_MSG), and the diary holds it - that day, or with no day read any booking ahead. A
+    thank-you the model answers "you're booked in" again then needs nobody."""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                             " AND COALESCE(kind, '') = '' ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        if not r or not (r[0] or "").startswith(_BOOKED_LINE_PREFIXES):
+            return False
+        return _has_booking_on(user, iso) if iso else bool(_other_booking_date(user, ""))
+    except Exception:
+        log.exception("Booked-line check failed for %s", user)
+        return False
+
+
+def raise_assist_booking_alert(user: str, raw: str, reply: str, lead: str = "", headline: str = "",
+                               tail: str = "", clash_key: str = "") -> bool:
+    """fix3 1D: THE 'nearly confirmed' (assist_booking) alert - from the assist that tried to book, and (round 2,
+    review H2) from the 1C booker when the code could not write what the watcher read. Once per yes: nothing when
+    one already stands for this moment and day (assist_booking_alerted_since_reply), nothing when the bot's own
+    booked line already told them and the row is there (_booked_line_covers). Keeps the alert's day for the next
+    dedupe. True when raised. `headline` / `tail` (round 3, R3-b: a booking they already hold on another day): the
+    alert's own first line and last line. Round 3c (VERIFY_FINAL M3): nothing while an "Already booked X - ... Y"
+    alert for this day still stands open (_clash_alert_stands - the staff side's double_booking, or this path's own),
+    and `clash_key` (_clash_fact_key) remembers the fact this alert told staff."""
+    iso = _assist_marker_iso(raw)
+    if _booked_line_covers(user, iso):
+        log.info("Assist booking for %s: the bot's booked line already told them and it is in the diary - "
+                 "nothing for staff", user)
+        return False
+    if assist_booking_alerted_since_reply(user, iso):
+        log.info("Assist booking for %s: the 'nearly confirmed' alert raised in this moment covers it - no "
+                 "second post", user)
+        return False
+    if iso and _clash_alert_stands(user, iso):
+        log.info("Assist booking for %s: an 'already booked' alert about %s still stands open - the same fact, no "
+                 "second post", user, iso)
+        return False
+    alert_owner(user, headline or assist_booking_headline(user, raw),
+                assist_booking_reason(user, raw, reply, lead, tail), kind="assist_booking")
+    try:
+        set_setting(f"assist_booking_day:{user}", iso)
+        if clash_key:
+            set_setting(clash_key, str(int(time.time())))      # round 3c (M3): the fact this alert told staff
+    except Exception:
+        log.exception("Could not keep the assist_booking day for %s", user)
+    return True
+
+
 # A message that asks for nothing must not wake anybody up. Five of the 33
 # "needs you to follow up" alerts in three days fired on one of these, and each
 # still got reposted at 30 minutes and pushed to the owner's private chat at two
@@ -6529,10 +6972,18 @@ def _maybe_courtesy_close(user: str) -> str | None:
     # so the time window just needs to cover an in-flight reply.
     if row and time.time() - (row[0] or 0) < 180:
         return  # a colleague replied moments ago — they have it
-    history = get_history(user)
+    history = _assist_history(user)      # fix3 1A: each colleague line labelled as the colleague's
     if not history or history[-1]["role"] != "user":
         return
-    system_prompt = (load_system_prompt(), availability_block() + ASSIST_WHILE_STAFF)
+    # fix3 1D: a "nearly confirmed" alert raised at or after their newest message (open, Done or sorted)
+    # already stands for it - nothing new to say about that "yes": no model call, no second post. (The
+    # stalled-staff sweep re-ran the assist on garage …195's "Yes please" 1 h 45 min later and raised it
+    # again, restarting the alert's clocks.) A NEW message is newer than the alert: answered as before.
+    if assist_booking_alerted_since_newest(user):
+        log.info("Assist for %s skipped - a 'nearly confirmed' alert already stands for their newest "
+                 "message", user)
+        return
+    system_prompt = (load_system_prompt(), availability_block() + assist_while_staff_prompt())
     raw = _call_claude(history + [{"role": "user", "content":
                                    "(Internal: apply the SPECIAL SITUATION rules to "
                                    "the customer's last message — answer the simple "
@@ -6562,7 +7013,9 @@ def _maybe_courtesy_close(user: str) -> str | None:
             or re.search(r"\bSKIP\b", reply)
             or (reply.startswith("(") and reply.endswith(")"))
             or re.search(r"SPECIAL SITUATION|customer's last message|the colleague is handling",
-                         reply, re.IGNORECASE)):
+                         reply, re.IGNORECASE)
+            or (ASSIST_LABEL_STAFF and (_ASSIST_LABEL_LEAK_RE.search(reply)       # fix3 1A: the label never goes out
+                                        or _ASSIST_TAG_LEAK_RE.search(reply)))):   # (round 2, F6: nor its form)
         if reply and not re.fullmatch(r"SKIP\.?", reply.strip(), re.IGNORECASE):
             log.warning("Assist reply for %s suppressed as internal deliberation: %r",
                         user, reply[:200])
@@ -6580,7 +7033,19 @@ def _maybe_courtesy_close(user: str) -> str | None:
     # Deliberately NOT _finish_reply: it saves the message itself, and its
     # blank-answer branch would turn a deliberate silent SKIP into the fallback
     # message plus an owner alert.
-    reply = guard_day_proposal(user, no_false_checking(after_hours_wording(reply)))
+    # fix3 1B (owner, 30 Sep (a)): no booking questions or read-backs while a colleague holds the chat.
+    # "Shall I book you in for Tuesday 27 October?", "Could I get the car make, model and year ... for the
+    # booking", "Just to confirm: ... Shall I book you in?" (garage …195, 13 Oct) are not sent - exactly as
+    # the model's own SKIP, nothing rewritten; the stalled-staff sweep still tells staff about the waiting
+    # message. Checked before the day guard, which would turn an offer into its own day offer. A reply that
+    # confirms a booking goes to the alert below instead.
+    if (ASSIST_NO_BOOKING_ASK and "<<<BOOKING" not in (raw or "")
+            and not _ASSIST_CLAIMS_BOOKED_RE.search(reply) and _ASSIST_BOOKING_ASK_RE.search(reply)):
+        log.warning("Assist reply for %s not sent - a booking question or read-back while a colleague "
+                    "holds the chat (%r): %r", user, _ASSIST_BOOKING_ASK_RE.search(reply).group(0), reply[:200])
+        return
+    unguarded = no_false_checking(after_hours_wording(reply))
+    reply = guard_day_proposal(user, unguarded)
     # This path strips the booking marker and never calls process_booking, so an
     # assist reply that says "you're booked in" puts NOTHING in the diary. The
     # colleague owns bookings while they have the chat; the assist bot must
@@ -6588,8 +7053,18 @@ def _maybe_courtesy_close(user: str) -> str | None:
     if "<<<BOOKING" in (raw or "") or _ASSIST_CLAIMS_BOOKED_RE.search(reply):
         log.warning("Assist reply for %s suppressed - it tried to confirm a booking: %r",
                     user, reply[:200])
-        alert_owner(user, "🙋 The bot nearly confirmed a booking while you had this chat",
-                    "It was stopped before sending. Please confirm the day with them yourself.", kind="assist_booking")
+        # fix3 1D: the alert says what to add (the day with its weekday worked out here, car, reg, job,
+        # name), quotes them and the colleague's last real words, and flags what to check first. Nothing
+        # goes to the customer (owner, 3 Oct: no holding line). Once per "yes": one raised in this moment
+        # (open, Done or sorted) already covers a sticker or "my wife brings it" after it - but a new day, or
+        # a colleague / the owner who came back since, is a new one (round 2: raise_assist_booking_alert).
+        raise_assist_booking_alert(user, raw, reply)
+        return
+    if ASSIST_NO_BOOKING_ASK and reply != unguarded:
+        # fix3 1B: the day guard made the reply its own day offer ("The nearest day I can offer you is ...
+        # - would that suit?"): no day offers in a colleague's chat either
+        log.warning("Assist reply for %s not sent - the day guard made it a day offer while a colleague "
+                    "holds the chat: %r", user, reply[:200])
         return
     if _FABRICATED_LOOK_RE.search(reply):
         alert_owner(user, "⚠️ The bot claimed it looked at this customer's car",
@@ -6662,13 +7137,712 @@ def _watch_note_once(user: str, day: str, text: str) -> None:
         log.exception("watch note memory failed for %s", user)
     send_telegram(text)
 
-def watch_staff_booking(user: str, by_customer: bool = False) -> None:
+# ------------------------------------- fix3 ROUND 3: the watcher may book only what a colleague's words offered
+# Garage …791 (13 Oct): Dima offered "This Saturday" and the customer-side watcher wrote Sat 17 (id 557). At 16:09
+# the stalled-staff sweep's assist read back "Saturday 24 October" (BOOKINGS_FROM pushed it), the customer answered
+# "Thats it, Yes please book me in" and the same watcher - which sees the bot's lines and the colleague's alike -
+# wrote Sat 24 too (id 558), past every gate (override_capacity), with no two-bookings warning (that lived only in
+# after_new_booking, as a bare Telegram line). Now (round 3):
+#   R3-a  the customer-side watcher books ONLY a day the newest real colleague day line of this hold offered (V1's
+#         invitation rule), and sees each line labelled as the colleague's / the owner's;
+#   R3-b  before ANY watcher save: a booking for this phone / car made in this hold or the last 24 h for ANOTHER day
+#         -> nothing saved, a precise alert ("already booked Sat 17 (id 557) - the bot read back Sat 24; check which");
+#   R3-c  every watcher save runs after_new_booking's two-bookings check, now an alerts row (double_booking);
+#   R3-d  a watcher save whose day did NOT come from a colleague's words: no capacity override, and every customer
+#         gate (BOOKINGS_FROM, a Saturday non-service job, a Land Rover / Range Rover repair, a bank holiday, a full
+#         day) -> nothing saved, staff told once.
+DOUBLE_BOOKING_KIND = "double_booking"
+
+
+# fix3 round 3b (reviews F2 / R3A-3): a colleague message that is ONLY a yes ("Sure", "Yes no problem", "Ok thanks",
+# "Book you in now") - a yes to the ONE day the customer just asked for (the headlights build's _STAFF_AFFIRM_RE).
+_HOLD_AFFIRM_WORD = (r"(?:yes|yeah|yep|yup|sure|ok|okay|no problem|no bother|no worries|grand|perfect|done|of course"
+                     r"|absolutely|definitely|that'?s fine|thats fine|fine|book(?:ed)? (?:you|u) in(?: now)?|will do"
+                     r"|da|sigur|bine)")
+_HOLD_AFFIRM_RE = re.compile(r"(?:(?:hi|hello|hey)(?:\s+\w+)?[\s,.!]*)?" + _HOLD_AFFIRM_WORD
+                             + r"(?:[\s,.!]+(?:" + _HOLD_AFFIRM_WORD[3:-1] + r"|mate|thanks|thank you))*[\s,.!]*",
+                             re.IGNORECASE)
+# ...and a colleague sentence that commits to nothing ("Remind me friday", G …729; "Maybe Thursday", "Thursday is mad
+# busy") - as a take-back, it unsets the days it names and no yes in that turn counts (the headlights twin's
+# _STAFF_NOT_INVITE_RE)
+_HOLD_NO_COMMIT_RE = re.compile(r"\b(?:maybe|perhaps|possibly|busy|packed|chock\w*|impossible)\b", re.IGNORECASE)
+
+
+def _hold_staff_offer_days(user: str) -> list:
+    """fix3 round 3 (R3-a): the days the customer-side watcher may book - from today on, never a Sunday. Round 3b
+    (reviews F2 / R3A-3: the newest colleague day line alone lost G …821 and G …221, both customers came) - the
+    headlights build's hold_colleague_days(offered=True): a per-day state across this chat's CURRENT hold, each
+    colleague sentence read as of the day it was written:
+      - a REAL colleague sentence that invites them in on a day (V1: _hold_invite_cue - "We can do Thursday", "the next
+        avaiable date will be 25th") or a colleague's own bare day statement ("This Saturday", G …791 - not a bare
+        "Thursday?") sets that day;
+      - the ONE day the customer asked for since the last business line, when the colleague's turn (their messages
+        under 5 minutes apart) opens with a plain yes ("Sure", "Book you in now", G …221) and names no other day;
+      - a later colleague sentence that turns a day down or commits to nothing ("Sorry, Thursday is full now",
+        "Remind me friday", G …729) unsets it - a plain later mention ("The tyres will be in Wednesday") leaves the
+        offer as it was; an owner's Telegram line with take-back words unsets every day offered so far.
+    Never a day only the bot named or read back (garage …791 Sat 24, …946). The clock is now_local's. Unsure: []."""
+    nowts = now_local().timestamp()
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT role, content, ts, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                                " AND ts >= ? ORDER BY id DESC LIMIT 300", (user, nowts - 7 * 86400)).fetchall()
+    except Exception:
+        log.exception("Could not read the hold of %s", user)
+        return []
+    start, last = None, nowts
+    for role, _c, ts, _k in rows:                 # newest first: back to the gap that ended an earlier hold
+        if role != "staff":
+            continue
+        if last - (ts or 0) >= AUTO_RESUME_HOURS * 3600:
+            break
+        last = start = ts or 0
+    if start is None:
+        return []
+    state = {}
+
+    def sentences(c):
+        t = re.sub(r"(?:\.{2,}|…)\s*", ". ", _plain_apostrophes(c or ""))
+        return [" ".join(s.split()) for s in re.split(r"(?<=[.!?])\s+|\n+", t) if s.strip()]
+
+    def read_turn(turn, asked):
+        declined, named = False, set()
+        for c, ts in turn:
+            d0 = _gap_local_date(ts)
+            for s in sentences(c):
+                if (_HOLD_TAKEN_BACK_RE.search(s) or _GAP_STAFF_DECLINE_RE.search(s) or _HOLD_REMIND_RE.search(s)
+                        or _HOLD_NO_COMMIT_RE.search(s)):
+                    declined = True
+                    state.update(dict.fromkeys(_hold_line_days(s, ts), False))
+                    # round 3c (VERIFY_FINAL M1): "Sorry, not Wednesday - Thursday is free", "We can't do tomorrow but
+                    # we can do Friday" - the day offered AFTER the decline is offered; the declined day stays unset
+                    tail = _hold_counter_offer(s)
+                    tdays = set(staff_named_days(tail, d0)) if tail and _hold_counter_ok(tail, False) else set()
+                    if tdays:
+                        named |= tdays
+                        state.update(dict.fromkeys(tdays, True))
+                    continue
+                days = set(staff_named_days(s, d0))
+                named |= days
+                if _HOLD_NOT_OFFER_RE.search(s):
+                    declined = True       # a call-back, a part, a day off: the turn's yes is not plainly to the day
+                    continue
+                if days and not (_HOLD_TWO_DAYS_RE.search(s) or _HOLD_NEG_INVITE_RE.search(s)) and (
+                        _hold_invite_cue(s) or ("?" not in s and _hold_bare_day_line(s))):
+                    state.update(dict.fromkeys(days, True))
+        first = " ".join(_STAFF_EMOJI_RE.sub(" ", _plain_apostrophes(turn[0][0] or "")).split())
+        if (len(asked) == 1 and not declined and not (named - asked) and len(first) <= 80
+                and _HOLD_AFFIRM_RE.fullmatch(first)):
+            state.update(dict.fromkeys(asked, True))
+
+    asked, turn = set(), []
+    for role, c, ts, kind in reversed(rows):      # oldest first, from a day before the hold
+        c, ts = c or "", ts or 0.0
+        if ts < start - 24 * 3600:
+            continue
+        if role == "staff":
+            if not is_real_staff_text(c):
+                continue
+            if turn and ts - turn[-1][1] > 300:
+                read_turn(turn, asked)
+                asked, turn = set(), []
+            if ts < start:
+                asked = set()         # a colleague of an earlier hold answered - not this hold's turn
+                continue
+            turn.append((c, ts))
+            continue
+        if turn:
+            read_turn(turn, asked)
+            asked, turn = set(), []
+        if role == "user":
+            asked |= set(staff_named_days(c, _gap_local_date(ts)))
+        elif role == "assistant" and kind in ("owner_tg", "owner_book"):
+            if _HOLD_TAKEN_BACK_RE.search(c) or _GAP_STAFF_DECLINE_RE.search(c):
+                state.update(dict.fromkeys([x for x, ok in state.items() if ok], False))
+            asked = set()
+        elif role == "assistant" and kind not in NOT_AN_ANSWER_KINDS:
+            asked = set()             # the bot answered it: a colleague's later yes is not to that message
+    if turn:
+        read_turn(turn, asked)
+    today = now_local().date()
+    return sorted(x for x, ok in state.items() if ok and date.fromisoformat(x) >= today
+                  and date.fromisoformat(x).weekday() != 6)
+
+
+# ------------------------------------- fix3 ROUND 3c (VERIFY_FINAL M1 / M3, 14 Oct)
+# M1: a colleague sentence that turns one day down AND offers another - "Sorry, not Wednesday - Thursday is free", "We
+# can't do tomorrow but we can do Friday", "Unfortunately Wednesday is full but we can do Thursday 22nd", "Sorry Don,
+# the next available date will be 25th", H …904 "Not tomorrow mate, Thursday in the morning". Rounds 3 / 3b read the
+# whole sentence as a take-back and unset every day it named - the OFFERED day too - so the customer's "book me in for
+# Thursday" / "ok" wrote nothing (live writes it). Now the words AFTER the last decline word, from the next clause break
+# on (a comma, ";", ":", a dash, "but", "however"), are read on their own: when they name a day and invite them in by
+# themselves (an offer cue, "<day> is free / available", or a bare day line) and pass every offer check, that day is
+# offered. The declined day stays unset. A decline AFTER the offer ("We could do Thursday but it's full"), "remind me",
+# words that only carry the decline on ("..., and Friday", "Friday too", "Friday maybe") or two days offer nothing, as
+# before.
+# (never inside a time or a range: "9:30", "9\u201311")
+_HOLD_COUNTER_BREAK_RE = re.compile(r"[,;]+|(?<!\d):+(?!\d)|\s[-\u2013\u2014]+\s|(?<!\d)[\u2013\u2014]+(?!\d)"
+                                    r"|\s(?=(?:but|however)\b)", re.IGNORECASE)
+_HOLD_COUNTER_LEAD_RE = re.compile(r"[\s,;:\u2013\u2014-]*(?:(?:but|however|though|yet)\b[\s,]*)?", re.IGNORECASE)
+_HOLD_COUNTER_CONT_RE = re.compile(r"(?:and|or|nor|&|plus|also|either|neither|too|as well)\b", re.IGNORECASE)
+_HOLD_DAY_FREE_RE = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|tomorrow|\d{1,2}(?:st|nd|rd|th)?)"
+    r"(?:\s+(?:morning|afternoon|evening))?(?:\s+is|'s|\s+are)\s+"
+    r"(?:(?:still|now|also)\s+)?(?:free|available|ok|okay|fine|good|grand)\b", re.IGNORECASE)
+# ...and when the customer-side watcher then writes nothing although the customer clearly asked to be booked in (R3-a
+# found no day a colleague's words offered, or its model read another day), staff are told - ONE precise alert, never
+# silence. Narrow on purpose: "Great, please book me in for Thursday", "Can I book it in for Friday?", "Book it.
+# Please", "I'd like to book a service" - not "did you book" questions about the past, a cancel or a "no need".
+_HOLD_CUST_BOOK_ASK_RE = re.compile(
+    r"\bbook\s+(?:me|us|it|her|him|them|my\s+(?:car|van)|the\s+(?:car|van))\b"
+    r"|\b(?:pencil|put|pop|squeeze|fit)\s+(?:me|us|it|her|him|them)\s+(?:in|down)\b"
+    r"|\b(?:can|could|may|shall)\s+(?:i|we)\s+(?:please\s+)?book\b"
+    r"|\b(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?book\b"
+    r"|\b(?:like|want|wanna|love|need)\s+to\s+book\b|\bplease\s+book\b"
+    r"|\bbook\s+(?:in\s+)?(?:for|on)\s+(?:the\s+|this\s+|next\s+)?(?:mon|tue|wed|thu|fri|sat|tomorrow|\d)"
+    r"|\b(?:make|get|have)\s+(?:a|an)\s+(?:booking|appointment)\b"
+    r"|\bbook\s+(?:a|an|the)\s+(?:slot|appointment|space|service)\b",
+    re.IGNORECASE)
+_HOLD_CUST_NO_BOOK_RE = re.compile(
+    r"\b(?:cancel\w*|resched\w*|postpon\w*|unbook\w*)\b|\b(?:don'?t|dont|do not|no need to|not)\s+(?:\w+\s+){0,2}?book",
+    re.IGNORECASE)
+
+
+def _hold_counter_offer(s: str) -> str:
+    """fix3 round 3c (VERIFY_FINAL M1): the words a colleague sentence says AFTER its last decline / no-commit word
+    (_HOLD_TAKEN_BACK_RE, _GAP_STAFF_DECLINE_RE, _HOLD_NO_COMMIT_RE), from the next clause break on - the offer a
+    decline may go on to make ("Sorry, not Wednesday - Thursday is free" -> "Thursday is free") - or '' (no such words,
+    a "remind me", or words that only carry the decline on: "..., and Friday"). Whether they offer a day is
+    _hold_counter_ok's question."""
+    t = " ".join(_plain_apostrophes(s or "").split())
+    if not t or _HOLD_REMIND_RE.search(t):
+        return ""
+    ends = [m.end() for rx in (_HOLD_TAKEN_BACK_RE, _GAP_STAFF_DECLINE_RE, _HOLD_NO_COMMIT_RE) for m in rx.finditer(t)]
+    if not ends:
+        return ""
+    brk = _HOLD_COUNTER_BREAK_RE.search(t, max(ends))
+    if not brk:
+        return ""
+    tail = t[brk.end():]
+    tail = tail[_HOLD_COUNTER_LEAD_RE.match(tail).end():].strip()
+    if not tail or _HOLD_COUNTER_CONT_RE.match(tail):
+        return ""
+    return tail
+
+
+def _hold_counter_ok(tail: str, question_ok: bool) -> bool:
+    """fix3 round 3c (VERIFY_FINAL M1): the words after a decline (_hold_counter_offer) invite them in by themselves -
+    every offer sentence's checks (no call-back / part / day off, ONE day, no negated invitation, no money / keys /
+    collection, no work on a car already here without "bring / drop / come"), and an offer cue (_hold_invite_cue),
+    "<day> is free / available" or a bare day line ("Thursday in the morning"; a bare question - "Friday?" - only where
+    the caller counts one: 1C)."""
+    t = " ".join((tail or "").split())
+    if (not t or _HOLD_NOT_OFFER_RE.search(t) or _HOLD_TWO_DAYS_RE.search(t) or _HOLD_NEG_INVITE_RE.search(t)
+            or _HOLD_NOT_VISIT_RE.search(t) or (_HOLD_WORK_HERE_RE.search(t) and not _HOLD_MOTION_RE.search(t))):
+        return False
+    return bool(_hold_invite_cue(t) or _HOLD_DAY_FREE_RE.search(t)
+                or ((question_ok or "?" not in t) and _hold_bare_day_line(t)))
+
+
+def _hold_colleague_last_ts(user: str) -> float:
+    """fix3 round 3c: when a colleague last REALLY wrote (is_real_staff_text) in this chat's CURRENT hold - back to the
+    gap that ended an earlier one, as _hold_staff_offer_days reads it; 0.0 when none did. The clock is now_local's."""
+    nowts = now_local().timestamp()
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?"
+                            " ORDER BY id DESC LIMIT 300", (user, nowts - 7 * 86400)).fetchall()
+    last = nowts
+    for c, ts in rows:
+        if last - (ts or 0) >= AUTO_RESUME_HOURS * 3600:
+            break
+        last = ts or 0
+        if is_real_staff_text(c or ""):
+            return ts or 0.0
+    return 0.0
+
+
+def _hold_book_ask_unbooked(user: str, read_iso: str = "", offered=None) -> str:
+    """fix3 round 3c (VERIFY_FINAL M1): the customer-side watcher wrote nothing - R3-a found no day a colleague's words
+    offered in this hold, or (`read_iso`, `offered`) its model read another day than the ones offered - but the
+    customer's newest message clearly asks to be booked in (_HOLD_CUST_BOOK_ASK_RE; not a cancel, a "no need", a status
+    or collection question) and a colleague REALLY wrote in this hold, more than 3 minutes ago (the assist's own grace -
+    inside it the colleague is mid-reply): not silence. ONE precise assist_booking alert (raise_assist_booking_alert:
+    once per moment and day) naming the day they asked for - or, when they named none, the ONE day the bot's own reply
+    after the colleague's last message named (its read-back, never counted as agreed) - or the diary-gap task for that
+    day when one stands (_diary_gap_task_covers). Nothing when that day is already in their diary. Returns "told" when
+    staff were told about this message now (the webhook then runs no assist - nothing goes to the customer, owner
+    3 Oct), else '' (today's flow). Switch: ASSIST_STAFF_DAY_BOOK. Unsure: ''."""
+    if not ASSIST_STAFF_DAY_BOOK:
+        return ""
+    try:
+        with closing(db()) as conn:
+            last = conn.execute("SELECT role, content, ts FROM messages WHERE wa_user = ? ORDER BY id DESC LIMIT 1",
+                                (user,)).fetchone()
+            hold = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+        if not last or last[0] != "user":
+            return ""
+        text = _plain_apostrophes(last[1] or "")
+        if (not _HOLD_CUST_BOOK_ASK_RE.search(text) or _HOLD_CUST_NO_BOOK_RE.search(text)
+                or _HOLD_CUST_STATUS_RE.search(text)):
+            return ""
+        if hold and time.time() - (hold[0] or 0) < 180:
+            log.info("Customer-side watch for %s: a colleague wrote moments ago - no booking-ask alert", user)
+            return ""
+        staff_ts = _hold_colleague_last_ts(user)
+        if not staff_ts:
+            return ""
+        today = now_local().date().isoformat()
+        iso, src = (read_iso or ""), ("read" if read_iso else "")
+        if not iso:
+            mine = [x for x in staff_named_days(text, _gap_local_date(last[2] or 0.0)) if x >= today]
+            if len(mine) == 1:
+                iso, src = mine[0], "asked"
+            elif not mine:
+                with closing(db()) as conn:
+                    b = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                                     " AND COALESCE(kind, '') = '' AND ts > ? ORDER BY id DESC LIMIT 1",
+                                     (user, staff_ts)).fetchone()
+                bd = sorted(_hold_line_days(b[0] or "", b[1] or 0.0)) if b else []
+                if len(bd) == 1:
+                    iso, src = bd[0], "bot"
+        if iso and _has_booking_on(user, iso):
+            log.info("Customer-side watch for %s: %s is already in their diary - no booking-ask alert", user, iso)
+            return ""
+        if iso and _diary_gap_task_covers(user, iso):
+            log.info("Customer-side watch for %s: the diary-gap task for %s tells staff", user, iso)
+            return "told"
+        d = date.fromisoformat(iso) if iso else None
+        offered_s = " / ".join(f"{date.fromisoformat(x):%a %d %b}" for x in (offered or []))
+        if d and src == "read" and offered_s:
+            lead = (f"They asked to be booked in and the bot read {d:%a %d %b} - but your colleague's words in this chat "
+                    f"offered {offered_s}, so nothing went into the diary.")
+        elif d and src == "bot":
+            lead = (f"They asked to be booked in - only the bot's own reply named {d:%a %d %b} (that never counts as "
+                    "agreed), and no day your colleague offered could be read from this chat, so nothing went into the "
+                    "diary.")
+        else:
+            lead = ("They asked to be booked in" + (f" for {d:%a %d %b}" if d else "") + ", but no day your colleague "
+                    "offered could be read from this chat, so nothing went into the diary.")
+        told = raise_assist_booking_alert(
+            user, f"<<<BOOKING|car=|reg=|need=|date={iso}|time=|name=|phone=|lang=>>>", "", lead=lead,
+            headline="" if d else "\U0001F64B Wants to be booked in — NOT in the diary yet")
+        log.info("Customer-side watch for %s: they asked to be booked in, nothing written - %s", user,
+                 "staff told" if told else "an alert already covers it")
+        return "told" if told else ""
+    except Exception:
+        log.exception("Customer-side watch: the booking-ask alert for %s failed", user)
+        return ""
+
+
+# M3: one "Already booked X - ... Y" alert per fact (this chat, booking X, day Y) while it stands open. The staff side's
+# double_booking (the colleague's own "Ok see you Saturday 24th then") and then the customer's "Ok" (1C, or the
+# customer-side watcher) posted the same fact twice - the second as kind assist_booking, which replaced the double_booking
+# row and so lost its "closes when the diary changes". Every clash alert now remembers its fact (clash_told:...); a new
+# one is skipped while the remembered fact's booking is still on another day and this customer's alert is still open
+# and unsorted (alert_resolved). Closed (Done, a colleague's real reply to an assist_booking one, the diary changed):
+# a new alert may go out. (The staff side keeps its own once-only watch_clash key as before.)
+def _clash_fact_key(user: str, bid, iso: str) -> str:
+    return f"clash_told:{user}:{bid}:{iso}"
+
+
+def _clash_alert_stands(user: str, iso: str) -> bool:
+    """fix3 round 3c (VERIFY_FINAL M3): an "Already booked X - ... `iso`" alert was raised for this chat (either side,
+    _clash_fact_key), booking X is still in the diary on another day, and this customer's alert row is still open and
+    unsorted, raised at or after that alert - the same fact stands open. Unsure: False (the alert goes out)."""
+    if not iso:
+        return False
+    prefix = f"clash_told:{user}:"
+    try:
+        with closing(db()) as conn:
+            facts = [(k, v) for k, v in conn.execute("SELECT key, value FROM settings WHERE key LIKE ?",
+                                                     (prefix + "%",)).fetchall()
+                     if k.startswith(prefix) and k.endswith(":" + iso)]
+            if not facts:
+                return False
+            a = conn.execute("SELECT ts, COALESCE(closed_ts, 0) FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+            if not a or (a[1] or 0) >= (a[0] or 0) or alert_resolved(conn, user, a[0]):
+                return False
+            for k, v in facts:
+                try:
+                    bid, told = int(k[len(prefix):-(len(iso) + 1)]), float(v or 0)
+                except ValueError:
+                    continue
+                b = conn.execute("SELECT date FROM bookings WHERE id = ?", (bid,)).fetchone()
+                if b and b[0] != iso and (a[0] or 0) >= told - 600:
+                    return True
+        return False
+    except Exception:
+        log.exception("Could not read the clash alerts of %s", user)
+        return False
+
+
+def _watch_iso(fields: dict) -> str:
+    """The watcher's date as save_booking will store it (the wrong-year fix), or ''."""
+    try:
+        return booking_year_fix(date.fromisoformat((fields.get("date") or "").strip()[:10]),
+                                now_local().date()).isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _watch_recent_other_booking(user: str, fields: dict):
+    """fix3 round 3 (R3-b): (id, date, created_ts) of a booking for this phone or car made in this hold or the last 24 h
+    for ANOTHER day after today - or None. Another car on the same phone (both regs known and different) is a second
+    car, not a clash. (A day already in their diary is a re-confirmation, checked before this.) Unsure: None."""
+    iso = _watch_iso(fields)
+    digits = "".join(c for c in str(user) if c.isdigit())
+    reg = clean_reg(fields.get("reg", ""))
+    if not iso or (len(digits) < 7 and not reg):
+        return None
+    nowts = now_local().timestamp()
+    try:
+        with closing(db()) as conn:
+            last = nowts            # the current hold: the colleague's rows back to the gap that ended an earlier one
+            for (ts,) in conn.execute("SELECT ts FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?"
+                                      " ORDER BY id DESC LIMIT 400", (user, nowts - 7 * 86400)).fetchall():
+                if last - (ts or 0) >= AUTO_RESUME_HOURS * 3600:
+                    break
+                last = ts or 0
+            rows = conn.execute(
+                "SELECT id, date, COALESCE(created_ts, 0), UPPER(TRIM(COALESCE(reg, ''))), COALESCE(car, '')"
+                " FROM bookings"
+                " WHERE COALESCE(created_ts, 0) >= ? AND date > ? AND date != ? AND ((? <> '' AND"
+                " UPPER(TRIM(COALESCE(reg, ''))) = ?) OR (? <> '' AND"
+                " REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '+', '') LIKE ?))"
+                " ORDER BY COALESCE(created_ts, 0) DESC LIMIT 10",
+                (min(nowts - 24 * 3600, last), now_local().date().isoformat(), iso, reg, reg,
+                 digits[-9:] if len(digits) >= 7 else "", "%" + digits[-9:])).fetchall()
+    except Exception:
+        log.exception("Could not read the diary for %s", user)
+        return None
+    for bid, d, cts, r, car in rows:
+        if reg and r and clean_reg(r) and clean_reg(r) != reg and not (
+                _one_edit_apart(clean_reg(r), reg) and _same_car_name(car, fields.get("car", ""))):
+            continue                  # another car on the same phone
+        return (bid, d, cts)
+    return None
+
+
+def _one_edit_apart(a: str, b: str) -> bool:
+    """fix3 round 3b (review F9): two regs one typing slip apart - one character changed, added or dropped, or two
+    neighbours swapped (232D12345 / 232D12354)."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diff = [k for k in range(len(a)) if a[k] != b[k]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    if len(a) > len(b):
+        a, b = b, a
+    k = 0
+    while k < len(a) and a[k] == b[k]:
+        k += 1
+    return a[k:] == b[k + 1:]
+
+
+def _same_car_name(a: str, b: str) -> bool:
+    """fix3 round 3b (review F9): both car names known and sharing a word of the make or model ("BMW 118i M Sport")."""
+    wa = {w for w in re.findall(r"[^\W_]{2,}", (a or "").lower()) if w not in _AGREED_CAR_STOP}
+    wb = {w for w in re.findall(r"[^\W_]{2,}", (b or "").lower()) if w not in _AGREED_CAR_STOP}
+    return bool(wa & wb)
+
+
+def _watch_bot_named(user: str, iso: str) -> bool:
+    """The bot's own replies of the last 24 h name this day (its read-back, garage …791)."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                                " AND COALESCE(kind, '') = '' AND ts >= ? ORDER BY id DESC LIMIT 20",
+                                (user, now_local().timestamp() - 24 * 3600)).fetchall()
+        return any(iso in _hold_line_days(c or "", ts or 0) for c, ts in rows)
+    except Exception:
+        return False
+
+
+def _watch_clash_words(user: str, fields: dict, clash: tuple, staff_day: bool) -> tuple:
+    """fix3 round 3 (R3-b): (headline, why, tail) for a watcher booking NOT written because this phone / car already
+    has a booking made in this hold or the last 24 h on another day."""
+    d, od = date.fromisoformat(_watch_iso(fields)), date.fromisoformat(clash[1])
+    made = datetime.fromtimestamp(clash[2] or 0, ZoneInfo("Europe/Dublin")).strftime("%a %H:%M")
+    src = ("your colleague offered" if staff_day else
+           "the bot read back" if _watch_bot_named(user, d.isoformat()) else "the chat now reads")
+    headline = f"\u26a0\ufe0f Already booked {od:%a %d %b} (id {clash[0]}) — {src} {d:%a %d %b}; check which"
+    why = (f"they are already in the diary for {od:%a %d %b} (id {clash[0]}, added {made}), and {src} "
+           f"{d:%a %d %b} - check which day they mean")
+    tail = ("Nothing was added. Check which day they mean, then fix the diary - move the booking, don't add a second "
+            "one - and tell them.")
+    return headline, why, tail
+
+
+def _watch_recent_car(user: str, fields: dict, since: float) -> None:
+    """fix3 round 3b (review F8): the customer-side watcher's car and reg must be in this chat's words since `since`
+    (the caller: 30 days) - the customer's or a colleague's (a family phone may carry another car; its model reads the
+    whole history). A car counts when its reg, or a word of its name (not "car", "the", "series"..., and not only an
+    everyday word like "fit"), is there; else it is dropped, as is a reg nobody typed. Unsure: nothing dropped."""
+    try:
+        with closing(db()) as conn:
+            said = " ".join((r[0] or "") for r in conn.execute(
+                "SELECT content FROM messages WHERE wa_user = ? AND ts >= ? AND role IN ('user', 'staff')",
+                (user, since)).fetchall())
+    except Exception:
+        log.exception("Could not read the chat of %s", user)
+        return
+    flat, low = re.sub(r"[^0-9A-Z]", "", said.upper()), said.lower()
+    reg = clean_reg(fields.get("reg", ""))
+    if reg and re.sub(r"[^0-9A-Z]", "", reg) not in flat:
+        log.info("Customer-side watch for %s: the reg %r is not in this chat's last days - dropped", user, reg)
+        fields["reg"] = ""
+    car = (fields.get("car") or "").strip()
+    hit = [w for w in re.findall(r"[^\W\d_]{2,}", car.lower()) if w not in _AGREED_CAR_STOP
+           and re.search(r"(?<![^\W_])" + re.escape(w) + r"(?![^\W_])", low)]
+    if car and car.lower() not in _PLACEHOLDER_CAR and not (
+            (clean_reg(car) and re.sub(r"[^0-9A-Z]", "", clean_reg(car)) in flat)
+            or any(w not in _AGREED_CAR_COMMON for w in hit)):
+        log.info("Customer-side watch for %s: the car %r is not in this chat's last days - dropped", user, car)
+        fields["car"] = ""
+
+
+def _watch_customer_gate(fields: dict) -> str:
+    """fix3 round 3 (R3-d): why a watcher booking whose day did NOT come from a colleague's own words may not be written
+    - the customer gates of the main path, without the capacity override ('' = it may)."""
+    iso = _watch_iso(fields)
+    if not iso:
+        return "the day could not be read"
+    d, need = date.fromisoformat(iso), fields.get("need", "") or ""
+    hol = bank_holiday_name(iso)
+    if hol:
+        return f"{d:%a %d %b} is a bank holiday ({hol}) - we're closed"
+    if before_open_date(iso):
+        return f"{d:%a %d %b} is before {bookings_open_from():%a %d %b}, the first day we take bookings"
+    if d.weekday() == 5 and not saturday_service_only(need):
+        return "it is a Saturday, and Saturdays are for general services only"
+    if services_only_window(d) and need and not saturday_service_only(need):
+        return f"before {all_jobs_open_from():%a %d %b} only general services are booked, and this job isn't one"
+    if (_ASSIST_LR_RE.search(f"{fields.get('car', '')} {need}")
+            and not (saturday_service_only(need) or _ASSIST_LR_OK_RE.search(need))):
+        return "it is a Land Rover / Range Rover repair - we don't do those"
+    if day_is_full(iso, need):
+        return f"{d:%a %d %b} has no room left for this job"
+    return ""
+
+
+def _watch_gate_note(user: str, fields: dict, why: str) -> None:
+    """fix3 round 3 (R3-d): staff told, once per customer and day (a diary-gap task for that day is posted instead).
+    Round 3b (review R3A-1): it says what is true - only the bot named that day."""
+    iso = _watch_iso(fields)
+    if task_for_watch_note(user, iso):
+        return
+    try:
+        day = date.fromisoformat(iso).strftime("%A %d %B")
+    except ValueError:
+        day = iso
+    _watch_note_once(user, iso, "\U0001F4CC Your colleague seems to have agreed "
+                                f"{day} with {customer_label(user)} - but only the bot named that day (its read-back): "
+                                f"no colleague message and nothing the customer wrote named it, and {why}. NOT put in "
+                                "the diary and no reminder will go out. If they really agreed it, add it by hand (that "
+                                f"overrides the checks). https://wa.me/{user}")
+
+
+def _watch_named_by(user: str, iso: str) -> set:
+    """fix3 round 3b (reviews F3 / R3A-1): who of the PEOPLE in this chat named this day in the last 7 days -
+    "colleague" (a real colleague message), "owner" (his Telegram lines), "customer" (their own words) - each line
+    read broadly (_hold_line_days: every day it names, ambiguous ones too, as of the day it was written; never rule
+    talk). R3-d gates a staff-side day only when none of them named it and the bot did (_watch_bot_only_day).
+    Unsure: {"?"}."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT role, content, ts, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                                " AND ts >= ? ORDER BY id DESC LIMIT 300",
+                                (user, now_local().timestamp() - 7 * 86400)).fetchall()
+    except Exception:
+        log.exception("Could not read the chat of %s", user)
+        return {"?"}
+    out = set()
+    for role, c, ts, kind in rows:
+        who = ("customer" if role == "user" else "colleague" if role == "staff" and is_real_staff_text(c or "")
+               else "owner" if role == "assistant" and kind in ("owner_tg", "owner_book") else "")
+        if who and who not in out and iso in _hold_line_days(c or "", ts or 0):
+            out.add(who)
+    return out
+
+
+def _watch_bot_only_day(user: str, iso: str) -> bool:
+    """fix3 round 3b (reviews F3 / R3A-1): the staff watcher's day came ONLY from the bot - its ordinary replies of the
+    last 24 h named it (_watch_bot_named: the read-back) and no person in this chat named it in 7 days. Only such a
+    day loses the capacity override and meets the customer gates (R3-d, the …791 twin: a colleague's "Done" to the
+    bot's read-back of a day before BOOKINGS_FROM, a Saturday repair, a full day). A colleague's "That's done thanks"
+    to the customer's own day (G …062), "Ok bring over we will do" (G …701), a squeeze-in worded around "fully booked"
+    (G …584), "Only tomorrow", "You are booked in for Thursday": the override, as today. Unsure: False."""
+    if not iso:
+        return False
+    try:
+        return _watch_bot_named(user, iso) and not _watch_named_by(user, iso)
+    except Exception:
+        log.exception("Could not tell who named %s for %s", iso, user)
+        return False
+
+
+def _diary_gap_task_covers(user: str, iso: str) -> bool:
+    """fix3 round 3 (VERIFY V2): an OPEN diary-gap task for this chat and day exists - it already tells staff the day
+    is not in the diary. An open one not posted yet is posted now (task_for_watch_note). Unsure: False.
+    Round 3d (review A-F1): a Done task covers nothing - someone pressed Done before the customer answered, so their
+    later yes must reach staff (the caller's own alert), never vanish with no alert at all."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT COALESCE(closed_ts, 0) FROM tasks WHERE kind = ? AND wa_user = ? AND date = ?"
+                               " ORDER BY COALESCE(closed_ts, 0) = 0 DESC, id DESC LIMIT 1",
+                               (TASK_KIND_DIARY_GAP, user, iso)).fetchone()
+    except Exception:
+        log.exception("Could not read the diary-gap tasks of %s", user)
+        return False
+    if not row:
+        return False
+    if not row[0]:
+        # round 3b (review R3A-N3): an open task covers it only when it really goes out now - not a call-off, nor one
+        # that waits for the morning (task_for_watch_note says so); else the caller's own alert goes out
+        return task_for_watch_note(user, iso)
+    return False            # round 3d (review A-F1): Done - the caller's own alert goes out
+
+
+def raise_diary_alert(user: str, headline: str, reason: str, days=(), reg: str = "") -> bool:
+    """fix3 round 3 (R3-c): a diary warning for staff as an alerts row - kind double_booking, with the Done button and
+    its ladder, listed in claimstatus - instead of a bare Telegram line. Never a customer chase: the customer waits on
+    nobody (chased_ts is set to the alert's own time). Never in place of an open alert of another kind that still
+    waits for a person (one row per customer: that customer would lose their clocks) - then, for the owner's own
+    number and when unsure, the plain Telegram line as before. True when the alerts row was raised.
+    Round 3b: an open, unsorted alert of another kind is never replaced however old it is (review R3A-6: a 30-hour-old
+    unanswered call-back is still on the 7-day waiting list - as the headlights build); `days` / `reg` (review R3A-7):
+    the diary days the warning is about, remembered so it closes on Done or once the diary for those days changes
+    (alert_resolved) - never on the colleague's next chat line.
+    Round 3d (review T-F1): DOUBLE_BOOKING_ALERT=0 - never an alerts row: the plain Telegram line with the same words
+    (after_new_booking's two-bookings check then reads exactly as before round 3)."""
+    digits = "".join(c for c in str(user or "") if c.isdigit())
+    busy = not DOUBLE_BOOKING_ALERT or len(digits) < 9 or bool(OWNER_WHATSAPP and user == OWNER_WHATSAPP)
+    if not busy:
+        try:
+            with closing(db()) as conn:
+                r = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(kind, '') FROM alerts WHERE wa_user = ?",
+                                 (user,)).fetchone()
+                busy = bool(r and (r[1] or 0) < (r[0] or 0) and (r[2] or "") != DOUBLE_BOOKING_KIND
+                            and not alert_resolved(conn, user, r[0]))
+        except Exception:
+            log.exception("Could not read the open alert of %s", user)
+            busy = True
+    if busy:
+        send_telegram(headline + "\n" + reason)
+        return False
+    alert_owner(user, headline, reason, kind=DOUBLE_BOOKING_KIND)
+    try:
+        rec = None
+        with closing(db()) as conn, conn:
+            conn.execute("UPDATE alerts SET chased_ts = ts WHERE wa_user = ? AND kind = ?", (user, DOUBLE_BOOKING_KIND))
+            a = conn.execute("SELECT ts FROM alerts WHERE wa_user = ? AND kind = ?",
+                             (user, DOUBLE_BOOKING_KIND)).fetchone()
+            if a and days:
+                rec = {"ts": a[0], "days": [d or "" for d in days], "reg": clean_reg(reg or ""),
+                       "state": _diary_alert_state(conn, user, reg, days)}
+        if rec:
+            set_setting(f"double_booking_days:{user}", json.dumps(rec))
+    except Exception:
+        log.exception("Could not take the diary alert of %s off the customer chase", user)
+    return True
+
+
+def _diary_alert_state(conn, user: str, reg: str, days) -> str:
+    """fix3 round 3b (review R3A-7): which of `days` this phone (its last 9 digits) or this car (its reg) holds a diary
+    row for - "10" = the first day only."""
+    tail = "".join(c for c in str(user or "") if c.isdigit())[-9:]
+    r = clean_reg(reg or "")
+    return "".join("1" if conn.execute(
+        "SELECT 1 FROM bookings WHERE date = ? AND ((? <> '' AND UPPER(TRIM(COALESCE(reg, ''))) = ?) OR"
+        " REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '+', '') LIKE ?) LIMIT 1",
+        (d or "", r, r, "%" + tail)).fetchone() else "0" for d in days)
+
+
+def _diary_alert_changed(conn, user: str, alert_ts: float) -> bool:
+    """fix3 round 3b (review R3A-7): the diary for this double_booking alert's days changed since it was raised (a
+    booking moved, cancelled or added) - it is sorted. No record of its days, or unsure: False (Done closes it)."""
+    try:
+        rec = json.loads(get_setting(f"double_booking_days:{user}") or "{}")
+        if not rec or abs(float(rec.get("ts") or 0) - float(alert_ts or 0)) > 1 or not rec.get("days"):
+            return False
+        return _diary_alert_state(conn, user, rec.get("reg", ""), rec["days"]) != rec.get("state", "")
+    except Exception:
+        log.exception("Could not read the diary days of %s's alert", user)
+        return False
+
+
+def double_booking_alert(user: str, bf: dict, floor_iso: str, source: str = "") -> str:
+    """THE two-bookings check after a new diary row - after_new_booking's, moved here unchanged (fix3 round 3, R3-c:
+    every watcher save runs it too). The same car (its reg) or, with no reg, the same phone has a booking after
+    `floor_iso` on another day: usually a move whose old row was never cancelled (Don, Alice 16 Sep). Deliberately not
+    cancelled - a customer CAN hold two - both rows are named and a person decides: now an alerts row with a Done
+    button (raise_diary_alert). Returns the other row's date ('' = none).
+    Round 3b: the car in with us TODAY is no second booking (review R3A-5: a diagnosis or service today and the repair
+    booked for later, G …892 / …381 / …523 / …821) - only a real second FUTURE day raises the alerts row; a today-only
+    pair keeps today's plain line. The owner's own bookings (`source` "owner booking ...", reviews N1 / F7) keep the
+    plain line. The alert remembers both days (it closes on Done or once the diary changes - review R3A-7)."""
+    other = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), floor_iso)
+    if not other or other[1] == bf.get("date"):
+        return ""
+    today_iso = now_local().date().isoformat()
+    today_pair = other[1] == today_iso
+    if today_pair:
+        nxt = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), today_iso)
+        if nxt and nxt[1] != bf.get("date"):
+            other, today_pair = nxt, False
+    reason = (f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
+              f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
+              f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
+              "If they moved, cancel the one they are not coming to:\n"
+              f"{PUBLIC_URL}/admin?token={review_link_token()}"
+              f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
+              f"&need={other[1]}")
+    if today_pair or (source or "").startswith("owner booking"):
+        send_telegram("\u26a0\ufe0f THIS CAR NOW HAS TWO BOOKINGS" + "\n" + reason)       # today's words
+        return other[1]
+    raise_diary_alert(user, "\u26a0\ufe0f THIS CAR NOW HAS TWO BOOKINGS", reason, days=(bf.get("date", ""), other[1]),
+                      reg=bf.get("reg", ""))
+    return other[1]
+
+
+def watch_staff_booking(user: str, by_customer: bool = False, agreed_days=None):
     """Silently log a booking that staff agreed in chat, so nothing is lost.
 
     The bot stays out of staff conversations, but staying silent must not mean the
-    diary, calendar, reminder and job sheet never hear about the car."""
+    diary, calendar, reminder and job sheet never hear about the car.
+
+    agreed_days (fix3 1C, staff_day_yes_book - the customer's short "yes" while a colleague
+    holds the chat): the days the colleague's own words named. Only a booking for one of
+    THOSE days is written, with the car and reg read from this chat's last 24 h (a family
+    phone may carry another car), and every refusal is silent - the caller then carries on
+    with today's flow. Returns the saved fields in that mode ("_note": the staff note, for the
+    caller to send after it told the customer), else None.
+
+    Round 3 (garage …791): by_customer (the customer's booking words in a held chat) books ONLY a day the colleague's
+    own words offered in this hold (_hold_staff_offer_days) - no such day, no model call - and its model sees each
+    line labelled; before ANY save, a booking made in this hold / the last 24 h for another day stops it with a
+    precise alert; a day the colleague's words did not offer (the staff side) gets no capacity override and every
+    customer gate; every save runs the two-bookings check (double_booking_alert)."""
+    agreed = agreed_days is not None
     try:
-        history = get_history(user)
+        since24 = time.time() - 24 * 3600
+        # round 3b (reviews F2 / R3A-3): the customer side's days - the headlights rule, a per-day state of the hold
+        staff_days = _hold_staff_offer_days(user) if (by_customer and not agreed) else []
+        if by_customer and not agreed and not staff_days:
+            log.info("Customer-side watch for %s: no day a colleague's own words offered in this hold - nothing to "
+                     "book (the bot's read-back never counts)", user)
+            # round 3c (VERIFY_FINAL M1): not silence - when they clearly asked to be booked in and a colleague really
+            # wrote in this hold, staff get ONE precise alert (or the diary-gap task); "told": the assist stays out
+            return _hold_book_ask_unbooked(user)
+        if agreed:
+            history = _assist_history(user, since=since24, label=True, owner=True)
+        elif by_customer:      # round 3 (R3-a): the colleague's and the owner's lines labelled, as 1C's watcher
+            history = _assist_history(user, label=True, owner=True)
+        else:
+            history = get_history(user)
         if not history:
             return
         # 2026-09-02: this prompt had NO "today is" line, so a staff message like
@@ -6688,7 +7862,8 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         raw = _call_claude(history + [{"role": "user", "content":
                                        "(Internal: apply your rules — the booking "
                                        "line, or SKIP.)"}],
-                           WATCH_BOOKING_SYSTEM + today_line) or ""
+                           WATCH_BOOKING_SYSTEM + today_line
+                           + (WATCH_AGREED_NOTE if (agreed or by_customer) else "")) or ""
         m = BOOKING_RE.search(raw)
         if not m:
             return
@@ -6699,6 +7874,24 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
                 fields[k.strip().lower()] = v.strip()
         if not fields.get("date"):
             return
+        if not agreed and example_reg_not_given(user, fields.get("reg", ""), staff=True):   # round 3 V3; 3b R3A-N2
+            fields["reg"] = ""
+        if by_customer and not agreed:
+            # round 3b (review F8): the customer-side model reads the whole history - a car or reg nobody in this chat
+            # (the customer or a colleague) wrote in the last 30 days came from older history (a family phone: the
+            # mother's Yaris two months ago, the son's Focus today) - dropped; with neither left, the no-car note below.
+            # (30, not 1C's 24 h: G …687's Volvo was in the colleague's invoice 16 days before - every real row kept.)
+            _watch_recent_car(user, fields, time.time() - 30 * 86400)
+        if agreed:
+            read = dict(fields)
+            # round 3 (VERIFY V2): the day it read is already in their diary - nothing to add and nothing to tell staff
+            if _watch_iso(fields) and _has_booking_on(user, _watch_iso(fields)):
+                log.info("Staff-hold yes for %s: already in the diary that day - nothing written", user)
+                return None
+            why = _agreed_booking_refusal(user, fields, agreed_days, since24)
+            if why:
+                log.info("Staff-hold yes for %s: nothing written - %s", user, why)
+                return dict(read, _refused=why)     # round 2 (review H2): the caller tells staff precisely
         # A row with no car, no reg AND no job is useless to the workshop (Olga's
         # phantom was exactly that: blank everything, just a date). Tell the owner
         # instead of writing an empty diary line.
@@ -6727,6 +7920,56 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
                 return  # a recent visit being talked about - nothing to book
             # About a year back: the model's wrong-year slip, not this visit.
             # Carry on - save_booking moves it to this year, as for any booking.
+        # fix3 round 3 (R3-b): this phone / car already has a booking made in this hold or the last 24 h for ANOTHER
+        # day - garage …791: Sat 17 (the colleague's) and then Sat 24 (the bot's read-back). Nothing is saved; staff
+        # get a precise alert naming both days (once).
+        iso_w = _watch_iso(fields)
+        if agreed or by_customer:
+            from_staff = staff_day = agreed or iso_w in staff_days
+        else:
+            # round 3b (reviews F3 / R3A-1): the staff side keeps the override unless ONLY the bot named that day
+            named = _watch_named_by(user, iso_w) if iso_w else {"?"}
+            from_staff = not _watch_bot_only_day(user, iso_w)
+            staff_day = "colleague" in named
+        clash = _watch_recent_other_booking(user, fields)
+        if clash:
+            headline, why, tail = _watch_clash_words(user, fields, clash, staff_day)
+            log.warning("Watcher for %s: not saved - %s", user, why)
+            # round 3c (VERIFY_FINAL M3): one alert per fact (this chat, that booking, this day) while it stands open,
+            # whichever side raised it first - the staff side's double_booking, then the customer's "Ok", posted twice
+            fact = _clash_fact_key(user, clash[0], _watch_iso(fields))
+            if agreed:
+                return dict(read, _refused=why, _headline=headline, _tail=tail, _clash_key=fact)
+            if by_customer:
+                said = " ".join(((_last_customer_messages(user, 1) or [""])[0] or "").split())[:60]
+                raise_assist_booking_alert(
+                    user, "<<<BOOKING|" + "|".join(f"{k}={(fields.get(k) or '').strip()}" for k in ("car", "reg", "need"))
+                    + f"|date={_watch_iso(fields)}|time=|name={(fields.get('name') or '').strip()}|phone=|lang=>>>",
+                    "", lead=f"They wrote “{said}” - but {why}.", headline=headline, tail=tail, clash_key=fact)
+                return
+            key = f"watch_clash:{user}:{clash[0]}:{_watch_iso(fields)}"
+            if not get_setting(key) and not _clash_alert_stands(user, _watch_iso(fields)):
+                if raise_diary_alert(user, headline, f"Your colleague's chat with {customer_label(user)} now reads "
+                                     f"{date.fromisoformat(_watch_iso(fields)):%a %d %b} - but {why}. {tail}",
+                                     days=(clash[1], _watch_iso(fields)), reg=fields.get("reg", "")):
+                    set_setting(fact, str(int(time.time())))      # round 3c (M3): the fact this alert told staff
+                set_setting(key, str(int(time.time())))     # round 3b (R3A-N4): after it - a failed alert tries again
+            return
+        # fix3 round 3 (R3-a / R3-d): a day the colleague's own words did not offer in this hold. The customer-side
+        # watcher books none (its "yes" may answer the bot's read-back); the staff side books it only as a customer
+        # booking - no capacity override, and every gate the bot's own bookings pass (garage …791 twin: a bot read-back
+        # of a day before BOOKINGS_FROM, a Saturday repair or a Land Rover repair was written past them all). Round 3b:
+        # on the staff side only a day the bot ALONE named (_watch_bot_only_day).
+        if not from_staff:
+            if by_customer:
+                log.info("Customer-side watch for %s: %s is not a day the colleague's own words offered - nothing "
+                         "written", user, _watch_iso(fields))
+                return _hold_book_ask_unbooked(user, _watch_iso(fields), staff_days)     # round 3c (M1): not silence
+            why = _watch_customer_gate(fields)
+            if why:
+                log.info("Staff watch for %s: not saved - %s (only the bot named that day)", user, why)
+                _watch_gate_note(user, fields, why)
+                return
         # 24 Sep 2026: a job with NO car and NO reg is not enough either. Dima told
         # Lesley "Pop in 9 am tomorrow" to collect a courtesy car while her car was
         # in with us; the model returned just "full service" and it went into a
@@ -6737,6 +7980,8 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         if car.lower() in _PLACEHOLDER_CAR:
             car = ""
         if not (car or clean_reg(fields.get("reg", "")) or clean_reg(car)):
+            if agreed:
+                return      # (never a note from a staff-hold "yes": the caller's flow, as today)
             # A diary-gap task for that day already says this, with a Done
             # button - post it now rather than send a second message.
             if task_for_watch_note(user, fields.get("date", "")):
@@ -6770,8 +8015,13 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
             fields["phone"] = user
         # A colleague has already told the customer yes, so this overrides
         # capacity: the alternative is dropping the booking silently and letting
-        # them arrive to a day nobody has a record of.
-        added = save_booking(fields, override_capacity=True)
+        # them arrive to a day nobody has a record of. (fix3 round 3, R3-d: only a
+        # day in the colleague's own words; any other passed the customer gates above.)
+        added = save_booking(fields, override_capacity=from_staff)
+        if not added and agreed:
+            if fields.get("refused") == "bank_holiday":     # round 2 (H2): the caller's precise alert carries the 🎌
+                return dict(fields, _refused="that day is a bank holiday - the diary won't take it")
+            return          # a duplicate: nothing written - the caller's flow, as today
         if not added:
             # save_booking refuses a bank holiday even past the override (owner, 28 Sep
             # 2026). The customer was told a day nobody is in: tell a person, once.
@@ -6818,7 +8068,16 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
         # ("can I change from the 25th to the 18th?"). Saved anyway, as before -
         # the reminder, the capacity count and the day guard all need the row -
         # but the owner is told so the old one can go.
-        other = _other_booking_date(user, fields.get("date", ""))
+        # fix3 round 3 (R3-c): every watcher save runs after_new_booking's two-bookings check - an alerts row with a
+        # Done button (floored at today: today's own booking is the car that is in with us now). Its note line below
+        # only when that check did not already say it.
+        try:
+            dbl = double_booking_alert(user, fields, now_local().date().isoformat(),
+                                       source="a booking agreed in the colleague's chat")
+        except Exception:
+            dbl = ""
+            log.exception("Double-booking check failed for %s", user)
+        other = "" if dbl else _other_booking_date(user, fields.get("date", ""))
         also = (f"\n\n⚠️ They are also in the diary for {other}. If the day moved, "
                 "please cancel the old booking; if it's a second car or visit, ignore "
                 "this." if other else "")
@@ -6830,19 +8089,724 @@ def watch_staff_booking(user: str, by_customer: bool = False) -> None:
             cal_missed = calendar_enabled() and not staff_cal
         except Exception:
             cal_missed = False
+        note = ("📌 Logged a booking your colleague agreed in chat:\n"
+                f"{fields.get('name','')} — {fields.get('car','')} "
+                f"{fields.get('reg','')}\n{fields.get('need','')}\n"
+                f"Date: {fields.get('date','')} (9-11am)\n"
+                + ("It's in the diary, but the calendar did NOT take it - "
+                   "please add it by hand. The reminder" if cal_missed else
+                   "It's in the diary and calendar; the reminder"
+                   if calendar_enabled() else "It's in the diary; the reminder")
+                + " will go out automatically." + two_ways + also)
+        if agreed:
+            # fix3 1C: the caller tells the customer first, then sends this note under its usual rule
+            log.info("Staff-hold yes: booking logged for %s on %s", user, fields.get("date"))
+            return dict(fields, _note=note if (two_ways or also or booking_note_now(fields, staff_cal, lead_days=1))
+                        else "")
         if two_ways or also or booking_note_now(fields, staff_cal, lead_days=1):
-            send_telegram("📌 Logged a booking your colleague agreed in chat:\n"
-                          f"{fields.get('name','')} — {fields.get('car','')} "
-                          f"{fields.get('reg','')}\n{fields.get('need','')}\n"
-                          f"Date: {fields.get('date','')} (9-11am)\n"
-                          + ("It's in the diary, but the calendar did NOT take it - "
-                             "please add it by hand. The reminder" if cal_missed else
-                             "It's in the diary and calendar; the reminder"
-                             if calendar_enabled() else "It's in the diary; the reminder")
-                          + " will go out automatically." + two_ways + also)
+            send_telegram(note)
         log.info("Staff-agreed booking logged for %s on %s", user, fields.get("date"))
     except Exception:
         log.exception("watch_staff_booking failed for %s", user)
+
+
+# ------------------------------------- fix3 ISSUE 1C: the customer's "yes" to a colleague's day
+# Owner, 30 Sep (b): a day a colleague agreed with the customer + the car goes into the diary by itself.
+# Garage …195 (13 Oct): the colleague offered "We can do 27th October", the customer said "Yes please" -
+# and nothing reached the diary: the customer-side watcher wakes only on booking words ("book",
+# "confirm", a weekday...), never on a plain "yes". Now a SHORT agreement, in a chat a colleague holds,
+# right after the business spoke, runs it (before the assist) - and it may write ONLY a day the newest
+# real colleague message of the hold named (staff_named_days, English and Romanian: the watcher's model
+# cannot tell the bot's lines from the colleague's), with the car and reg from the last 24 h. Then the
+# customer gets the booked line (true now) and staff the 📌 note. Anything else: today's flow, unchanged.
+_SHORT_YES_CORE = (r"yes|yeah|yea|yep|yup|ya|ok|okay|okey|oki|okie|okk|sure|perfect|great|grand|lovely"
+                   r"|brilliant|fine|good|deal|cool|super|please|pls|plz|book it|go ahead|sounds good"
+                   r"|sounds great|sounds perfect|that works|works for me"
+                   r"|that'?s (?:fine|grand|great|perfect|ok|okay|good|lovely|brilliant)"
+                   r"|da|bine|sigur|desigur|да|ок|окей|хорошо|давайте|конечно|отлично|подходит"
+                   r"|taip|gerai|tinka|puiku|tak|dobrze|sim|pode ser|claro")
+_SHORT_YES_SOFT = (r"thanks?|thank you|thx|ty|cheers|mate|then|mersi|mul[țţt]umesc|te rog|спасибо"
+                   r"|пожалуйста|a[čc]i[ūu]|dzi[ęe]kuj[ęe]|obrigad[oa]")
+_SHORT_YES_RE = re.compile(r"(?:(?:" + _SHORT_YES_CORE + "|" + _SHORT_YES_SOFT + r")\b\s*)+", re.IGNORECASE)
+_SHORT_YES_CORE_RE = re.compile(r"\b(?:" + _SHORT_YES_CORE + r")\b", re.IGNORECASE)
+# A real colleague message AFTER the one that named the day, that may take it back: unsure, nothing booked.
+# (round 2: + "unfortunately", "can't", "won't", "closed", "booked up" - the headlights twin's retract words; "not a
+# problem" / "nu-i problemă" are no take-back. The owner's Telegram lines are read with it too, and a sentence of the
+# colleague's day line itself that carries one names no offer: "Unfortunately the 27th is gone" - _hold_offer_days.)
+_HOLD_TAKEN_BACK_RE = re.compile(r"\b(?:no|nope|not|sorry|actually|instead|change\w*|cancel\w*|full|nu|нет"
+                                 r"|unfortunately|can'?t|cannot|won'?t|closed|booked up)\b"
+                                 r"(?![\s-]+(?:a\s+|i\s+)?(?:problem\w*|worries|bother))", re.IGNORECASE)
+# fix3 round 2 (13 Oct reviews: garage-correctness F1 / F3, real-data F1, integration 2-3, parity H6) - what else keeps
+# the booker shut. A colleague's sentence that names a day but invites nobody in: a call-back ("I'll check the part
+# price and call you tomorrow", "Ring me Monday", "Text me tomorrow with the reg", "Send me photos tomorrow", "Ok I
+# will let you know tomorrow"), a part's arrival ("The part comes in on Thursday"), us driving their car ("Can we
+# bring tomorrow morning for cvrt", …492), a delivery asked of a supplier ("Can you bring me 10 tomorrow morning",
+# H …555), a colleague off or the garage closed ("I'm off tomorrow"). ("...let ME know" is part of an offer: "We can
+# do Tuesday if that suits you, let me know".)
+_HOLD_NOT_OFFER_RE = re.compile(
+    r"\b(?:call|ring|phone|text|message|whatsapp|contact|e-?mail)\s+(?:you|u|ye|yous|me|us|him|her|them|back)\b"
+    r"|\bgive (?:you|u|me|us|him|her) a (?:call|ring|bell|shout|text)\b|\blet (?:you|u|him|her|them) know\b"
+    r"|\bbring (?:me|us)\s+\d+\b"
+    r"|\bget back to (?:you|u|him|her)\b|\bsend(?:ing)? (?:me |us )?(?:a |some |the )?(?:photos?|pics?|pictures?"
+    r"|videos?|reg|details)\b|\bparts?\b|\b(?:arriv\w*|deliver\w*|in stock|order(?:ed|ing)?|supplier)\b"
+    r"|\b(?:it|they|that|this|which) (?:comes?|will come|should come|is coming|are coming)\b"
+    r"|\b(?:can|could|shall|will|should) (?:we|i) (?:bring|take|drive|collect|pick)\b|\bwe(?:'ll| will) (?:bring|take|drive)\b"
+    r"|\b(?:i'?m|i am|we'?re|we are|he'?s|he is|she'?s|she is)\s+(?:off|away|out|not in|not here|not working"
+    r"|on holiday)\b|\bday off\b|\bclosed\b",
+    re.IGNORECASE)
+# fix3 round 3 (VERIFY V1, 14 Oct): a colleague's day sentence counts only when it INVITES them in on that day - an
+# offer or an invitation, never a day merely mentioned. Declines and status lines name a day too ("We're too busy
+# tomorrow", "Tomorrow is mad busy", "Thursday is chock-a-block", "We'll look at it tomorrow", "Dima will be back
+# Thursday", "Your car will be finished tomorrow", "I'll check with Dima and confirm tomorrow"), and round 2's deny-list
+# could not name them all. Kept (_hold_invites): the diary-gap's own staff go-ahead (_GAP_STAFF_RE: "Bring over
+# tomorrow morning", "See you Thursday", "Booked you in for Friday 16th"), an offer or an invitation (_HOLD_INVITE_RE:
+# "We can do 27th October", "15th can do", "We can fit you in tomorrow", "Any chance you can drop Friday?", "Tomorrow at
+# lunch time will be ok for you?", "How about Thursday?", "I'll pencil you in", "Thursday is fine, bring it in at 9"),
+# the Romanian / "tell him" go-ahead (_gap_staff_foreign: "Spunei pe sambata", "Vino joi"), or a bare day line - only
+# day, date, time and ok-words ("This Saturday", "Friday the 7th", "Tuesday is good", "Thursday?", "Thursday next week").
+_HOLD_INVITE_RE = re.compile(
+    # we can do / fit / take / fix it - "We can do 27th October", "We can try to do on Wednesday", "15th can do"
+    r"\b(?:we|i) can (?:also |still |just )?(?:try (?:and |to )?)?(?:do|fit|take|fix|sort|have a look)\b"
+    r"|\bcan (?:also |still )?do\b|\bcould do\b|\bfit (?:you|u|it|her|him|them) in\b"
+    r"|\bcan we (?:also |still )?do (?:it|that|this|her|him|the car|the van|the job|on|for|next|mon|tue|wed|thu|fri"
+    r"|sat|tomorrow|today|\d)"
+    # you can / could you (be able to) bring / drop / pop / come / leave it
+    r"|\b(?:can|could|will|would) (?:you|u)(?: be able to)? (?:bring|drop|pop|come|leave)\b"
+    r"|\b(?:you|u)(?:'ll| will| can| could| should| may| might)(?: just| also)? (?:bring|drop|pop|come|leave)\b"
+    r"|\b(?:you|u) (?:want|wanna|need|like) (?:to )?(?:bring|drop|pop|come|leave)\b"
+    r"|\b(?:need|want|like) (?:you|u) to (?:bring|drop|pop|come|leave)\b"
+    r"|\b(?:you|u) (?:bring|drop|pop|come)\b[^.!?\n]{0,60}\?"
+    # bring it / drop it / come in at the start of a sentence or a clause ("Alright bring it over tomorrow",
+    # "Thursday is fine, bring it in at 9") - never "leave it with me"
+    r"|(?:^|[,;:\u2013\u2014-])[^\w\n]{0,6}(?:(?:hi|hello|hey|ok|okay|alright|all right|right|yes|yeah|sure|grand"
+    r"|perfect|great|sound|no problem|mate|so|then|just|please)\b[\s,.!]{0,6}){0,6}(?:bring|drop|pop|come|leave)\s{1,3}"
+    r"(?:it|her|him|the car|the van|in|over|up|down|by|round)\b(?!\s{1,3}with\s{1,3}(?:me|us)\b)"
+    # ok for you / suits you / that's fine for ... / all good for tomorrow
+    r"|\b(?:ok|okay|good|fine|grand|suit\w*|work\w*) for (?:you|u)\b|\bsuits? (?:you|u)\b|\bdoes (?:that|it|this) suit\b"
+    r"|\b(?:that'?s|is|it'?s) (?:fine|good|ok|okay|grand|perfect|no problem) for\b"
+    r"|\b(?:fine|good|ok|okay|grand|perfect) (?:for|with) (?:us|me)\b"
+    r"|\b(?:all good|all set|ok|okay|grand|good|perfect|fine) for (?:this |next |the )?(?:mon|tue|wed|thu|fri|sat"
+    r"|tomorrow|tmrw|today|\d)"
+    # space on a day; booked / pencilled in; how about Thursday
+    r"|\b(?:i|we)(?:'ve| have| got|'ve got)? (?:availability|space|a space|a slot|room|an opening)\b"
+    r"|\b(?:we'?re|we are|i'?m|i am) (?:available|free)\b|\b\d{1,2}(?:st|nd|rd|th)? (?:is )?available\b"
+    # "the next avaiable date will be 25th" (G …821, as typed), "the earliest free slot is Tuesday" (round 3b, reviews
+    # F2 / R3A-3 - the headlights build's cue)
+    r"|\b(?:next|earliest|first)\s+(?:ava\w*|free|possible)\s+(?:date|day|slot|space|appointment|booking)\b"
+    r"|\bpencil\w*|\bbook (?:you|u|ye)\b|\bbooked (?:you|u|ye)\b|\bbooked(?: in)? now\b"
+    r"|\b(?:put|pop|have|got) (?:you|u|ye) (?:in|down)\b|\b(?:how|what) about\b",
+    re.IGNORECASE)
+# "We don't need to see you Thursday", "Don't bring it tomorrow": a negated invitation is none.
+_HOLD_NEG_INVITE_RE = re.compile(
+    r"\b(?:don'?t|do not|doesn'?t|does not|didn'?t|did not|never)\s+(?:\w+\s+){0,2}?"
+    r"(?:need|have|bring|come|drop|pop|see|do|take|book|want)\b", re.IGNORECASE)
+# A bare day line: nothing but these words, numbers ("7th", "9am", "10") and punctuation.
+_HOLD_BARE_WORDS = frozenset((
+    "monday tuesday wednesday thursday friday saturday sunday mon tue tues wed weds thu thur thurs fri sat "
+    "tomorrow tomorow tommorow tmrw tmr today tonight morning afternoon evening lunch lunchtime noon midday am pm "
+    "o'clock oclock january february march april may june july august september october november december jan feb "
+    "mar apr jun jul aug sep sept oct nov dec the on at for from in by of this next week then so is ok okay yes "
+    "yeah sure grand perfect great good fine works work suits suit would should be does please mate hi hello hey "
+    "around about between and early first thing time la pe ora dimineata").split())
+_HOLD_BARE_NUM_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th|am|pm|h)?|20\d\d", re.IGNORECASE)
+# Two days in one sentence ("We can do 2nd or 3rd September", "Thursday or Friday"): which one an "ok" took is a guess.
+_HOLD_DAY_ALT = (r"\d{1,2}(?:st|nd|rd|th)|mon(?:day)?|tues?(?:day)?|wed(?:nesday)?|thu(?:rs?(?:day)?)?|fri(?:day)?"
+                 r"|sat(?:urday)?|tomorrow|today")
+_HOLD_TWO_DAYS_RE = re.compile(r"\b(?:" + _HOLD_DAY_ALT + r")\s{0,3}(?:or|/)\s{0,3}(?:the\s{1,3})?(?:" + _HOLD_DAY_ALT
+                               + r")\b", re.IGNORECASE)
+# A call-back the round-2 list missed ("Please remind me tomorrow..we will see maybe we can take you this week").
+_HOLD_REMIND_RE = re.compile(r"\bremind (?:me|us)\b", re.IGNORECASE)
+# fix3 round 3b (review F1, 14 Oct): V1 still opened the 1C booker on colleague day lines that answer something else
+# than "when can I come in?" - and only the 3-day car-still-with-us rule stood behind them ("When will it be ready?" ->
+# "Tomorrow" -> "Ok great"; "I can do the price tomorrow"; "We can sort the invoice Thursday"; G …062 30 Sep "I can
+# collect it tomorrow. 1400?" -> "Tomorrow evening" -> "Sure thanks."). For 1C only (the customer-side watcher, whose
+# customer wrote booking words, keeps V1):
+#   (a) the customer's messages around the day line (since the colleague last really wrote, and between it and the yes)
+#       ask about their car's status or its collection - no day line answers that with a visit;
+#   (b) a BARE day line ("Tomorrow", "Thursday 10am") counts only when they asked for a visit or named a day, and never
+#       after a price, a part, the opening hours or the NCT ("Are you open on Saturday?" -> "Saturday 9-2");
+#   (c) a day sentence about money, keys, a wash, a collection or work on a car that is already here, and any message
+#       that says the car is here or ready, invites nobody in (_hold_offer_sentences);
+#   (d) a diary row in the last 14 days with no "is ready" since: the car may still be here (_hold_car_may_be_here).
+_HOLD_CUST_STATUS_RE = re.compile(
+    r"\bready\b|\bcollect\w*|\bpick(?:ing)?\s+(?:it|her|him|them|the\s+(?:car|van|keys?)|my\s+(?:car|van))\s+up\b"
+    r"|\bpick\s?-?up\b|\bfinish\w*"
+    r"|\b(?:is|was|has)\s+(?:it|she|he|the\s+(?:car|van)|my\s+(?:car|van))\s+(?:been\s+)?(?:done|fixed|sorted)\b",
+    re.IGNORECASE)
+_HOLD_CUST_NOT_VISIT_RE = re.compile(
+    r"\bpric\w*|\bcost\w*|\bhow much\b|\bquot\w*|\binvoic\w*|\bpa(?:y|id|yment)\b|\breceipt\b|€"
+    r"|\bparts?\b|\barriv\w*|\bdeliver\w*|\bin stock\b|\border(?:ed|ing)?\b"
+    r"|\bopen(?:ing)?\b|\bclos(?:e|ed|es|ing)\b|\bhours\b|\bnct\b|\bcvrt\b|\bre-?test\b",
+    re.IGNORECASE)
+_HOLD_CUST_VISIT_RE = re.compile(
+    r"\bbook\w*|\bappointment\b|\bslots?\b|\bspace\b|\bavailab\w*|\bfree\b|\bsqueeze\b|\bsooner\b|\bearlier\b"
+    r"|\bfit (?:me|us|it|her|him|them|the car|the van|my car) in\b|\bcome (?:in|over|down|by|round)\b"
+    r"|\b(?:bring|drop|leave) (?:it|her|him|the car|the van|my car|in|off|over)\b|\bpop (?:in|it|over|down|round)\b"
+    r"|\bservice\b|\bwhen can (?:i|we|you)\b|\b(?:what|which|any|another|next|earliest) (?:day|date)\b"
+    r"|\b(?:this|next) week\b",
+    re.IGNORECASE)
+_HOLD_NOT_VISIT_RE = re.compile(
+    r"\bpa(?:y|id|yment)\b|\binvoic\w*|\breceipt\b|\bmoney\b|\bcash\b|\bkeys?\b|\bwash\w*|\bvalet\w*"
+    r"|\bready\b|\bfinish\w*|\bcollect\w*|\bpick(?:ing)?\s+(?:it|her|him|them|the\s+car|the\s+van)\s+up\b"
+    r"|\bpick\s?-?up\b"
+    r"|\b(?:do|have a look at|look at|sort(?: out)?|send|get|have|check|give you)\s+(?:you\s+)?"
+    r"(?:the\s+|your\s+|ur\s+|a\s+)?(?:price|quote|cost)\b"
+    r"|\bif\s+(?:it|she|he|that|this|the\s+\w+(?:\s+\w+)?)\s+(?:\w+\s+){0,3}?"
+    r"(?:again|comes?\s+(?:on|back)|happens?|returns?|starts?)\b",
+    re.IGNORECASE)
+# work on a car that is already here - unless the same sentence tells them to bring / drop / pop / come / leave it
+_HOLD_WORK_HERE_RE = re.compile(
+    r"\b(?:fix|fit|repair|replace|change|finish)\s+(?:it|them|her|him|the\s+parts?)\b"
+    r"|\b(?:should|shall)\s+(?:we|i)\s+(?:do|fix|change|replace|fit)\b|\bfit\s+the\s+(?:new\s+)?parts?\b",
+    re.IGNORECASE)
+_HOLD_MOTION_RE = re.compile(r"\b(?:bring|drop|pop|come|leave)\b", re.IGNORECASE)
+_HOLD_CAR_HERE_RE = re.compile(
+    r"\b(?:car|van|jeep|it|she|he)\s+(?:is|'s)\s+(?:already\s+)?(?:here|with us|in the (?:garage|workshop|yard)"
+    r"|on (?:the )?ramp|ready|done|finished)\b|\balready\s+(?:here|with us|in the (?:garage|workshop))\b"
+    r"|\b(?:is|are)\s+ready\b|\bready\s+(?:to|for)\s+(?:collect\w*|pick)",
+    re.IGNORECASE)
+
+
+def _hold_bare_day_line(s: str) -> bool:
+    """fix3 round 3 (VERIFY V1): a sentence of nothing but day, date, time and ok-words - the colleague answering
+    "when can I come?" ("This Saturday", "Friday the 7th", "Tuesday is good", "Thursday?", "Tomorrow 9am"). Romanian /
+    Russian day words are put into English first ("Joi" -> "Thursday")."""
+    t = s or ""
+    if GAP_FOREIGN_LANGS and _GAP_FX_ANYDAY_RE.search(t):
+        t = _gap_fx_english(t)
+    words = re.findall(r"\d+[^\W\d_]*|[^\W\d_]+(?:'[^\W\d_]+)?", t.lower())
+    return bool(words) and all(w in _HOLD_BARE_WORDS or _HOLD_BARE_NUM_RE.fullmatch(w) for w in words)
+
+
+def _hold_foreign_goahead(s: str) -> bool:
+    """fix3 round 3d (review L-F3): the Romanian go-ahead ("Vino joi", "Ne vedem sâmbătă") invites them in - a "tell him
+    <day>" relay ("Tell him Saturday", "Spunei pe sambata", "Spune-i că mâine îl sun") never does: the spec makes it a
+    diary-gap TASK only (staff_relay), never a row from 1C or R3-a (…124's chat holds the son's car)."""
+    day_s, relay, _strong = _gap_staff_foreign(s)
+    return bool(day_s) and not relay
+
+
+def _hold_invites(s: str) -> bool:
+    """fix3 round 3 (VERIFY V1): this colleague sentence invites the customer in (the note above _HOLD_INVITE_RE).
+    Round 3d (review L-F3): never a "tell him <day>" relay (_hold_foreign_goahead)."""
+    s = re.sub(r"\s+", " ", s or "").strip()
+    if not s or _HOLD_NEG_INVITE_RE.search(s):
+        return False
+    return bool(_GAP_STAFF_RE.search(s) or _HOLD_INVITE_RE.search(s) or _hold_foreign_goahead(s)
+                or _hold_bare_day_line(s))
+
+
+# A customer message after the colleague's day that turns a day down or asks for another ("27th doesn't suit me, I'm
+# away", "I can't do the 27th", "Would you have next friday instead", garage …536).
+_HOLD_CUST_DECLINE_RE = re.compile(
+    r"\b(?:doesn'?t|does not|don'?t|do not|won'?t|wont|will not|wouldn'?t|would not|isn'?t|is not|not)\s+"
+    r"(?:really\s+)?(?:suit|work|good|great|possible|available|free|ok|okay|be able|make it)\b"
+    r"|\bcan'?t\b|\bcannot\b|\bcan not\b|\bcouldn'?t\b|\bunable\b|\bno\s+(?:good|can do|chance)\b"
+    r"|\b(?:i'?m|i am|we'?re|we are|i'?ll be|i will be)\s+(?:away|busy|working|off|abroad|on holiday"
+    r"|not (?:around|available|free|here|in))\b"
+    r"|\binstead\b|\brather\b|\b(?:another|a different|other|different|any other|earlier|later|sooner)\s+"
+    r"(?:day|date|time|week)\b"
+    r"|^\W*(?:no|nope|nah|nu|нет)\b(?!\s+(?:problem|worries|bother|rush|hurry|stress))"
+    # round 3d (review L-F1, the foreign halves): "Joi nu pot, lucrez", "nu-mi convine", "nu se poate"; "В четверг не
+    # могу", "не получится", "не подходит"; "Ketvirtadienį negaliu", "netinka"; "W czwartek nie mogę", "nie pasuje";
+    # "Na quinta não posso", "não dá"
+    r"|\bnu\s+(?:pot|putem|se\s+poate)\b|\bnu(?:\s*-\s*|\s+)[îi]?mi\s+convine\b"
+    r"|\bне\s+(?:могу|смогу|сможем|получится|подходит)\b"
+    r"|\bnegal\w*|\bnetinka\b|\bnie\s+(?:mog\w*|pasuje)\b|\bn[ãa]o\s+(?:posso|podemos|d[áa])\b",
+    re.IGNORECASE)
+# A day a customer names in plain words: a weekday, tomorrow / today, the 28th, 28 Oct / Oct 28 (_gap_date reads
+# "next friday" as no day at all).
+_HOLD_CUST_DAY_RE = re.compile(
+    r"\b(?P<wd>monday|tuesday|wednesday|thursday|friday|saturday|sunday|tues?|weds?|thu|thur|thurs|fri)\b"
+    r"|\b(?P<rel>tomorrow|tomorow|tommorow|tommorrow|tmrw|tmr|today|tonight)\b"
+    r"|\b(?P<n1>\d{1,2})(?:st|nd|rd|th)\b"
+    r"|\b(?P<n3>\d{1,2})\s*(?:of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(?P<n4>\d{1,2})\b",
+    re.IGNORECASE)
+_HOLD_WD = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+# A headlight brought or posted on its own is no car visit (review H1, the garage twin: "I have the headlight off the
+# car already ... can I drop it in?" - "Yes you can drop it in Thursday" - "Ok"); the garage -> headlights routing
+# release decides where a lamp job goes. 1C leaves it to today's flow.
+_HOLD_LAMP_ONLY_RE = re.compile(
+    r"\boff the car\b|\b(?:just|only) the (?:head)?(?:light|lamp)s?\b|\b(?:head)?(?:light|lamp)s? only\b|\bcourier\b"
+    r"|\bpost(?:ed|ing)? (?:it|them|the (?:head)?(?:light|lamp)s?)\b"
+    r"|\b(?:drop|leave|bring|send)(?:ing)? (?:in |over )?(?:the |my |your )?(?:head)?(?:light|lamp)s?\b",
+    re.IGNORECASE)
+_BOOKED_LINE_PREFIXES = tuple(v.split("{day}")[0] for v in BOOKED_LINE_MSG.values())
+# The owner's words sent from Telegram, as the 1C watcher sees them (round 2, review INT-2): a person's, not the
+# automatic assistant's.
+OWNER_TG_LABEL = "[Owner, typed in Telegram]: "
+WATCH_AGREED_NOTE = (
+    "\n\nIn this conversation, lines that start with \"" + ASSIST_STAFF_LABEL.strip() + "\" were typed by the "
+    "COLLEAGUE, and lines that start with \"" + OWNER_TG_LABEL.strip() + "\" by the owner (a person too); the "
+    "other business lines are the automatic assistant. Only a day the COLLEAGUE offered or agreed counts - not "
+    "one the colleague or the owner later moved or took back - and only if the customer's LAST message accepts "
+    "it. Take the car, reg and name only from this conversation; never invent them.")
+
+
+def short_agreement(text: str) -> bool:
+    """fix3 1C: a short "yes" and nothing else - "Yes please", "Ok", "That's fine", "Da", "Да, хорошо 👍",
+    "Taip": no question, no number, no "but"; at most 40 characters; a bare "thanks" is not one."""
+    t = (text or "").strip()
+    if not t or len(t) > 40 or "?" in t or t.startswith("[") or any(ch.isdigit() for ch in t):
+        return False
+    flat = " ".join(re.sub(r"[^\w\s']", " ", t.replace("’", "'")).split())
+    return bool(flat) and bool(_SHORT_YES_RE.fullmatch(flat)) and bool(_SHORT_YES_CORE_RE.search(flat))
+
+
+def _hold_colleague_days(user: str) -> tuple:
+    """fix3 1C: (days, words) - the days that the newest REAL colleague message of the current hold names
+    (staff_named_days, read as of the day it was written; only days AFTER today - "We will fix your car
+    today", "Very busy today", "I will post them today" were the corpus's misses - never a Sunday). ([], "")
+    when the customer's newest message does not answer the business (the row before it, past a colleague's
+    reaction, is their own: "Can it be Saturday?" -> "ok" is no yes to the colleague's day), when no real
+    colleague message of the hold names a day, or when a real one after it may take it back.
+    Round 2 (13 Oct reviews): also ([], "") when that newest colleague line with a day invites nobody in - a
+    call-back, a part, a colleague off (_hold_offer_days) - or when what came after it says the day is not
+    settled (_hold_after_day_line)."""
+    nowts = time.time()
+    tz = ZoneInfo("Europe/Dublin")
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT role, content, ts, COALESCE(kind, '') FROM messages WHERE wa_user = ?"
+                            " AND ts >= ? ORDER BY id DESC LIMIT 80", (user, nowts - 24 * 3600)).fetchall()
+    if not rows or rows[0][0] != "user":
+        return [], ""
+    prev = next((r for r in rows[1:] if not (r[0] == "staff" and not is_real_staff_text(r[1]))), None)
+    if not prev or prev[0] not in ("staff", "assistant"):
+        return [], ""
+    held, last = [], nowts
+    for i, (role, _content, ts, _kind) in enumerate(rows):
+        if role != "staff":
+            continue
+        if last - (ts or 0) >= AUTO_RESUME_HOURS * 3600:
+            break                     # the gap that ended an earlier hold: not this one
+        last = ts or 0
+        held.append(i)
+    newer = []
+    for i in held:                    # newest first
+        content, ts = rows[i][1] or "", rows[i][2] or 0
+        if not is_real_staff_text(content):
+            continue
+        wrote = datetime.fromtimestamp(ts, tz).date()
+        # round 3c (VERIFY_FINAL M1): "Unfortunately Wednesday is full but we can do Thursday 22nd" names two days in
+        # one sentence, which staff_named_days reads as none - the offer after its decline makes it the day line
+        if staff_named_days(content, wrote) or _hold_offer_days(content, wrote):
+            days = _hold_offer_days(content, wrote)
+            if not days:
+                log.info("Staff-hold yes for %s: not booked - the colleague's newest line with a day invites "
+                         "nobody in (a call-back, a part, a day off)", user)
+                return [], ""
+            if any(_HOLD_TAKEN_BACK_RE.search(n) or _GAP_STAFF_DECLINE_RE.search(n) for n in newer):
+                return [], ""
+            why = _hold_turn_why(rows, i, wrote)        # round 3b (review F1 a / b)
+            if why:
+                log.info("Staff-hold yes for %s: not booked - %s", user, why)
+                return [], ""
+            today = now_local().date()
+            days = [x for x in days if date.fromisoformat(x) > today and date.fromisoformat(x).weekday() != 6]
+            why = _hold_after_day_line(user, rows[1:i], days, ts) if days else ""
+            if why:
+                log.info("Staff-hold yes for %s: not booked - %s", user, why)
+                return [], ""
+            return days, content
+        newer.append(content)
+    return [], ""
+
+
+def _hold_offer_sentences(text: str) -> list:
+    """fix3 1C: the colleague's sentences that may invite them in, as (sentence, bare) - `bare`: only a bare day line
+    (_hold_bare_day_line) carries it, no invitation cue of its own (_hold_invite_cue). Round 2 (review F1): never a
+    sentence with a call-back, a part, a delivery or a day off (_HOLD_NOT_OFFER_RE), nor one that takes a day back
+    ("Unfortunately the 27th is gone" - _HOLD_TAKEN_BACK_RE). Round 3 (VERIFY V1): only a sentence that INVITES them
+    in (_hold_invites), on ONE day ("2nd or 3rd September"), never "remind me tomorrow". Round 3b (review F1 c): never
+    money, keys, a wash, a collection or work on a car that is already here ("Come in tomorrow and pay", "I can do the
+    price tomorrow", "We can fix it tomorrow", "Bring it back tomorrow if the light comes on again" -
+    _HOLD_NOT_VISIT_RE / _HOLD_WORK_HERE_RE), and nothing at all from a message that says the car is here or ready
+    ("Can we do it tomorrow? The car is here already" - _HOLD_CAR_HERE_RE)."""
+    t = re.sub(r"(?:\.{2,}|…)\s*", ". ", _plain_apostrophes(text or ""))     # "tomorrow..we" is two sentences
+    sents = [s for s in re.split(r"(?<=[.!?])\s+|\n+", t) if s.strip()]
+    if any(_HOLD_CAR_HERE_RE.search(s) for s in sents):
+        return []
+    out = []
+    for s in sents:
+        if (_HOLD_TAKEN_BACK_RE.search(s) or _GAP_STAFF_DECLINE_RE.search(s)) and not _HOLD_REMIND_RE.search(s):
+            # round 3c (VERIFY_FINAL M1): a decline that goes on to offer another day ("Unfortunately Wednesday is full
+            # but we can do Thursday 22nd", "Sorry Don, the next available date will be 25th") - only that offer
+            tail = _hold_counter_offer(s)
+            if tail and _hold_counter_ok(tail, True):
+                out.append((tail, not (_hold_invite_cue(tail) or _HOLD_DAY_FREE_RE.search(tail))))
+            continue
+        if (_HOLD_NOT_OFFER_RE.search(s) or _HOLD_TAKEN_BACK_RE.search(s) or _HOLD_REMIND_RE.search(s)
+                or _HOLD_TWO_DAYS_RE.search(s) or _HOLD_NOT_VISIT_RE.search(s)
+                or (_HOLD_WORK_HERE_RE.search(s) and not _HOLD_MOTION_RE.search(s)) or not _hold_invites(s)):
+            continue
+        out.append((s, not _hold_invite_cue(s)))
+    return out
+
+
+def _hold_invite_cue(s: str) -> bool:
+    """fix3 round 3b: this colleague sentence carries an invitation cue of its own (the diary-gap's staff go-ahead, an
+    offer, the Romanian go-ahead) - it is more than a bare day line."""
+    s = re.sub(r"\s+", " ", s or "").strip()
+    # round 3d (review L-F3): a "tell him <day>" relay is no invitation cue (_hold_foreign_goahead)
+    return bool(s) and bool(_GAP_STAFF_RE.search(s) or _HOLD_INVITE_RE.search(s) or _hold_foreign_goahead(s))
+
+
+def _hold_offer_days(text: str, wrote) -> list:
+    """fix3 1C: staff_named_days of the colleague's sentences that may invite them in (_hold_offer_sentences, read as
+    of the day they were written)."""
+    keep = _hold_offer_sentences(text)
+    return staff_named_days("\n".join(s for s, _bare in keep), wrote) if keep else []
+
+
+def _hold_cust_asked_visit(text: str) -> bool:
+    """fix3 round 3b (review F1 b): the customer's message asks for a visit or names a day (a weekday, tomorrow, the
+    28th; Romanian / Russian day words put into English first)."""
+    t = _plain_apostrophes(text or "")
+    if GAP_FOREIGN_LANGS and _GAP_FX_ANYDAY_RE.search(t):
+        t = _gap_fx_english(t) or t
+    return bool(_HOLD_CUST_VISIT_RE.search(t) or _HOLD_CUST_DAY_RE.search(t))
+
+
+def _hold_turn_why(rows: list, i: int, wrote) -> str:
+    """fix3 round 3b (review F1 a / b): why the colleague's day line rows[i] - `rows` newest first (role, content, ts,
+    kind), rows[0] the customer's yes - may answer something else than "when can I come in?" ('' = it may invite them):
+      - a customer message since the colleague last really wrote before that line, or between the line and the yes,
+        asks about their car's status or its collection ("When will it be ready?", "I can collect it tomorrow");
+      - the line is BARE (only day, date, time and ok-words, and no other line of the colleague's same turn invites
+        them) and the customer's messages before it ask about a price, a part, the opening hours or the NCT, or never
+        asked for a visit or named a day."""
+    j = i + 1
+    while j < len(rows) and rows[j][0] == "staff" and (rows[j - 1][2] or 0) - (rows[j][2] or 0) <= 300:
+        j += 1                        # the colleague's own turn, just before the day line
+    before = []
+    for role, c, _ts, _kind in rows[j:]:
+        if role == "staff" and is_real_staff_text(c or ""):
+            break
+        if role == "user":
+            before.append(_plain_apostrophes(c or ""))
+    after = [_plain_apostrophes(r[1] or "") for r in rows[1:i] if r[0] == "user"]
+    if any(_HOLD_CUST_STATUS_RE.search(c) for c in before + after):
+        return "the customer asked about their car's status or its collection - the colleague's day may answer that"
+    keep = _hold_offer_sentences(rows[i][1] or "")
+    if any(not bare for s, bare in keep if staff_named_days(s, wrote)):
+        return ""
+    turn = [rows[k][1] or "" for k in range(i + 1, j)]
+    k = i - 1
+    while k >= 1 and rows[k][0] == "staff" and (rows[k][2] or 0) - (rows[k + 1][2] or 0) <= 300:
+        turn.append(rows[k][1] or "")
+        k -= 1
+    if any(is_real_staff_text(c) and not staff_named_days(c, wrote) and _hold_invite_cue(c)
+           and not (_HOLD_TAKEN_BACK_RE.search(c) or _HOLD_NOT_OFFER_RE.search(c)) for c in turn):
+        return ""                     # "Can do the service" / "This Saturday": the turn's other line invites them
+    if any(_HOLD_CUST_NOT_VISIT_RE.search(c) for c in before):
+        return "a bare day line after a question about a price, a part, the opening hours or the NCT"
+    if not any(_hold_cust_asked_visit(c) for c in before):
+        return "a bare day line, and the customer had not asked for a visit or a day"
+    return ""
+
+
+def _hold_car_may_be_here(user: str) -> bool:
+    """fix3 round 3b (review F1 d), the 1C booker only: a diary row for this customer in the last 14 days (today too)
+    and no "is ready" / invoice from a colleague since that day - the car may still be with us (a long repair: "When
+    will it be ready?" -> "Tomorrow" was booked as a second visit). The diary-gap's own 3-day rule
+    (_gap_car_still_with_us) is unchanged. Unsure: True (nothing booked)."""
+    try:
+        today = now_local().date()
+        past = [x for x in _gap_diary_dates(user) if today - timedelta(days=14) <= x <= today]
+        if not past:
+            return False
+        latest = max(past)
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?",
+                                (user, now_local().timestamp() - 15 * 86400)).fetchall()
+        return not any(_GAP_FX_READY_MSG_RE.search(c or "") and _gap_local_date(ts or 0) >= latest for c, ts in rows)
+    except Exception:
+        log.exception("Staff-hold yes: could not tell whether %s's car is still here", user)
+        return True
+
+
+def _hold_line_days(text: str, ts: float) -> set:
+    """fix3 1C, round 2: every day from today on that a business line names anywhere - ambiguous ones too (each
+    sentence's _gap_candidates, Romanian / Russian day words put into English first, as the headlights gate's
+    _line_days) - but not in a rule ("Saturday is for general services only", "we're open Saturday 9-2")."""
+    d0, today, out = _gap_local_date(ts or 0.0), now_local().date(), set()
+    for raw in re.split(r"(?<=[.!?])\s+|\n+", _plain_apostrophes(text or "")):
+        s = re.sub(r"\s+", " ", raw).strip()
+        if not s or _GAP_FX_RULE_TALK_RE.search(s):
+            continue
+        if GAP_FOREIGN_LANGS and _GAP_FX_ANYDAY_RE.search(s):
+            s = _gap_fx_english(s) or s
+        for d, _how in _gap_candidates(s, d0):
+            if d >= today:
+                out.add(d.isoformat())
+    return out
+
+
+def _hold_cust_other_day(text: str, ts: float, days: list) -> bool:
+    """fix3 1C, round 2 (reviews real-data F1 / INT-3): does this customer message name a day that is not one of
+    the colleague's `days`? Plain words - a weekday, tomorrow / today, the 28th, 28 Oct (_HOLD_CUST_DAY_RE);
+    Romanian / Russian day words put into English first; a day English cannot pin down counts as another."""
+    t = _plain_apostrophes(text or "")
+    if GAP_FOREIGN_LANGS and _GAP_FX_ANYDAY_RE.search(t):
+        t = _gap_fx_english(t)
+        if not t:
+            return True
+    ds = [date.fromisoformat(x) for x in days]
+    wds, nums, said = {d.weekday() for d in ds}, {d.day for d in ds}, _gap_local_date(ts or 0.0)
+    for m in _HOLD_CUST_DAY_RE.finditer(t):
+        wd, rel = (m.group("wd") or "").lower(), (m.group("rel") or "").lower()
+        n = next((int(g) for g in (m.group("n1"), m.group("n3"), m.group("n4")) if g), None)
+        if wd:
+            if _HOLD_WD[wd[:3]] not in wds:
+                return True
+        elif rel:
+            if (said if rel in ("today", "tonight") else said + timedelta(days=1)) not in ds:
+                return True
+        elif n is not None and n not in nums:
+            return True
+    return False
+
+
+def _booking_created_since(user: str, ts: float) -> bool:
+    """A diary row for this phone made at or after `ts` (unsure: True - nothing is booked on a guess)."""
+    digits = "".join(c for c in str(user) if c.isdigit())
+    if len(digits) < 7:
+        return False
+    try:
+        with closing(db()) as conn:
+            return conn.execute("SELECT 1 FROM bookings WHERE COALESCE(created_ts, 0) >= ? AND"
+                                " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? LIMIT 1",
+                                (ts or 0, "%" + digits[-9:])).fetchone() is not None
+    except Exception:
+        log.exception("Could not read the diary for %s", user)
+        return True
+
+
+def _hold_lamp_only(user: str, said: str) -> bool:
+    """fix3 1C, round 2 (review H1, garage twin): the colleague's day line, or the customer's words of the last 24 h,
+    are about a headlight brought or posted on its own (_HOLD_LAMP_ONLY_RE). Unsure: True (nothing is booked)."""
+    if _HOLD_LAMP_ONLY_RE.search(_plain_apostrophes(said or "")):
+        return True
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND ts >= ?",
+                                (user, time.time() - 24 * 3600)).fetchall()
+    except Exception:
+        log.exception("Could not read the chat of %s", user)
+        return True
+    return any(_HOLD_LAMP_ONLY_RE.search(_plain_apostrophes(r[0] or "")) for r in rows)
+
+
+def _hold_after_day_line(user: str, between: list, days: list, d_ts: float) -> str:
+    """fix3 1C, round 2 (13 Oct reviews): why what came AFTER the colleague's day line says that day is not settled
+    ('' = it may be). `between`: the rows between that line and the customer's yes, newest first (role, content,
+    ts, kind).
+      - a booking for this phone was made since, or the bot's booked line went out since: a thank-you after a 1C
+        booking is no new yes (F3);
+      - a customer message since turns a day down or asks for another (F1: "27th doesn't suit me, I'm away");
+      - an owner's Telegram line since may take it back ("Sorry, the 27th has just gone", INT-2);
+      - the newest business line since that names a day - a real colleague message, the owner's Telegram line or
+        the bot's own reply - names another day too (INT-2; the headlights gate's rule);
+      - a customer message since names another day and no business line after it answers with a day (real-data
+        F1 / INT-3: "Is next friday ok?" - "Yes" - "Perfect thank you", garage …536 11 Aug - the car came Friday);
+      - the bot's own reply right before the yes names none of the colleague's days: the yes answers the bot
+        ("Would you like a quote for it?" - "Yes please", H6)."""
+    dset = set(days)
+    if _booking_created_since(user, d_ts):
+        return "a booking for this phone was made after the colleague's day line"
+    seen_biz_day = newest_done = False
+    last_biz = None
+    for role, content, ts, kind in between:          # newest first
+        c = content or ""
+        if role == "user":
+            if _HOLD_CUST_DECLINE_RE.search(_plain_apostrophes(c)):
+                return "the customer turned a day down or asked for another since"
+            if not seen_biz_day and _hold_cust_other_day(c, ts, days):
+                return "the customer named another day since, and nobody answered it with a day"
+            continue
+        if role == "staff" and not is_real_staff_text(c):
+            continue
+        if role != "staff" and (c.startswith(UNDELIVERED_PREFIX) or c.lstrip().startswith("[")):
+            continue
+        owner = role == "assistant" and kind in ("owner_tg", "owner_book")
+        bot = role == "assistant" and not owner
+        if last_biz is None:
+            last_biz = (bot, c, ts)
+        if bot and not kind and c.startswith(_BOOKED_LINE_PREFIXES):
+            return "the bot already told them they are booked in"
+        if owner and (_HOLD_TAKEN_BACK_RE.search(c) or _GAP_STAFF_DECLINE_RE.search(c)):
+            return "the owner wrote from Telegram since, and may have moved or taken the day back"
+        named = _hold_line_days(c, ts)
+        if named:
+            if not newest_done and not named <= dset:
+                return "the newest business line that names a day names another day"
+            newest_done = seen_biz_day = True
+    if last_biz and last_biz[0] and not (_hold_line_days(last_biz[1], last_biz[2]) & dset):
+        return "the bot's reply right before the yes names none of the colleague's days (the yes may answer it)"
+    return ""
+
+
+_AGREED_CAR_STOP = {"the", "car", "van", "new", "old", "series", "class", "model", "diesel", "petrol", "sport",
+                    "line", "and", "auto", "manual", "hybrid", "electric", "ev", "my", "his", "her", "jeep"}
+# fix3 round 2 (review real-data F6): model names that are everyday words ("can you FIT me in" was "Honda Fit").
+# Alone they never show the car was said - the make, another word of the name or the reg must.
+_AGREED_CAR_COMMON = {"fit", "note", "leaf", "up", "one", "jazz", "life", "move", "spark", "city", "space", "star"}
+
+
+def _agreed_booking_refusal(user: str, fields: dict, days, since: float) -> str:
+    """fix3 1C: why the watcher's booking may NOT be written from a staff-hold "yes" ('' = it may) - in words
+    for staff (round 2: the 1C alert quotes it). The day must be one the colleague's own words named; a reg or
+    car the CUSTOMER did not write in this chat's last 24 h is dropped (a family phone may carry another car -
+    round 2, reviews F5 / H6: never from the bot's own read-back of the car on file, nor from the colleague's
+    words), and with neither left nothing is written; the phone is always this chat's. The date is year-fixed
+    first, as save_booking fixes it."""
+    try:
+        iso = booking_year_fix(date.fromisoformat((fields.get("date") or "").strip()[:10]),
+                               now_local().date()).isoformat()
+    except (TypeError, ValueError):
+        iso = ""
+    if iso not in set(days or ()):
+        return ((f"the bot read the day as {date.fromisoformat(iso):%a %d %b}" if iso else
+                 "the bot could not read which day") + ", not a day your colleague named - check which day was agreed")
+    fields["date"] = iso
+    with closing(db()) as conn:
+        said = " ".join((r[0] or "") for r in conn.execute(
+            "SELECT content FROM messages WHERE wa_user = ? AND ts >= ? AND role = 'user'", (user, since)).fetchall())
+    flat, low = re.sub(r"[^0-9A-Z]", "", said.upper()), said.lower()
+    reg = clean_reg(fields.get("reg", ""))
+    if reg and re.sub(r"[^0-9A-Z]", "", reg) not in flat:
+        fields["reg"] = ""
+    car = (fields.get("car") or "").strip()
+    # a word of the car's name (make or model, as a whole word - not "car", "the", "series"...) they said in the
+    # 24 h, and not only an everyday word ("fit", "note")
+    hit = [w for w in re.findall(r"[^\W\d_]{2,}", car.lower()) if w not in _AGREED_CAR_STOP
+           and re.search(r"(?<![^\W_])" + re.escape(w) + r"(?![^\W_])", low)]
+    if car and (car.lower() in _PLACEHOLDER_CAR or not (
+            (clean_reg(car) and re.sub(r"[^0-9A-Z]", "", clean_reg(car)) in flat)
+            or any(w not in _AGREED_CAR_COMMON for w in hit))):
+        fields["car"] = ""
+    if not ((fields.get("car") or "").strip() or clean_reg(fields.get("reg", ""))):
+        return ("no car or reg of theirs in this chat in the last 24 h (a family phone may carry another car) - "
+                "check which car it is")
+    fields["phone"] = user
+    return ""
+
+
+def staff_day_yes_days(user: str, text: str) -> tuple:
+    """fix3 1C: (days, the colleague's words) that every code gate of the staff-hold "yes" booker allows -
+    ASSIST_STAFF_DAY_BOOK on, a short agreement, a day the colleague named (_hold_colleague_days) - and not
+    while their car may still be here (_gap_car_still_with_us, the diary-gap rule: in within the last 3
+    days with no "is ready" since, or ready in the last 3): a colleague's "tomorrow" may be the collection
+    ("I think tomorrow evening you will take car", garage …524). ([], "") = the booker does not run."""
+    if not ASSIST_STAFF_DAY_BOOK or not short_agreement(text):
+        return [], ""
+    # round 2 (review F4): not while a colleague wrote in the last 3 minutes - they may be about to change the day
+    # or add the time (the assist keeps the same grace; the sweep's assist, or their next message, comes later)
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
+    except Exception:
+        log.exception("Staff-hold yes: could not read the hold for %s", user)
+        return [], ""
+    if row and time.time() - (row[0] or 0) < 180:
+        return [], ""
+    days, said = _hold_colleague_days(user)
+    if not days:
+        return [], ""
+    # round 3 (VERIFY V2): a day they are already in the diary for is nothing to add - no watcher call, and no alert
+    # that would say "did NOT put it in the diary" and "ALREADY in the diary" at once (as the headlights gate)
+    days = [x for x in days if not _has_booking_on(user, x)]
+    if not days:
+        log.info("Staff-hold yes for %s: not booked - already in the diary that day", user)
+        return [], ""
+    if _hold_lamp_only(user, said):        # round 2 (review H1, garage twin): a lamp on its own is no car visit
+        log.info("Staff-hold yes for %s: not booked - a headlight brought or posted on its own", user)
+        return [], ""
+    try:
+        if _gap_car_still_with_us(user, _gap_diary_dates(user), now_local().date(), foreign=True):
+            return [], ""
+        if _hold_car_may_be_here(user):         # round 3b (review F1 d): 14 days, not 3
+            log.info("Staff-hold yes for %s: not booked - in the diary in the last 14 days and no 'is ready' since "
+                     "(the car may still be here)", user)
+            return [], ""
+    except Exception:
+        log.exception("Staff-hold yes: could not tell whether %s's car is still here", user)
+        return [], ""
+    return days, said
+
+
+def staff_day_yes_book(user: str, text: str) -> bool:
+    """fix3 1C: the customer's short "yes", in a chat a colleague holds, to a day the colleague named: into
+    the diary (watch_staff_booking with agreed_days, synchronously), then the booked line to the customer
+    (it is true now) and staff the watcher's usual 📌 note under its 29 Sep rule (the evening report lists
+    every booking; an instant note only for a day due today / tomorrow, a second day in the diary, a day
+    read two ways or a calendar miss) - True, and the assist does not run. False: nothing written, nothing
+    sent - today's flow carries on. ASSIST_STAFF_DAY_BOOK=0: always False."""
+    days, said = staff_day_yes_days(user, text)
+    if not days:
+        return False
+    fields = watch_staff_booking(user, by_customer=True, agreed_days=days)
+    if not fields:
+        return False
+    if fields.get("_refused"):
+        return staff_day_yes_refused(user, text, days, fields)
+    try:
+        d = date.fromisoformat(fields["date"])
+        day = f"{d:%A} {d.day} {d:%B}"     # round 2 (review F8): "Wednesday 7 October", not "07"
+    except (KeyError, ValueError):
+        day = fields.get("date", "")
+    lang = _guess_lang_code(_recent_customer_words(user, 4))
+    if lang == "en" and (fields.get("lang") or "").strip().lower()[:2] in ("ru", "ro", "lt"):
+        lang = fields["lang"].strip().lower()[:2]
+    line = BOOKED_LINE_MSG.get(lang, BOOKED_LINE_MSG["en"]).format(day=day)
+    send_whatsapp(user, line)
+    save_message(user, "assistant", line)
+    if fields.get("_note"):
+        try:
+            send_telegram(fields["_note"])
+        except Exception:
+            log.exception("Staff-hold yes note failed for %s", user)
+    log.info("Staff-hold yes for %s: booked %s from the colleague's words %r", user, fields.get("date"),
+             (said or "")[:80])
+    return True
+
+
+def staff_day_yes_refused(user: str, text: str, days: list, fields: dict) -> bool:
+    """fix3 1C, round 2 (review H2): every code gate passed and the watcher read a booking, but it may not be
+    written - another day than the colleague's, no car or reg of theirs in the last 24 h, a bank holiday. Staff get
+    the precise 'nearly confirmed' alert now (raise_assist_booking_alert: once per yes; the colleague's day with
+    its weekday, why not, their words, the colleague's, the flags) instead of silence while the assist holds its
+    read-back back. True: the assist does not run - nothing goes to the customer (owner, 3 Oct). The alert failed:
+    False, today's flow."""
+    try:
+        try:
+            iso = booking_year_fix(date.fromisoformat((fields.get("date") or "").strip()[:10]),
+                                   now_local().date()).isoformat()
+        except ValueError:
+            iso = ""
+        day = iso if iso in days else (days[0] if len(days) == 1 else "")
+        # round 3 (VERIFY V2): a diary-gap task for this chat and day already tells staff the same fact (the colleague's
+        # "Bring over tomorrow morning" raised it, garage …700 / …414): that task is posted now, no second alert. (Not
+        # for a booking they hold on another day - R3-b: the task would ask for the second row.) Round 3d (review
+        # A-F1): only an OPEN task - one pressed Done before this yes covers nothing; the alert below goes out.
+        if day and not fields.get("_tail") and _diary_gap_task_covers(user, day):
+            log.info("Staff-hold yes for %s: not written (%s) - the diary-gap task for %s says it", user,
+                     fields["_refused"], day)
+            return True
+        raw = "<<<BOOKING|" + "|".join(f"{k}={(fields.get(k) or '').strip()}" for k in ("car", "reg", "need")) \
+              + f"|date={day}|time=|name={(fields.get('name') or '').strip()}|phone=|lang=>>>"
+        said = " ".join((text or "").split())[:60]
+        raise_assist_booking_alert(user, raw, "", lead=(
+            f"They said “{said}” to the day your colleague named, but the bot did NOT put it in the diary: "
+            f"{fields['_refused']}."), headline=fields.get("_headline", ""), tail=fields.get("_tail", ""),
+            clash_key=fields.get("_clash_key", ""))         # round 3c (VERIFY_FINAL M3): one alert per fact
+        log.info("Staff-hold yes for %s: not written (%s) - staff told", user, fields["_refused"])
+        return True
+    except Exception:
+        log.exception("Staff-hold yes: the alert for %s failed", user)
+        return False
+
 
 def human_handling(user: str) -> bool:
     """True while a colleague is dealing with this customer, so the bot keeps out.
@@ -6890,6 +8854,25 @@ OWNER_HINT = (
     "Only output this line when the owner is telling you what a job cost — never for a booking."
 )
 
+# fix3 ISSUE 3 (13 Oct 2026; Gordon …945): the bot re-asked the car, the reg and the name it already had. The "do
+# not ask again - confirm instead" sentence sat under `if past:` only, so a customer with just a name or a reg on
+# file never got it; it now goes to everyone with something on file, and says how to confirm: the standard read-back,
+# then "— still the same car?" (the summary keeps its shape for _PROPOSAL_RE / _READBACK_RE), and a name taken from
+# the record is read back too - AFTER the drop-off day, where neither parser reads it as the job (a shared phone can
+# carry another name). Fake example reg only. The same words as the headlights build, but "brakes" (the garage's own
+# STEP 1 example) and "a website booking form".
+CUSTOMER_KNOWN_RULE = (
+    "Do NOT ask again for anything listed here or already given in this chat — use it, and ask only for what is "
+    "still missing. Read the booking back as usual; for a car from an earlier visit add \"— still the same car?\" "
+    "before \"Shall I book you in?\", e.g. \"Just to confirm: Toyota Yaris (12D3456), brakes, drop-off Monday "
+    "between 9 and 11am — still the same car? Shall I book you in?\". If their name comes only from here (not from "
+    "this chat), put it in that read-back too, after the drop-off day (\"… between 9 and 11am, under the name NAME "
+    "…\"), so they can correct it.")
+CUSTOMER_CARS_RULE = (
+    " They have MORE THAN ONE car on file: if this chat (or their website booking form) already says which car this "
+    "request is for, use that one; otherwise ask which one, naming them — never pick one yourself.")
+
+
 def customer_context(user: str) -> str:
     """Tell Claude what we already know about a returning customer.
 
@@ -6900,8 +8883,11 @@ def customer_context(user: str) -> str:
     with closing(db()) as conn:
         cust = conn.execute(
             "SELECT name, reg FROM customers WHERE wa_number = ?", (user,)).fetchone()
+        # [fix3 ISSUE 3] every booking, not the newest 300: once the diary passed 300 rows (future ones first) an
+        # older customer's visits dropped out (99 customers on 13 Oct). The listing below still shows at most 6, so
+        # the prompt does not grow with the diary (measured on the 13 Oct diary: see fix3/BUILD_g_reask.md).
         rows = conn.execute(
-            "SELECT date, car, reg, need, phone FROM bookings ORDER BY date DESC LIMIT 300"
+            "SELECT date, car, reg, need, phone FROM bookings ORDER BY date DESC"
         ).fetchall()
         reg_on_file = clean_reg(cust[1]) if cust and cust[1] else ""
         charges = conn.execute(
@@ -6910,10 +8896,15 @@ def customer_context(user: str) -> str:
     name = (cust[0] if cust else "") or ""
     reg = (cust[1] if cust else "") or ""
     past = []
+    cars = {}   # [fix3 ISSUE 3] each reg in their bookings (newest first) -> the newest car name booked with it
     today = now_local().date()
     for d, car, r, need, phone in rows:
         pdigits = "".join(ch for ch in (phone or "") if ch.isdigit())
-        if (tail and pdigits.endswith(tail)) or (reg and r and r == reg):
+        # [fix3 ISSUE 3] the reg compared clean on both sides ("12-D-3456" in the diary is 12D3456 on file)
+        if (tail and pdigits.endswith(tail)) or (reg_on_file and r and clean_reg(r) == reg_on_file):
+            r_clean = clean_reg(r or "")
+            if r_clean and not cars.get(r_clean):
+                cars[r_clean] = clean_car(car or "")
             ago = ""
             try:
                 days = (today - datetime.strptime(d, "%Y-%m-%d").date()).days
@@ -6929,14 +8920,19 @@ def customer_context(user: str) -> str:
     if name:
         out.append(f"- Name: {name}")
     if reg:
-        out.append(f"- Car reg on file: {reg}")
+        car_on_file = cars.get(reg_on_file, "")     # [fix3 ISSUE 3] the make and model booked with that reg
+        out.append(f"- Car reg on file: {reg}" + (f" ({car_on_file}, from a booking with us)" if car_on_file else ""))
+    # [fix3 ISSUE 3] every car on file: the customers row first, then the bookings (newest first)
+    regs = ([reg_on_file] if reg_on_file else []) + [x for x in cars if x != reg_on_file]
+    if len(regs) > 1:
+        out.append("- More than one car on file: " + ", ".join(
+            f"{cars[x]} ({x})" if cars.get(x) else x for x in regs[:4]))
     if past:
         out.append("- Previous bookings with us:")
         out += [f"  * {p}" for p in past[:6]]
         out.append("This is a RETURNING customer: greet them warmly (by name if you have it) and "
                    "refer to their car naturally, e.g. \"good to hear from you again\". Do not "
-                   "recite their history at them, and do not ask again for details we already "
-                   "have — confirm instead, e.g. \"still the Yaris, 12D3456?\".")
+                   "recite their history at them.")
         out.append("COMEBACK CHECK (important): if what they're describing now sounds like the "
                    "SAME or a related problem to one of the bookings above from the last two "
                    "weeks, this is very likely a COMEBACK — the earlier work didn't fully fix "
@@ -6945,6 +8941,8 @@ def customer_context(user: str) -> str:
                    "soonest day the calendar shows, same as any other job. When you write the "
                    "final BOOKING line, start the need= field with 'COMEBACK - ' so the team "
                    "sees it immediately and can decide whether it's a free warranty visit.")
+    # [fix3 ISSUE 3] for everyone with something on file, not only after a past booking
+    out.append(CUSTOMER_KNOWN_RULE + (CUSTOMER_CARS_RULE if len(regs) > 1 else ""))
     if charges:
         out.append("- What we charged them before (INTERNAL ONLY — never quote these back "
                    "as today's price):")
@@ -9064,14 +11062,17 @@ def no_false_checking(text: str) -> str:
         text = rx.sub(rep, text)
     return text
 
-def after_new_booking(user: str, booking: dict, source: str, regcheck: bool = True) -> None:
+def after_new_booking(user: str, booking: dict, source: str, regcheck: bool = True,
+                      twocheck: bool = True) -> None:
     """Everything that follows a NEW diary row: the booking note and calendar entry,
     the email, the register check, the two-bookings alert and this bot's own extras.
     Moved out of _finish_reply unchanged (29 Sep 2026) so the owner's Telegram bookings
     run the very same code as a chat booking; `source` names the path in the
     register-check note (it was the literal "chat booking"). regcheck=False only for
     the owner's "✅ Book (no message)": the register check would text a customer he
-    chose not to message, and its saved Bot row would cancel their day-before reminder."""
+    chose not to message, and its saved Bot row would cancel their day-before reminder.
+    fix3 round 3b (reviews F4 / R3A-2, as the headlights build): twocheck=False - the caller runs the two-bookings
+    check itself, later (_finish_reply: after the reply's own cancellation - a move is ONE reply)."""
     try:
         # The owner's own bookings (WhatsApp "Added" or Telegram) never echo
         # back to him unless something went wrong (29 Sep 2026).
@@ -9106,25 +11107,17 @@ def after_new_booking(user: str, booking: dict, source: str, regcheck: bool = Tr
         # later_booking_exists return the EARLIEST row of all time —
         # every past visit included — so the alert fired on history and
         # missed a genuine second future booking.
-        other = later_booking_exists(
-            0, bf.get("phone", ""), bf.get("reg", ""),
-            (now_local().date() - timedelta(days=1)).isoformat())
-        if other and other[1] != bf.get("date"):
-            send_telegram(
-                "⚠️ THIS CAR NOW HAS TWO BOOKINGS\n"
-                f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
-                f"({clean_reg(bf.get('reg','')) or 'no reg'}) +{bf.get('phone','')}\n"
-                f"{bf.get('date','?')} (just booked) and {other[1]} (id {other[0]}).\n"
-                "If they moved, cancel the one they are not coming to:\n"
-                f"{PUBLIC_URL}/admin?token={review_link_token()}"
-                f"&action=cancel&date={clean_reg(bf.get('reg','')) or bf.get('phone','')}"
-                f"&need={other[1]}")
+        # (fix3 round 3, R3-c: the same check, in double_booking_alert, now an alerts row - kind double_booking, a
+        # Done button, claimstatus - and run by every watcher save too)
+        if twocheck:
+            double_booking_alert(user, bf, (now_local().date() - timedelta(days=1)).isoformat(), source=source)
     except Exception:
         log.exception("Double-booking check failed for %s", bf.get("phone"))
 
 def _finish_reply(user: str, answer: str) -> str:
     """Strip hidden markers, notify the owner, store and return the customer reply."""
     raw_answer = answer
+    two_check_after = None      # fix3 round 3b (F4 / R3A-2): the two-bookings check, after this reply's cancellation
     # A reply can be cut off mid-marker (token limit), leaving '<<<HANDOVER|reason=…'
     # with no closing '>>>'. The normal parsers need the '>>>' so they miss it and the
     # fragment goes out to the customer. Catch that here, before anything else.
@@ -9163,6 +11156,12 @@ def _finish_reply(user: str, answer: str) -> str:
         # A customer's booking always belongs to the number they message from —
         # never trust a typed phone. (The owner may log bookings for others.)
         booking["phone"] = user
+        # fix3 round 3 (VERIFY V3): ...and never the prompt's own example reg this customer never typed (G …356, G …660
+        # read 161D22222 back as theirs): not stored, so the "car and reg" gate asks for the real one.
+        if example_reg_not_given(user, booking.get("reg", "")):
+            log.warning("Booking for %s: the reg %r is the prompt's example and the customer never typed it - "
+                        "not stored", user, booking.get("reg"))
+            booking["reg"] = ""
     if booking:
         # A re-confirmation of a booking already in the diary sails past every
         # gate — save_booking dedupes it silently and the answer stays intact.
@@ -9194,7 +11193,8 @@ def _finish_reply(user: str, answer: str) -> str:
             # or a closed day when BOOKINGS_FROM falls on one (12 Oct 2026).
             answer = NOT_OPEN_MSG.get(
                 reminder_lang_code(booking.get("lang", "")), NOT_OPEN_MSG["en"]
-            ).format(date=first_bookable_day(opens).strftime("%A %d %B") if opens else "")
+            ).format(date=first_bookable_day(opens, booking.get("need", "")).strftime("%A %d %B")
+                     if opens else "")   # [fix3 ISSUE 3] the first day with room for THIS job
             # ...but a bank holiday is shut, never "fully booked" (owner, 28 Sep 2026): say
             # so in the bank-holiday gate's own words, and the customer picks another day.
             if bank_holiday_shut(booking.get("date", "")):
@@ -9327,8 +11327,14 @@ def _finish_reply(user: str, answer: str) -> str:
         # A repeat of a booking we already hold must not alert, email or make a
         # second calendar entry — that is what filled the diary with doubles.
         if is_new:
-            after_new_booking(user, booking,
-                              "owner booking (WhatsApp)" if is_owner else "chat booking")
+            # fix3 round 3b (reviews F4 / R3A-2, as the headlights build): a chat booking's two-bookings check runs
+            # AFTER this reply's own cancellation (below) - a move is ONE reply ("cancel the old one, then book the new
+            # day", the KB), and the old row is still in the diary here: a correct move was raised as an open, laddered
+            # "THIS CAR NOW HAS TWO BOOKINGS"
+            after_new_booking(user, booking, "owner booking (WhatsApp)" if is_owner else "chat booking",
+                              twocheck=is_owner)
+            if not is_owner:
+                two_check_after = dict(booking)
     answer, invoice = process_invoice(answer)
     if invoice and not is_owner:
         try:
@@ -9414,6 +11420,14 @@ def _finish_reply(user: str, answer: str) -> str:
                             + " They have been told we are checking.", kind="cancel_failed")
             except Exception:
                 log.exception("Could not alert on the failed cancellation for %s", user)
+    if two_check_after is not None:
+        # fix3 round 3b (F4 / R3A-2): this turn's cancellation (a move) is done - two days for the car now are two
+        try:
+            two_check_after["phone"] = two_check_after.get("phone") or user
+            double_booking_alert(user, two_check_after, (now_local().date() - timedelta(days=1)).isoformat(),
+                                 source="chat booking")
+        except Exception:
+            log.exception("Double-booking check failed for %s", user)
     answer, customer = process_customer(answer)
     if customer and not is_owner:
         try:
@@ -11933,18 +13947,22 @@ CHASE_SYSTEM = (
 )
 
 def _make_chase(user: str) -> str:
-    history = get_history(user)
+    history = _assist_history(user)      # fix3 1A: each colleague line labelled as the colleague's
     if not history:
         return ""
     messages = history + [{"role": "user", "content":
                            "(Internal: nobody has come back to this customer yet. Write "
                            "the check-in per your rules, or reply SKIP.)"}]
-    raw = _call_claude(messages, CHASE_SYSTEM) or ""
+    raw = _call_claude(messages, CHASE_SYSTEM + (_CHASE_LABEL_NOTE if ASSIST_LABEL_STAFF else "")) or ""
     if raw.startswith(MODEL_FAILED_PREFIX):
         return ""    # never send the outage line as a holding message; the staff note says "NOT messaged"
     text = re.sub(r"<<<.*?>>>", "", raw).strip()
     text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a chase with no words in it
     if not text or text.upper().startswith("SKIP") or not reply_has_words(text):
+        return ""
+    if ASSIST_LABEL_STAFF and (_ASSIST_LABEL_LEAK_RE.search(text)      # fix3 1A: the label never goes out
+                               or _ASSIST_TAG_LEAK_RE.search(text)):   # (round 2, F6: nor its form)
+        log.warning("Chase for %s dropped - it carried the colleague label: %r", user, text[:160])
         return ""
     return fix_weekday_mentions(strip_phone_readback(text))
 
@@ -12650,7 +14668,16 @@ def sweep_stalled_staff_chats(from_briefing: bool = False) -> None:
                     with closing(db()) as conn:
                         before = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND "
                                               "role = 'assistant'", (user,)).fetchone()[0]
-                    if _maybe_courtesy_close(user) == "alerted":  # answers the simple thing, or does nothing
+                    # [fix3 1D] under the customer's own lock, as the webhook's handler runs: a message landing meanwhile is
+                    # handled after this pass - never two answers or two alerts for one moment
+                    u_lock = _get_user_lock(user)
+                    if not u_lock.acquire(timeout=120):
+                        raise RuntimeError("the customer's lock stayed busy")
+                    try:
+                        verdict = _maybe_courtesy_close(user)
+                    finally:
+                        u_lock.release()
+                    if verdict == "alerted":  # answers the simple thing, or does nothing
                         # Fix 1 [R1 N4]: the model was down; the blank alert covering this message
                         # already told staff - a stalled alert too would be a second post
                         log.info("Stalled staff chat %s: model outage, the blank alert covers it", user)
@@ -13779,10 +15806,14 @@ def alert_resolved(conn, user: str, alert_ts: float) -> bool:
     # customer who had been ticked off stayed on the waiting list, in the
     # evening digest and in the morning briefing. It is why that list never
     # seemed to go down.
-    row = conn.execute("SELECT closed_ts, COALESCE(kind, ''), COALESCE(topic, '') FROM alerts "
+    row = conn.execute("SELECT closed_ts, COALESCE(kind, ''), COALESCE(topic, ''), ts FROM alerts "
                        "WHERE wa_user = ?", (user,)).fetchone()
     if row and (row[0] or 0) >= alert_ts:
         return True
+    if row and row[1] == DOUBLE_BOOKING_KIND and abs((row[3] or 0) - (alert_ts or 0)) < 1:
+        # fix3 round 3b (review R3A-7): a two-bookings warning is sorted by Done or by a change in the diary for its
+        # days - never by the colleague's next chat line ("✅ sorted" was stamped while both rows were still there)
+        return _diary_alert_changed(conn, user, alert_ts)
     if is_real_staff_reply(conn, user, alert_ts):
         return True
     kind, topic = (row[1], row[2]) if row else ("", "")
@@ -16470,6 +18501,421 @@ def _gap_joined_claim(before: str, s: str, today) -> dict:
     return {"date": d, "sentence": shown[:160], "how": how, "strong": True}
 
 
+# ------------------------------------------------- a colleague's go-ahead in Romanian (13 Oct 2026)
+# Garage …124, Tue 13 Oct: the customer asked in Romanian when his father could come in, and a
+# colleague answered from the WhatsApp app "Spunei pe sambata" ("tell him Saturday"). No task, no
+# note - every word list above is English - so the father was expected on a Saturday nobody wrote
+# down (headlights …216 on 8 Oct, "Ne vedem Simbata la 9", was the same miss). This block reads a
+# colleague's go-ahead in Romanian, with the Moldovan spellings colleagues type ("simbata", "miine",
+# "mercuri"), and the English relay "Tell him Saturday", which made no task either. Its day words
+# are put into English and the SAME _gap_date decides the day, so a Romanian "come Saturday" makes
+# exactly the task the English one would, and what the English rule leaves alone (a question, "if
+# you want come Saturday", "you come today", "can you come tomorrow") is left alone here too.
+# The staff path of diary_gap_claims only, and only ever a TASK, never a diary row: in …124 the
+# chat holds the SON's Ford, and a row would have carried the wrong car. English sentences are
+# read exactly as before. Replayed over all 6,823 colleague messages with words (garage) and 1,025
+# (headlights) before it went in.
+#
+# GAP_FOREIGN_LANGS (default "ro"): "ro,ru" adds Russian - no colleague has written Russian yet, so
+# its words are unmeasured. "off" turns the whole block off, the English "tell him" with it (today's
+# behaviour exactly). Lithuanian / Polish / Portuguese: not until a colleague writes them.
+_GAP_FX_RAW = os.environ.get("GAP_FOREIGN_LANGS", "ro").strip().lower()
+_GAP_FX_ON = _GAP_FX_RAW not in ("0", "off", "none", "no", "false")
+GAP_FOREIGN_LANGS = tuple(x for x in ("ro", "ru") if _GAP_FX_ON
+                          and x in [y.strip() for y in (_GAP_FX_RAW or "ro").split(",")])
+_GAP_FX_NEVER = r"(?!x)x"
+_GAP_FX_EN_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_GAP_FX_EN_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August",
+                     "September", "October", "November", "December")
+_GAP_FX_WORDS = {
+    "ro": {
+        # Romanian "luni" is also "months": not after a number ("peste 2 luni").
+        "days": (r"lunea|(?<!\d )(?<!\d)(?<!dou[ăa] )(?<!trei )(?<!patru )(?<!c[âaîi]teva )luni",
+                 r"mar[țţt]ea|mar[țţt]i", r"miercurea|miercuri|mercuri", r"joia|joi",
+                 r"vinerea|vineri", r"s[âăaîi]mb[ăa]t[ăa]", r"duminic[ăa]"),
+        # (no "mai" for May: it is also "more")
+        "months": ("ianuarie", "februarie", "martie", "aprilie", "", "iunie", "iulie", "",
+                   "septembrie", "octombrie", "noiembrie", "decembrie"),
+        "tomorrow": r"m[âaîi]ine",
+        "today": r"ast[ăa]zi|azi",
+        "tonight": r"disear[ăa]|desear[ăa]|ast[ăa][\s-]+sear[ăa]|[îi]n\s+seara\s+asta",
+        "day_after": r"poim[âaîi]ine",
+        "distance": (r"peste\s+(?:o|un|una|\d+|dou[ăa]|doi|trei|c[âaîi]teva)\s+"
+                     r"(?:s[ăa]pt[ăa]m[âaîi]n\w*|zile|zi)"
+                     r"|[îi]n\s+(?:dou[ăa]|trei|\d+)\s+s[ăa]pt[ăa]m[âaîi]ni"),
+        "next_week": r"s[ăa]pt[ăa]m[âaîi]na\s+(?:viitoare|urm[ăa]toare)",
+        "this_after": r"asta|[ăa]sta|aceasta|acesta",
+        "this_before": r"aceast[ăa]|acest",
+        "next_after": r"viitoare|viitor|urm[ăa]toare|urm[ăa]tor",
+        "next_before": "",
+        "again": r"din\s+nou", "back": r"[îi]napoi",
+        # The go-ahead, at the START of a sentence (after the run-up below): come / drop by / bring
+        # (it) / leave it or the car - and the pronoun forms "poți s-o aduci", "o poți aduce". Not a
+        # bare "poți (să) vii": Romanian chat drops the "?", so it is "can you come?" as often as not
+        # (…538 "Poti sami spui…", …032 "Poti sa trimiti…"). Not "vii" / "aduci" alone ("Tu vina azi",
+        # "Si maine aduci lei"). "Lasă" only with its object: "lasă, mâine vedem" is "never mind".
+        "go": (r"vino|veni[țţt]i|vin[ăa]|treci|trece[țţt]i|adu(?:-?[lo])?|aduce[țţt]i(?:-?[lo])?"
+               r"|l[ăa]sa[țţt]i(?:-?[lo]|\s+ma[șşs]in\w*)|las-?o"
+               r"|l[ăa]s[ăa](?:-?[lo]|\s+(?:ma[șşs]in\w*|chei\w*|automobil\w*))"
+               r"|(?:po[țţt]i|pute[țţt]i)\s+(?:s-?o|s[ăa]\s+o|s-?l|s[ăa]\s+[îi]l)\s+"
+               r"(?:aduci|aduce[țţt]i|l[ăa]si|l[ăa]sa[țţt]i)"
+               r"|(?:o|[îi]l)\s+(?:po[țţt]i|pute[țţt]i)\s+(?:aduce|l[ăa]sa)"
+               r"|programat\w*|e[șşs]ti\s+pe|sunte[țţt]i\s+pe"),
+        # "Ne vedem sâmbătă" (see you), in the first 20 characters, as English "see you" anywhere.
+        "see": r"ne\s+vedem",
+        # "Te aștept mâine", "Sâmbătă la 9 te aștept" - only right beside the day: not "te aștept cu
+        # poze mâine" (I'll wait for your photos) or "vă aștept răspunsul" (your answer).
+        "expect": r"(?:te|v[ăa])\s+a[șşs]tept(?:[ăa]m)?",
+        # Booked: strong, like English "booked you in for" (never a collection).
+        "booked": (r"(?:te|v|l)-?am\s+(?:programat|scris|pus|trecut|notat)(?:-?o)?"
+                   r"|am\s+(?:programat|scris|pus|trecut|notat)-o"
+                   r"|e[șşs]ti\s+(?:programat\w*|pus|scris|trecut|notat)"
+                   r"|sunte[țţt]i\s+(?:programa[țţt]\w*|scri[șşs]i|pu[șşs]i|trecu[țţt]i)"),
+        "booked_start": r"programat\w*|e[șşs]ti\s+pe|sunte[țţt]i\s+pe",
+        # About somebody else ("tell him", "let him come", "he can come"): their row may be under
+        # another name, so the task is posted once, with no reminders (staff_relay).
+        "relay_start": r"s[ăa]\s+vin[ăa]|poate\s+(?:s[ăa]\s+vin[ăa]|veni)",
+        "tell": (r"(?:spune-?i|spunei|spune[țţt]i-?i|zi-?i|zice[țţt]i-?i)"
+                 r"(?:\s+lui\s+\w+|\s+(?:tatei|mamei|tat[ăa]lui))?"),
+        "tell_verb": (r"s[ăa]\s+vin[ăa]|s[ăa]\s+treac[ăa]|s[ăa]\s+(?:o\s+|-?l\s+)?aduc[ăa]"
+                      r"(?:\s+ma[șşs]ina)?|s-?o\s+aduc[ăa]|s-?o\s+las[ăa]|s[ăa]\s+o\s+las[ăa]"
+                      r"|poate\s+(?:s[ăa]\s+vin[ăa]|veni)"),
+        "prep": r"pe|[îi]n|pentru|la",
+        # Never a go-ahead: a "no", closed / full, a finished car to collect or pay for, a part.
+        "neg": r"nu|nici|n-am|n-ai|n-o|n-a",
+        # (+ the waiting list, and the NCT centre's own test - English "for NCT" is not ours either)
+        "closed": (r"[îi]nchis\w*|ocupa[țţt]\w*|plin[ăa]?|list[aăe]\s+de\s+a[șşs]teptare"
+                   r"|(?:la|pentru)\s+(?:nct|itp)|(?:nct|itp)-ul"),
+        "ready": (r"(?:e|este|va\s+fi|o\s+fi|deja|acum|s-?a\s+f[ăa]cut)\s+gata"
+                  r"|gata\s+(?:ma[șşs]in\w*|auto\w*)|ma[șşs]in\w*\s+(?:e\s+|este\s+)?gata"
+                  r"|(?:e|este|a\s+fost|va\s+fi)\s+(?:reparat|terminat|f[ăa]cut)[ăa]?|am\s+terminat"),
+        "collect": (r"ridic\w*|s[ăa]\s+(?:o\s+|-?l\s+|[îi]l\s+)?(?:iei|ia|lua[țţt]i|lua)"
+                    r"|s-?o\s+(?:iei|ia|lua[țţt]i|lua)|s-?l\s+(?:iei|ia)"
+                    r"|dup[ăa]\s+(?:ma[șşs]in\w*|ea|el|chei\w*|auto\w*)"
+                    r"|s[ăa]\s+(?:pl[ăa]te[șşs]ti|pl[ăa]ti[țţt]i|pl[ăa]teasc[ăa]|achi[țţt]i"
+                    r"|achita[țţt]i|achite)|banii?"),
+        "bring": r"adu|aduce[țţt]i|aduci|aduce|aduc[ăa]",
+        "part": r"far(?:ul|urile|uri)?|pies[aăe]\w*",
+        "car": r"ma[șşs]in\w*|automobil\w*",
+        "them": r"adu-?le|aduce[țţt]i-?le|aduci-?le",
+        # ...and the "no"s that are not one: no problem, no worries, don't forget, it doesn't matter
+        "no_problem": (r"nu-?i\s+problem[ăa]|nu\s+e\s+problem[ăa]|nicio\s+problem[ăa]"
+                       r"|nici\s+o\s+problem[ăa]|n-ai\s+grij[ăa]|nu-?[țţt]i\s+face\s+griji"
+                       r"|nu\s+v[ăa]\s+face[țţt]i\s+griji|nu\s+uita\w*|nu-?i\s+nimic|nu-?i\s+bai"
+                       r"|nu\s+conteaz[ăa]|nu\s+e\s+nevoie"),
+        "greet": r"salut|servus|noroc|bun[ăa](?:\s+ziua|\s+diminea[țţt]a|\s+seara)?",
+        # (a leading "Gata," is "OK" - "e gata" / "gata mașina" is "it's ready", blocked below)
+        "filler": (r"da|bine|perfect|sigur|deci|atunci|mersi|mul[țţt]umesc|super|bun|clar|desigur"
+                   r"|excelent|gata"),
+        "please": r"te\s+rog|v[ăa]\s+rog|s[ăa]",
+        "if": r"dac[ăa]|dac-",
+    },
+    "ru": {
+        "days": (r"понедельник\w*", r"вторник\w*", r"сред[ауеы]", r"четверг\w*", r"пятниц\w*",
+                 r"суббот\w*", r"воскресень\w*"),
+        "months": ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                   "сентября", "октября", "ноября", "декабря"),
+        "tomorrow": r"завтра",
+        "today": r"сегодня",
+        "tonight": r"сегодня\s+вечером|вечером\s+сегодня",
+        "day_after": r"послезавтра",
+        "distance": (r"через\s+(?:неделю|недели|две\s+недели|пару\s+дней|несколько\s+дней"
+                     r"|\d+\s*(?:дн\w*|недел\w*))"),
+        "next_week": r"(?:на\s+)?следующей\s+неделе|на\s+будущей\s+неделе",
+        "this_after": "",
+        "this_before": r"эт[уоиа]|этот",
+        "next_after": "",
+        "next_before": r"следующ\w*|будущ\w*",
+        "again": r"снова|опять|ещ[её]\s+раз", "back": r"обратно",
+        "go": (r"приезжай(?:те)?|приходи(?:те)?|привози(?:те)?|привезите|привези|пригоняй(?:те)?"
+               r"|пригоните|подъезжай(?:те)?|подъедьте|заезжай(?:те)?|оставь(?:те)?"),
+        "see": r"увидимся|до\s+встречи|жд[её]м\s+(?:вас|тебя)|жду\s+(?:вас|тебя)",
+        "expect": r"жд[её]м(?:\s+(?:вас|тебя))?|жду(?:\s+(?:вас|тебя))?",
+        "booked": "",
+        "booked_start": "",
+        "relay_start": "",
+        "tell": r"скажи(?:те)?\s+(?:ему|ей|им)",
+        "tell_verb": r"(?:что(?:бы)?\s+)?(?:пусть\s+приед\w*|пусть\s+приезжа\w*|приех\w*|приед\w*)",
+        "prep": r"в|во|на",
+        "neg": r"не|нет|нельзя|перезвон\w*|позвон\w*",
+        "closed": r"закрыт\w*|занят\w*",
+        "ready": r"готов\w*|отремонтирован\w*|сделан[аоы]?",
+        "collect": (r"забир\w*|забер\w*|забрат\w*|за\s+(?:машин\w*|ней|ним|авто\w*|ключ\w*)"
+                    r"|рассчита\w*|оплат\w*"),
+        "bring": r"привез\w*|привоз\w*",
+        "part": r"фар\w*|детал\w*|запчаст\w*",
+        "car": r"машин\w*|авто\w*",
+        "them": "",
+        "no_problem": r"не\s+за\s+что|нет\s+проблем|без\s+проблем|не\s+волнуйтесь",
+        "greet": r"привет|здравствуйте|добрый\s+(?:день|вечер)|доброе\s+утро",
+        "filler": r"да|ок|хорошо|ладно|отлично|конечно|тогда|спасибо|договорились",
+        "please": r"пожалуйста",
+        "if": r"если",
+    },
+}
+# Russian booked forms need the day RIGHT AFTER them: "Записал вас, завтра перезвоню" (I've
+# noted you, I'll call back tomorrow) is no booking.
+_GAP_FX_RU_BOOKED = (r"(?:записал[аи]?|записали)\s+(?:вас|тебя)\s+(?:на|в|во)\s+"
+                     r"|вы\s+записаны\s+(?:на|в|во)\s+|ты\s+записан\w*\s+(?:на|в|во)\s+")
+
+
+def _gap_fx_alt(key: str) -> str:
+    """The enabled languages' words of one kind, as one alternation ("" = none)."""
+    return "|".join(_GAP_FX_WORDS[x][key] for x in GAP_FOREIGN_LANGS if _GAP_FX_WORDS[x].get(key))
+
+
+def _gap_fx_rx(pattern: str):
+    """A whole-word, any-case pattern - one that never matches when there are no words."""
+    return re.compile(r"\b(?:" + pattern + r")\b" if pattern else _GAP_FX_NEVER, re.IGNORECASE)
+
+
+_GAP_FX_DAY_SUBS = [(en, _gap_fx_rx("|".join(_GAP_FX_WORDS[x]["days"][i] for x in GAP_FOREIGN_LANGS)))
+                    for i, en in enumerate(_GAP_FX_EN_DAYS)]
+_GAP_FX_MONTH_SUBS = [(en, re.compile(r"\b(\d{1,2})\.?\s+(?:de\s+)?(?:" + alts + r")\b", re.IGNORECASE))
+                      for en, alts in ((en, "|".join(_GAP_FX_WORDS[x]["months"][i]
+                                                      for x in GAP_FOREIGN_LANGS
+                                                      if _GAP_FX_WORDS[x]["months"][i]))
+                                       for i, en in enumerate(_GAP_FX_EN_MONTHS)) if alts]
+_GAP_FX_EN_DAY = r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+_GAP_FX_TOMORROW_RE = _gap_fx_rx(_gap_fx_alt("tomorrow"))
+_GAP_FX_TODAY_RE = _gap_fx_rx(_gap_fx_alt("today"))
+_GAP_FX_TONIGHT_RE = _gap_fx_rx(_gap_fx_alt("tonight"))
+# The day after tomorrow, "in a week", "in two weeks": English cannot read them either - no claim.
+_GAP_FX_NO_DAY_RE = _gap_fx_rx("|".join(p for p in (_gap_fx_alt("day_after"), _gap_fx_alt("distance")) if p))
+_GAP_FX_NEXT_WEEK_RE = _gap_fx_rx(_gap_fx_alt("next_week"))
+_GAP_FX_AGAIN_RE = _gap_fx_rx(_gap_fx_alt("again"))
+_GAP_FX_BACK_RE = _gap_fx_rx(_gap_fx_alt("back"))
+_GAP_FX_THIS_SUBS = [(re.compile(r"\b" + _GAP_FX_EN_DAY + r"\s+(?:" + _gap_fx_alt("this_after") + r")\b",
+                                 re.IGNORECASE), r"this \1") if _gap_fx_alt("this_after") else None,
+                     (re.compile(r"\b(?:" + _gap_fx_alt("this_before") + r")\s+" + _GAP_FX_EN_DAY + r"\b",
+                                 re.IGNORECASE), r"this \1") if _gap_fx_alt("this_before") else None,
+                     (re.compile(r"\b" + _GAP_FX_EN_DAY + r"\s+(?:" + _gap_fx_alt("next_after") + r")\b",
+                                 re.IGNORECASE), r"next \1") if _gap_fx_alt("next_after") else None,
+                     (re.compile(r"\b(?:" + _gap_fx_alt("next_before") + r")\s+" + _GAP_FX_EN_DAY + r"\b",
+                                 re.IGNORECASE), r"next \1") if _gap_fx_alt("next_before") else None]
+# "săptămâna viitoare, miercuri", "на следующей неделе в среду", "miercuri din săptămâna viitoare":
+# the day goes BESIDE "next week", the only order weekday_asked_for reads (else it is THIS week's).
+_GAP_FX_NEXT_WEEK_ORDER = (
+    (re.compile(r"\bnext week\s*,?\s*(?:(?:on|pe|[îi]n|din|в|во|на)\s+)?" + _GAP_FX_EN_DAY + r"\b",
+                re.IGNORECASE), r"\1 next week"),
+    (re.compile(r"\b" + _GAP_FX_EN_DAY + r"\s*,?\s*(?:(?:din|de|da|on|в|во|на)\s+)?next week\b",
+                re.IGNORECASE), r"\1 next week"))
+# Any foreign day word at all (a day, a month date, tomorrow, today, tonight, next week...).
+_GAP_FX_ANYDAY_RE = _gap_fx_rx("|".join(p for p in (
+    "|".join(_GAP_FX_WORDS[x]["days"][i] for x in GAP_FOREIGN_LANGS for i in range(7)),
+    "|".join(m for x in GAP_FOREIGN_LANGS for m in _GAP_FX_WORDS[x]["months"] if m),
+    _gap_fx_alt("tomorrow"), _gap_fx_alt("today"), _gap_fx_alt("tonight"), _gap_fx_alt("day_after"),
+    _gap_fx_alt("distance"), _gap_fx_alt("next_week")) if p))
+# Saturday in a colleague's words, English or not (_colleague_named_saturday).
+_GAP_FX_SAT_RE = re.compile(r"\bsat(?:urday)?s?\b" + (
+    r"|\b(?:" + "|".join(_GAP_FX_WORDS[x]["days"][5] for x in GAP_FOREIGN_LANGS) + r")\b"
+    if GAP_FOREIGN_LANGS else ""), re.IGNORECASE)
+# A day as the relay / "te aștept" forms want it straight after them.
+_GAP_FX_DAY_ALT = "|".join(p for p in (
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|weds?|thurs?|fri|sat|sun"
+    r"|tomorrow|tmrw|today|tonight|\d{1,2}(?:st|nd|rd|th)?",
+    "|".join(_GAP_FX_WORDS[x]["days"][i] for x in GAP_FOREIGN_LANGS for i in range(7)),
+    _gap_fx_alt("tomorrow"), _gap_fx_alt("today"), _gap_fx_alt("tonight")) if p)
+# The run-up a go-ahead may have, as _GAP_STAFF_RE allows before "Bring over Saturday": a greeting
+# (and a name), then ok / yes / no problem..., then please.
+_GAP_FX_LEAD = (
+    r"^(?:(?:hi|hello|hey" + "".join("|" + _GAP_FX_WORDS[x]["greet"] for x in GAP_FOREIGN_LANGS)
+    + r")(?:\s+\w+)?[\s,.!]*)?"
+    r"(?:(?:ok|okay|yes|sure|so|then|grand|perfect|great|sound|no\s+problem"
+    + "".join("|" + _GAP_FX_WORDS[x]["filler"] + "|" + _GAP_FX_WORDS[x]["no_problem"]
+              for x in GAP_FOREIGN_LANGS) + r")\b[\s,.!]*)*"
+    r"(?:(?:please|just" + "".join("|" + _GAP_FX_WORDS[x]["please"] for x in GAP_FOREIGN_LANGS)
+    + r")\s+)?")
+_GAP_FX_GO_RE = re.compile("|".join(p for p in (
+    _GAP_FX_LEAD + r"(?:" + _gap_fx_alt("go") + r")\b" if _gap_fx_alt("go") else "",
+    r"^(?:[^.!?]{0,20}\s)?(?:" + _gap_fx_alt("see") + r")\b" if _gap_fx_alt("see") else "",
+    r"\b(?:" + _gap_fx_alt("expect") + r")\s+(?:(?:" + _gap_fx_alt("prep") + r")\s+)?(?:"
+    + _GAP_FX_DAY_ALT + r")\b" if _gap_fx_alt("expect") else "",
+    r"\b(?:" + _GAP_FX_DAY_ALT + r")\b[^.!?]{0,25}?\b(?:" + _gap_fx_alt("expect") + r")\W*$"
+    if _gap_fx_alt("expect") else "",
+    r"\b(?:" + _gap_fx_alt("booked") + r")\b" if _gap_fx_alt("booked") else "",
+    r"\b(?:" + _GAP_FX_RU_BOOKED + r")(?:" + _GAP_FX_DAY_ALT + r")\b" if "ru" in GAP_FOREIGN_LANGS else "",
+) if p) or _GAP_FX_NEVER, re.IGNORECASE)
+_GAP_FX_STRONG_RE = re.compile("|".join(p for p in (
+    r"\b(?:" + _gap_fx_alt("booked") + r")\b" if _gap_fx_alt("booked") else "",
+    _GAP_FX_LEAD + r"(?:" + _gap_fx_alt("booked_start") + r")\b" if _gap_fx_alt("booked_start") else "",
+    r"\b(?:" + _GAP_FX_RU_BOOKED + r")(?:" + _GAP_FX_DAY_ALT + r")\b" if "ru" in GAP_FOREIGN_LANGS else "",
+) if p) or _GAP_FX_NEVER, re.IGNORECASE)
+# "Tell him Saturday", "Spunei pe sambata", "Spune-i să vină sâmbătă", "Spune-i că poate veni
+# sâmbătă", "Să vină mâine", "Poate veni sâmbătă": the day comes STRAIGHT after the relay (never
+# "tell him we're closed Saturday", "tell him it'll be ready tomorrow"), and is not the subject of
+# what follows ("Tell him Saturday is the earliest we can do" is an offer).
+_GAP_FX_RELAY_RE = re.compile("|".join(p for p in (
+    _GAP_FX_LEAD + r"(?:tell\s+(?:him|her|them)" + "".join("|" + _GAP_FX_WORDS[x]["tell"]
+                                                            for x in GAP_FOREIGN_LANGS) + r")[\s,:]+"
+    r"(?:(?:c[ăa]|что)\s+)?"
+    r"(?:(?:to\s+(?:come|bring\s+it|drop\s+it|pop)(?:\s+(?:in|over|up|down|by|round|off))?"
+    + "".join("|" + _GAP_FX_WORDS[x]["tell_verb"] for x in GAP_FOREIGN_LANGS) + r")\s+)?"
+    r"(?:(?:at\s+)?\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\s+)?"
+    r"(?:(?:on|for" + "".join("|" + _GAP_FX_WORDS[x]["prep"] for x in GAP_FOREIGN_LANGS) + r")\s+)?"
+    r"(?:(?:this|next|the)\s+)?(?:" + _GAP_FX_DAY_ALT + r")\b"
+    r"(?!\s*(?:is|was|isn'?t|e|este|nu|не)\b)",
+    _GAP_FX_LEAD + r"(?:" + _gap_fx_alt("relay_start") + r")\b" if _gap_fx_alt("relay_start") else "",
+) if p), re.IGNORECASE)
+_GAP_FX_NO_PROBLEM_RE = _gap_fx_rx("|".join(p for p in (r"no\s+problem", _gap_fx_alt("no_problem")) if p))
+_GAP_FX_IF_RE = re.compile(r"^\W*(?:if" + "".join("|" + _GAP_FX_WORDS[x]["if"] for x in GAP_FOREIGN_LANGS)
+                           + r")\b", re.IGNORECASE)
+# A finished car to collect (or pay for): the English words, plus the foreign ones - in the claim
+# sentence, and in its message and the chat's last day (gap_skip_reason), as English does.
+_GAP_FX_READY_RE = _gap_fx_rx(_gap_fx_alt("ready"))
+_GAP_FX_COLLECT_RE = _gap_fx_rx("|".join(p for p in (_gap_fx_alt("ready"), _gap_fx_alt("collect")) if p))
+# ...and _gap_car_still_with_us for a foreign claim: a Romanian "Mașina e gata" is an "is ready".
+_GAP_FX_READY_MSG_RE = re.compile(
+    _GAP_READY_MSG_RE.pattern + ("|" + _GAP_FX_READY_RE.pattern if GAP_FOREIGN_LANGS else ""),
+    re.IGNORECASE)
+_GAP_FX_BLOCK_RE = re.compile(
+    r"\b(?:not|can'?t|cannot|won'?t|don'?t|closed|ready|collect\w*)\b"
+    r"|\b(?:we'?re|we\s+are|is|are|it'?s|fully)\s+(?:full|booked)\b|\bbooked\s+(?:up|out)\b"
+    r"|\bwaiting\s+list\b"
+    r"|\btell\s+(?:him|her|them)\s+no\b|\bpick(?:ing)?\s+(?:it|her|him|them|the\s+car)\s+up\b"
+    r"|\bpick\s?-?up\b"
+    + "".join(r"|\b(?:" + p + r")\b" for p in (_gap_fx_alt("neg"), _gap_fx_alt("closed"),
+                                                 _gap_fx_alt("ready"), _gap_fx_alt("collect")) if p),
+    re.IGNORECASE)
+# "Adu farul mâine" (bring the headlight), "Adu-le mâine" (bring them): a part on its own, as English
+# "bring the headlights" / "bring them" - but not "adu mașina și piesa" (the car is coming).
+_GAP_FX_BRING_RE = _gap_fx_rx(_gap_fx_alt("bring"))
+_GAP_FX_PART_RE = _gap_fx_rx(_gap_fx_alt("part"))
+_GAP_FX_CAR_RE = _gap_fx_rx(_gap_fx_alt("car"))
+_GAP_FX_THEM_RE = _gap_fx_rx(_gap_fx_alt("them"))
+
+
+def _gap_fx_blocked(s: str) -> bool:
+    """A sentence that is never a go-ahead in any language: a "no", closed or full, a finished
+    car to collect or pay for, a part (or "them") brought on its own, an "if" opening."""
+    t = _GAP_FX_NO_PROBLEM_RE.sub(" ", s)
+    return bool(_GAP_FX_BLOCK_RE.search(t) or _GAP_FX_IF_RE.search(t) or _GAP_FX_THEM_RE.search(t)
+                or (_GAP_FX_BRING_RE.search(t) and _GAP_FX_PART_RE.search(t)
+                    and not _GAP_FX_CAR_RE.search(t)))
+
+
+def _gap_fx_english(s: str) -> str:
+    """The sentence with its foreign day words in English, for _gap_date ("Spunei pe sambata" ->
+    "Spunei pe Saturday"), or "" when it names a day English cannot read either (the day after
+    tomorrow, "in a week") - then it is no claim at all. English words are left as they are."""
+    if not GAP_FOREIGN_LANGS:
+        return s
+    if _GAP_FX_NO_DAY_RE.search(s):
+        return ""
+    t = _GAP_FX_TONIGHT_RE.sub(" tonight ", s)
+    t = _GAP_FX_NEXT_WEEK_RE.sub(" next week ", t)
+    for en, rx in _GAP_FX_MONTH_SUBS:
+        t = rx.sub(r"\1 " + en, t)
+    for en, rx in _GAP_FX_DAY_SUBS:
+        t = rx.sub(" " + en + " ", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    for sub in _GAP_FX_THIS_SUBS:
+        if sub:
+            t = sub[0].sub(sub[1], t)
+    for rx, rep in _GAP_FX_NEXT_WEEK_ORDER:
+        t = rx.sub(rep, t)
+    t = _GAP_FX_TOMORROW_RE.sub(" tomorrow ", t)
+    t = _GAP_FX_TODAY_RE.sub(" today ", t)
+    t = _GAP_FX_AGAIN_RE.sub(" again ", t)
+    t = _GAP_FX_BACK_RE.sub(" back ", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
+def _gap_staff_foreign(s: str) -> tuple:
+    """(day sentence, relay, strong) for a colleague's go-ahead in Romanian (Russian too with
+    GAP_FOREIGN_LANGS=ro,ru) or an English "Tell him Saturday" - ("", False, False) when it is
+    not one. The day sentence is `s` with its day words in English, for _gap_date. `relay`: it is
+    about somebody else ("tell him", "let him come") - their diary row may be under another name."""
+    if not _GAP_FX_ON or "?" in s or _gap_fx_blocked(s):
+        return "", False, False
+    relay = bool(_GAP_FX_RELAY_RE.search(s))
+    if not (relay or _GAP_FX_GO_RE.search(s)):
+        return "", False, False
+    return _gap_fx_english(s), relay, bool(_GAP_FX_STRONG_RE.search(s))
+
+
+def _gap_fx_chat_has_customer(user: str) -> bool:
+    """Has a customer ever written in this chat? Colleagues also write to each other in Romanian
+    on numbers no customer uses (garage …032: 40 colleague messages, not one customer's); a
+    go-ahead read from foreign words is a task only in a customer's chat."""
+    try:
+        with closing(db()) as conn:
+            return conn.execute("SELECT 1 FROM messages WHERE wa_user = ? AND role = 'user' LIMIT 1",
+                                (user,)).fetchone() is not None
+    except Exception:
+        return True
+
+
+def _gap_staff_src(claim: dict, source: str, with_us: bool, with_us_fx: bool = False) -> str:
+    """The task's source for a claim: a colleague's "Pop in tomorrow" while their car may still be
+    here to collect is posted once, without reminders (staff_withus) - "bring it BACK in" / "drop it
+    in AGAIN" is a comeback whatever the diary says; a relay about somebody else ("tell him
+    Saturday") is posted once too (staff_relay). English claims: exactly as before."""
+    if "day_sentence" not in claim:
+        return ("staff_withus" if with_us and not _GAP_BACK_AGAIN_RE.search(claim["sentence"])
+                else source)
+    if source != "staff":
+        return source
+    if claim.get("relay"):
+        return "staff_relay"
+    return ("staff_withus" if with_us_fx and not _GAP_BACK_AGAIN_RE.search(claim["day_sentence"])
+            else source)
+
+
+# A day named in a RULE, not offered: "Saturday is for services only", "we're open Saturday 9-2",
+# "Monday is a bank holiday" (staff_named_days only - a "yes" to that is no booking for that day).
+_GAP_FX_RULE_TALK_RE = re.compile(
+    r"\bservices?\s+only\b|\bonly\s+(?:for\s+)?(?:a\s+)?(?:general\s+)?services?\b"
+    # round 2 (review F1): "Saturday we only do services", "we just take services Saturday"
+    r"|\b(?:only|just)\s+(?:do(?:ing)?|take|taking|book(?:ing)?|have)\s+(?:(?:a|the)\s+)?(?:general\s+)?services?\b"
+    r"|\b(?:doar|numai)\s+(?:pentru\s+)?(?:revizi|servic|schimb\w*\s+de\s+ulei)\w*"
+    r"|\bopen(?:ing)?\b|\bhours\b|\bdeschi[sș]\w*|\bbank\s+holiday\b|\bs[ăa]rb[ăa]toare\b",
+    re.IGNORECASE)
+
+
+# Money brought ("Si maine aduci lei" - bring the money tomorrow): no visit (round 2, review H8 - the headlights
+# twin's exclusion; staff_named_days only).
+_STAFF_DAYS_MONEY_RE = re.compile(r"\b(?:banii|bani|lei)\b", re.IGNORECASE)
+
+
+def staff_says_saturday(text: str) -> bool:
+    """A colleague's words name a Saturday: English "sat"/"Saturday", or Romanian "sâmbătă" /
+    "sambata" / "simbata" (Russian "суббота" with GAP_FOREIGN_LANGS=ro,ru)."""
+    return bool(_GAP_FX_SAT_RE.search(text or ""))
+
+
+def staff_named_days(text: str, today=None) -> list:
+    """THE shared reader of the days a colleague's message names: sorted "YYYY-MM-DD" strings.
+    `today` is the day the colleague WROTE it ("tomorrow" said yesterday is today).
+
+    Each sentence pins at most ONE day, read by the same _gap_date as the diary-gap check -
+    English as it is, Romanian (Russian with GAP_FOREIGN_LANGS=ro,ru) with its day words in English
+    first. A sentence that names two days ("Monday or Tuesday?"), a "no" / closed / full ("Sâmbătă e
+    închis", "fully booked Friday"), a finished car to collect ("Mașina va fi gata pe joi", "ready
+    Friday"), a part on its own, the NCT centre's own test, a rule or opening hours ("Saturday is
+    for services only", "we're open Saturday 9-2", "Monday is a bank holiday"), the day after
+    tomorrow or "in a week" gives nothing. Questions DO count ("Can you come Saturday 24th?" answered "yes" agreed it).
+    Used by the staff-hold "yes" booker (fix3 ISSUE 1C): it books only a day in this list."""
+    today = today or now_local().date()
+    out = set()
+    for raw in re.split(r"(?<=[.!?])\s+|\n+", _plain_apostrophes(text or "")):
+        # (runs of spaces collapsed: weekday_asked_for is slow on thousands of them in a row)
+        s = re.sub(r"\s+", " ", raw).strip()
+        if not s:
+            continue
+        day_s = _gap_fx_english(s) if (GAP_FOREIGN_LANGS and _GAP_FX_ANYDAY_RE.search(s)) else s
+        if (not day_s or _gap_fx_blocked(s) or _GAP_STAFF_DECLINE_RE.search(day_s)
+                or _GAP_NOT_OURS_RE.search(day_s) or _GAP_FX_RULE_TALK_RE.search(s)
+                or _GAP_COLLECTING_RE.search(_GAP_READY_TEMPLATE_RE.sub(" ", day_s))
+                # round 2 (review H8, as the headlights twin): a part / "them" brought on its own, money
+                or _GAP_PART_ONLY_RE.search(s) or _STAFF_DAYS_MONEY_RE.search(s)):
+            continue
+        d, _how = _gap_date(day_s, today)
+        if d:
+            out.add(d)
+    return sorted(out)
+
+
 def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> list:
     """Every sentence in which `source` ("customer", "bot" or "staff") says a car
     is coming in on a day: [{date, sentence, how, strong}]. Pure - the diary is
@@ -16487,7 +18933,14 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
     for raw in re.split(r"(?<=[.!?])\s+|\n+", text):
         s = raw.strip()
         before, prev = prev, (s or prev)
-        if not s or not trigger.search(s) or _GAP_NOT_OURS_RE.search(s):
+        day_s, fx = s, None   # fx: a colleague's go-ahead read by the foreign block (13 Oct 2026)
+        if s and source == "staff" and _GAP_FX_ON and not trigger.search(s):
+            # "Spunei pe sambata" (…124), "Ne vedem Simbata la 9", "Tell him Saturday"
+            day_s, relay, fx_strong = _gap_staff_foreign(s)
+            if not day_s or _GAP_NOT_OURS_RE.search(day_s):
+                continue
+            fx = {"relay": relay, "strong": fx_strong}
+        elif not s or not trigger.search(s) or _GAP_NOT_OURS_RE.search(s):
             continue
         if source == "customer" and _GAP_PAST_VISIT_RE.search(s):
             continue
@@ -16497,7 +18950,14 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
             continue
         if source == "bot" and _GAP_OFFER_RE.search(s):
             continue   # an offer, not a confirmation
-        d, how = _gap_date(s, today)
+        d, how = _gap_date(day_s, today)
+        if (not d and fx is None and source == "staff" and GAP_FOREIGN_LANGS
+                and _GAP_FX_ANYDAY_RE.search(s) and not _gap_fx_blocked(s)):
+            # An English go-ahead with the day in Romanian: "Ok bring Simbata", "Come miine"
+            day_s = _gap_fx_english(s)
+            if day_s and not _GAP_NOT_OURS_RE.search(day_s):
+                d, how = _gap_date(day_s, today)
+                fx = {"relay": False, "strong": False}
         if not d and source == "bot" and before and _GAP_STRONG_RE.search(s):
             c = _gap_joined_claim(before, s, today)
             if c:
@@ -16505,14 +18965,19 @@ def diary_gap_claims(text: str, source: str, today=None, context: str = "") -> l
             continue
         if not d:
             continue
-        strong = bool(_GAP_STRONG_RE.search(s))
+        strong = bool(_GAP_STRONG_RE.search(s) or (fx and fx["strong"]))
         if source == "bot" and not (strong or how in ("date", "ordinal")
                                     or _GAP_TIME_RE.search(s)
                                     or _GAP_BOT_IMPERATIVE_RE.search(s)
                                     or _GAP_CUSTOMER_RE.search(_plain_apostrophes(context or ""))):
             continue   # a bare "see you tomorrow!" sign-off to a chat about something else
         if all(d != c["date"] for c in out):
-            out.append({"date": d, "sentence": s[:160], "how": how, "strong": strong})
+            claim = {"date": d, "sentence": s[:160], "how": how, "strong": strong}
+            if fx is not None:
+                # The colleague's own words stay the claim (the task quotes them); the English-day
+                # reading is what _gap_later_weekday and the comeback test read.
+                claim.update(day_sentence=day_s[:160], relay=fx["relay"])
+            out.append(claim)
     # Only for a day no single sentence claimed: those keep deciding everything
     # they decided before, the read-back cut included.
     for c in joined:
@@ -16535,7 +19000,7 @@ def _gap_later_weekday(claim: dict, messages: list, today) -> dict:
              4: "fri(?:day)?", 5: "saturday", 6: "sunday"}[d.weekday()]
     this_week = re.compile(r"\b(?:this|coming)\s+(?:" + names + r")\b|\b(?:" + names
                            + r")\s+this\s+week\b", re.IGNORECASE)
-    own = _plain_apostrophes(claim.get("sentence") or "")
+    own = _plain_apostrophes(claim.get("day_sentence") or claim.get("sentence") or "")
     if (this_week.search(own) or _GAP_TOMORROW_RE.search(own) or _GAP_TODAY_RE.search(own)
             or _GAP_TONIGHT_RE.search(own)):
         return claim   # the claim itself pins this week ("bring it this Wednesday so")
@@ -16595,6 +19060,10 @@ def gap_skip_reason(claim: dict, context: str, diary_dates: list, today, source:
         return ""   # "I'm booked in for the 29th" is never a collection
     if _GAP_COLLECT_RE.search(_GAP_READY_TEMPLATE_RE.sub(" ", claim["sentence"] + "\n" + ctx)):
         return "collecting, or a courtesy car"
+    # A colleague's foreign go-ahead (13 Oct 2026): "Mașina e gata.\nVino mâine" is a collection too
+    # - its ready / collect words in the claim's message and the chat's last day, as English.
+    if "day_sentence" in claim and _GAP_FX_COLLECT_RE.search(claim["sentence"] + "\n" + ctx):
+        return "collecting, or a courtesy car"
     # A colleague saying "Pop in tomorrow" knows better than any diary rule; when
     # the car may still be here, the caller posts it once as "may be a
     # collection" (_gap_car_still_with_us) - never silence. "Bring it back
@@ -16606,10 +19075,12 @@ def gap_skip_reason(claim: dict, context: str, diary_dates: list, today, source:
     return ""
 
 
-def _gap_car_still_with_us(user: str, diary_dates: list, today) -> bool:
+def _gap_car_still_with_us(user: str, diary_dates: list, today, foreign: bool = False) -> bool:
     """For a colleague's "Pop in tomorrow": is the car still here? Yes when it was
     in within the last 3 days and no "is ready" / invoice has gone out since, or
-    when one went out in the last 3 days (finished, waiting to be collected)."""
+    when one went out in the last 3 days (finished, waiting to be collected).
+    `foreign`: for a colleague's Romanian go-ahead, a Romanian "Mașina e gata" is
+    an "is ready" too."""
     past = [x for x in diary_dates if today - timedelta(days=14) <= x <= today]
     if not past:
         return False
@@ -16619,7 +19090,8 @@ def _gap_car_still_with_us(user: str, diary_dates: list, today) -> bool:
             "SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
             " AND COALESCE(ts, 0) >= ? ORDER BY id DESC LIMIT 300",
             (user, time.time() - 15 * 86400)).fetchall()
-    ready = [ts or 0 for content, ts in rows if _GAP_READY_MSG_RE.search(content or "")]
+    ready_re = _GAP_FX_READY_MSG_RE if foreign else _GAP_READY_MSG_RE
+    ready = [ts or 0 for content, ts in rows if ready_re.search(content or "")]
     if ready and max(ready) >= time.time() - 3 * 86400:
         return True
     return (today - latest).days <= 3 and not any(_gap_local_date(t) >= latest for t in ready)
@@ -16739,7 +19211,8 @@ def raise_diary_gap(user: str, claim: dict, source: str, claim_ts: float = 0) ->
                 # Better evidence for a task not yet posted than a read-back the
                 # bot took out (or a "may be a collection" guess): the customer or
                 # a colleague said it, or it went out.
-                weaker = ("bot_cut", "staff_withus") if source != "bot" else ("bot_cut",)
+                weaker = (("bot_cut", "staff_withus", "staff_relay") if source != "bot"
+                          else ("bot_cut",))
                 conn.execute(
                     "UPDATE tasks SET source = ?, sentence = ? WHERE kind = ? AND wa_user = ?"
                     " AND date = ? AND COALESCE(closed_ts, 0) = 0 AND source IN ("
@@ -16766,14 +19239,21 @@ def diary_gap_from_text(user: str, text: str, source: str) -> None:
         context = "\n".join(t for t, _ts in reversed(msgs))
         dates = _gap_diary_dates(user)
         with_us = source == "staff" and _gap_car_still_with_us(user, dates, today)
+        with_us_fx = None
         for c in claims:
             c = _gap_later_weekday(c, msgs, today)
             if gap_skip_reason(c, context, dates, today, source):
                 continue
+            if "day_sentence" in c:
+                # A colleague's foreign go-ahead / "tell him" (13 Oct 2026): only in a chat a
+                # customer has written in; their Romanian "is ready" counts as one too.
+                if not _gap_fx_chat_has_customer(user):
+                    continue
+                if with_us_fx is None:
+                    with_us_fx = _gap_car_still_with_us(user, dates, today, foreign=True)
             # A colleague's "Pop in tomorrow" while the car may still be here to
-            # collect: posted once, without reminders.
-            src = ("staff_withus" if with_us and not _GAP_BACK_AGAIN_RE.search(c["sentence"])
-                   else source)
+            # collect: posted once, without reminders (and so is "tell him Saturday").
+            src = _gap_staff_src(c, source, with_us, bool(with_us_fx))
             raise_diary_gap(user, c, src, claim_ts=said)
     except Exception:
         log.exception("Diary-gap check failed for %s (%s)", user, source)
@@ -16912,6 +19392,9 @@ def _task_text(user: str, day: str, source: str, sentence: str, created_ts: floa
            "staff": "A colleague told them",
            "staff_withus": "A colleague told them (their car may still be with you to collect "
                            "- if that's it, just press Done)",
+           "staff_relay": "A colleague asked them to pass this on to someone else (the diary row "
+                          "may be under that person's name, phone or reg - this task can't see it, "
+                          "so it won't remind you: press Done once it's in)",
            "bot_cut": "The bot's reply said this, but it was taken out before sending because "
                       "the diary doesn't have it - check the chat, they may think they're "
                       "booked"}.get(source, "The chat says")
@@ -16927,8 +19410,15 @@ def _task_text(user: str, day: str, source: str, sentence: str, created_ts: floa
             moved = "\nThey have been booked in for another day since - if they moved, just press Done."
     except Exception:
         pass
+    shown = f"“{sentence}”"
+    if (source in ("staff", "staff_withus", "staff_relay") and GAP_FOREIGN_LANGS
+            and _GAP_FX_ANYDAY_RE.search(sentence or "")):
+        # A colleague's Romanian: the day words in English beside it (13 Oct 2026)
+        en = _gap_fx_english(sentence or "")
+        if en and en != sentence:
+            shown += f" [{en}]"
     text = (f"{headline}\n{customer_label(user)}\n"
-            f"{who}: “{sentence}”\n"
+            f"{who}: {shown}\n"
             f"The diary has nothing for them on {_task_day(day)}.{other}{moved}\n")
     if since:
         text += (f"\n✅ Since then: “{since[:200]}” - so probably nothing to do. "
@@ -17229,7 +19719,7 @@ def tick_tasks() -> None:
             # Reminders: not out of hours, not for a "may be a collection" guess,
             # not when they have been booked for a nearby day since, and not when
             # a newer claim for a nearby day carries its own (one ladder per customer).
-            if (not open_hours or source == "staff_withus"
+            if (not open_hours or source in ("staff_withus", "staff_relay")
                     or _task_booked_nearby(user, day, created or 0, today)
                     or _task_newer_nearby(tid, user, day, created or 0)):
                 continue
@@ -19711,14 +22201,22 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
             msgs = msgs[:6]
             context = "\n".join(t for t, _ts in reversed(msgs))
             with_us = bool(who) and s == "staff" and _gap_car_still_with_us(who, days_held, today)
+            with_us_fx = (bool(who) and s == "staff"
+                          and _gap_car_still_with_us(who, days_held, today, foreign=True))
             for c in diary_gap_claims(words, s, today,
                                       context=answering if s == "bot" else ""):
                 c = _gap_later_weekday(c, msgs, today)
                 why = gap_skip_reason(c, context + ("\n" + words if s == "bot" else ""),
                                       days_held, today, s)
+                if not why and "day_sentence" in c and who and not _gap_fx_chat_has_customer(who):
+                    why = "no customer has written in this chat (a colleague's foreign words)"
                 item = dict(c, source=s, would_raise_task=not why, skip_reason=why)
-                if not why and with_us and not _GAP_BACK_AGAIN_RE.search(c["sentence"]):
+                src = _gap_staff_src(c, s, with_us, with_us_fx)
+                if not why and src == "staff_withus":
                     item["posted_as"] = "once, no reminders: their car may still be here to collect"
+                elif not why and src == "staff_relay":
+                    item["posted_as"] = ("once, no reminders: passed on to someone else - the "
+                                         "row may be under their name")
                 if s == "bot" and not why:
                     out, kept = _gap_would_cut(words, c["sentence"], answering, False)
                     item["reply_as_sent"] = out
@@ -19727,6 +22225,7 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         return {"today": today.isoformat(), "words": words[:300],
                 "customer_diary_days": [x.isoformat() for x in sorted(days_held)],
                 "results": results,
+                "foreign_langs": list(GAP_FOREIGN_LANGS) if _GAP_FX_ON else "off",
                 "rule": "a task is raised when somebody says a car is coming on a day and "
                         "the diary has nothing for that customer within a day of it (a bare "
                         "weekday: nothing on that weekday in the next 3 weeks); collections, "
@@ -19958,7 +22457,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         old = _CLAIMS_A_PERSON_RE.search(reply) or _HOUSE_HANDOVER_RE.search(reply)
         more = _CLAIMS_A_PERSON_MORE_RE.search(reply)
         counts = new_phrases_count_after(cust)
+        held = _ASSIST_BOOKING_ASK_RE.search(reply)
         return {"reply": reply[:300], "customer": cust[:200],
+                # fix3 ISSUE 1 (read-only; new code only): in a chat a colleague holds, would the assist hold
+                # this reply back as a booking question / read-back (1B), and is the customer's message the
+                # short "yes" that lets a colleague's day go into the diary (1C)?
+                "held_chat": {"booking_ask": held.group(0) if held else "",
+                              "short_yes": short_agreement(cust),
+                              "switches": {"ASSIST_LABEL_STAFF": ASSIST_LABEL_STAFF,
+                                           "ASSIST_NO_BOOKING_ASK": ASSIST_NO_BOOKING_ASK,
+                                           "ASSIST_STAFF_DAY_BOOK": ASSIST_STAFF_DAY_BOOK,
+                                           # fix3 round 3d (review T-F1): the new-code probe
+                                           "DOUBLE_BOOKING_ALERT": DOUBLE_BOOKING_ALERT}},
                 "old_phrase": old.group(0) if old else "",
                 "new_phrase": more.group(0) if more else "",
                 "customer_message_lets_new_phrases_count": counts,
@@ -20951,15 +23461,31 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
             check_escalation(sender)
         except Exception:
             log.exception("Escalation check failed for %s", sender)
+        # fix3 1C (owner, 30 Sep (b)): their short "yes" to a day the colleague named goes into the diary
+        # (only that day, the car from the last 24 h) - then the booked line is true, the assist stays out
+        # and so does the watcher thread below. Not written: today's flow.
+        try:
+            if staff_day_yes_book(sender, text):
+                return
+        except Exception:
+            log.exception("Staff-hold yes booking failed for %s", sender)
+        # The customer may be the one sealing a staff-offered booking ("yes book me
+        # for the 21st") — watch for that here too, not just on the staff side.
+        # fix3 round 2 (review INT-4, garage …946 "Book it. Please"): FIRST, and waited for - so a row it writes
+        # is in the diary before the assist's alert says whether it is ("NOT in the diary - add it first" was
+        # false when this watcher, a thread started after the assist, then wrote that very row).
+        if BOOKINGISH_RE.search(text):
+            try:
+                # round 3c (VERIFY_FINAL M1): "told" - nothing was written although they asked to be booked in, and
+                # staff got the precise alert / task for this very message: the assist stays out (as after 1C's alert)
+                if watch_staff_booking(sender, True) == "told":
+                    return
+            except Exception:
+                log.exception("Customer-side staff booking watch failed for %s", sender)
         try:
             _maybe_courtesy_close(sender)
         except Exception:
             log.exception("Courtesy close failed for %s", sender)
-        # The customer may be the one sealing a staff-offered booking ("yes book me
-        # for the 21st") — watch for that here too, not just on the staff side.
-        if BOOKINGISH_RE.search(text):
-            threading.Thread(target=watch_staff_booking, args=(sender, True),
-                             daemon=True).start()
         return
     if not is_owner:  # remember the customer (alerting about new ones is off by default)
         try:
@@ -21426,7 +23952,8 @@ async def retell_function(request: Request):
             # never "closed" (12 Oct 2026). A Sunday or a bank holiday keeps its words.
             if hours_on(d):
                 _o = bookings_open_from()
-                _until = first_bookable_day(_o).strftime("%A %d %B") if _o else "then"
+                # [fix3 ISSUE 3] the first day with room for THIS job
+                _until = first_bookable_day(_o, fields["need"]).strftime("%A %d %B") if _o else "then"
                 return {"booked": False, "reason": "that day is fully booked - the garage is "
                         "open as normal, just full: never say we are closed that day. Say "
                         f"we're fully booked until {_until} and offer the earliest day from "
@@ -21440,7 +23967,7 @@ async def retell_function(request: Request):
         need = fields["need"]
         r = day_full_reason(iso, need)
         if r == "hard" and services_only_window(d) and d.weekday() != 5:
-            _o = first_bookable_day(all_jobs_open_from()).strftime("%A %d %B")
+            _o = first_bookable_day(all_jobs_open_from(), need).strftime("%A %d %B")
             return {"booked": False, "reason": f"before {_o} we take general services only - for any other "
                     f"job the earliest day is {_o}: say we're fully booked for other work until then and offer "
                     "that day. Never say we are closed and never say 'hard job'"}
