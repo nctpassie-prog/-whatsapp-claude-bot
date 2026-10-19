@@ -81,6 +81,10 @@ GAP_REPORT_WEEKDAY = int(os.environ.get("GAP_REPORT_WEEKDAY", "0"))  # Monday
 GAP_REPORT_HOUR = int(os.environ.get("GAP_REPORT_HOUR", "9"))        # 9am Irish time
 # Don't accept bookings before this date (YYYY-MM-DD). Blank = no restriction.
 BOOKINGS_FROM = os.environ.get("BOOKINGS_FROM", "2026-08-24").strip()
+# Owner, 19 Oct 2026: "only service bookings do this week all the rest from 27 october" (2 staff on holiday).
+# BOOKINGS_FROM_SERVICES - a date BEFORE BOOKINGS_FROM: from that day the bot books GENERAL SERVICES only (the
+# Saturday whitelist reader), every other job still waits for BOOKINGS_FROM. Unset (or not before it) = as before.
+BOOKINGS_FROM_SERVICES = os.environ.get("BOOKINGS_FROM_SERVICES", "").strip()
 # SAFETY LOCK: only answer messages that arrive on these WhatsApp numbers
 # (comma-separated phone_number_ids). Anything arriving on any other number —
 # e.g. the owner's private line — is ignored completely. Blank = allow all.
@@ -1230,6 +1234,8 @@ def offer_freed_slot(freed_date: str, skip_phone: str = "") -> None:
             return  # same-day swaps are the team's call, not the bot's
         if before_open_date(freed_date):
             return  # before BOOKINGS_FROM: the before-open gate would refuse their YES (12 Oct 2026)
+        if services_only_window(freed_date):
+            return  # 19 Oct 2026: a services-only day - the team offers those, not the waiting list
         if not (9 <= now_local().hour < 20):
             return  # never text a waiting customer at night
         skip = "".join(ch for ch in str(skip_phone) if ch.isdigit())[-9:]
@@ -4954,6 +4960,9 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     cap = day_capacity(d)
     if n >= cap:
         return "capacity"
+    # 19 Oct 2026: before BOOKINGS_FROM, from BOOKINGS_FROM_SERVICES, general services only (as a Saturday).
+    if services_only_window(d):
+        return "hard" if (need and not saturday_service_only(need)) else ""
     # Saturday is general services only - a long stay too: it still takes one of
     # the four places, and it is not a service.
     if need and d.weekday() == 5 and not saturday_service_only(need):
@@ -5137,8 +5146,8 @@ FULL_DAY_MSG = {
           "Spuneți-mi o altă zi potrivită și rezolv eu.",
 }
 
-def bookings_open_from() -> "datetime.date | None":
-    """First date we will accept bookings for (BOOKINGS_FROM), or None for no limit."""
+def all_jobs_open_from() -> "datetime.date | None":
+    """First date we take EVERY kind of job (BOOKINGS_FROM), or None for no limit."""
     if not BOOKINGS_FROM:
         return None
     try:
@@ -5146,6 +5155,52 @@ def bookings_open_from() -> "datetime.date | None":
     except Exception:
         log.warning("BOOKINGS_FROM is not a valid YYYY-MM-DD date: %s", BOOKINGS_FROM)
         return None
+
+def services_open_from() -> "datetime.date | None":
+    """BOOKINGS_FROM_SERVICES as a date when it is BEFORE all_jobs_open_from() - from then until
+    BOOKINGS_FROM only general services are booked (owner, 19 Oct 2026). None otherwise."""
+    if not BOOKINGS_FROM_SERVICES:
+        return None
+    try:
+        so = datetime.strptime(BOOKINGS_FROM_SERVICES, "%Y-%m-%d").date()
+    except Exception:
+        log.warning("BOOKINGS_FROM_SERVICES is not a valid YYYY-MM-DD date: %s", BOOKINGS_FROM_SERVICES)
+        return None
+    full = all_jobs_open_from()
+    return so if full and so < full else None
+
+def bookings_open_from() -> "datetime.date | None":
+    """First date we will accept ANY booking for: BOOKINGS_FROM_SERVICES while the services-only
+    window is on, else BOOKINGS_FROM (or None for no limit)."""
+    return services_open_from() or all_jobs_open_from()
+
+def services_only_window(d) -> bool:
+    """True for a day from BOOKINGS_FROM_SERVICES up to (not incl.) BOOKINGS_FROM: general services only."""
+    try:
+        if isinstance(d, str):
+            d = datetime.strptime(d.strip()[:10], "%Y-%m-%d").date()
+        so, full = services_open_from(), all_jobs_open_from()
+        return bool(so and full and so <= d < full)
+    except Exception:
+        return False
+
+def services_week_note(today, voice: bool = False) -> str:
+    """The chat / voice note while the services-only window is ahead or on: "" otherwise."""
+    so, full = services_open_from(), all_jobs_open_from()
+    if not (so and full and full > today):
+        return ""
+    o = first_bookable_day(full).strftime("%A %d %B")
+    if voice:
+        return (f" GENERAL SERVICES ONLY BEFORE {o}: days before {o} that are in open_days have "
+                "services_only=true - book ONLY a general service (with the free pre-NCT check at most) "
+                f"on them. For any other job say: the earliest day I can book you in for that is {o} - we're "
+                "fully booked for other work until then. Never say we are closed.")
+    return ("\n\nIMPORTANT: until " + full.strftime("%A %d %B") + " we take GENERAL SERVICES ONLY (a service, "
+            "with the free pre-NCT check at most) - the days before it below say GENERAL SERVICES ONLY. For "
+            "ANY other job (repairs, NCT work, diagnostics, brakes, tyres...) say plainly: \"The earliest day I "
+            f"can book you in for that is {o} - we're fully booked for other work until then.\" Never say we "
+            "are closed, never give another reason, and never offer one of those days for a job that is not a "
+            "general service.")
 
 def before_open_date(date_str: str) -> bool:
     """True if this booking date is earlier than the day we start taking bookings."""
@@ -5297,6 +5352,9 @@ def availability_block() -> str:
         elif d.weekday() == 5:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) — GENERAL "
                          "SERVICES ONLY (Saturday)")
+        elif services_only_window(d):
+            lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) — GENERAL SERVICES ONLY "
+                         f"(any other job: from {first_bookable_day(all_jobs_open_from()):%a %d %b})")
         elif other_left == 0:
             lines.append(f"{d.strftime('%a %d %b')}: {left} slot(s) left — GENERAL "
                          "SERVICES ONLY (no place left for any other job)")
@@ -5320,6 +5378,7 @@ def availability_block() -> str:
                         "before that date.")
         # ...and the days before are fully booked, not closed (12 Oct 2026).
         opening_note += fully_booked_note(today)
+    opening_note += services_week_note(today)    # 19 Oct 2026: services-only days before BOOKINGS_FROM
     return (today_line + opening_note +
         "\n\nBOOKING AVAILABILITY — capacity is 10 jobs Mon-Fri. ANY job can be booked on "
         "ANY open day in this list, up to 4 weeks ahead, within TWO LIMITS. (1) "
@@ -21256,17 +21315,22 @@ def _voice_availability() -> str:
         if left == 0:
             continue
         # 6 Oct 2026: 4 places kept for general services (see SERVICE_SPACES_PER_DAY).
-        other_left = 0 if d.weekday() == 5 else min(
+        _svc_only = d.weekday() == 5 or services_only_window(d)   # 19 Oct 2026: the services-only days too
+        other_left = 0 if _svc_only else min(
             left, max(0, cap - max(0, SERVICE_SPACES_PER_DAY) - other.get(iso, 0)))
-        hard_left = 0 if (d.weekday() == 5 or left < HARD_NEEDS_FREE_SLOTS) else min(
+        hard_left = 0 if (_svc_only or left < HARD_NEEDS_FREE_SLOTS) else min(
             other_left, max(0, HARD_JOBS_PER_DAY - hard.get(iso, 0)))
-        out.append({"date": iso, "day": d.strftime("%A"),
-                    # (kept as it was: the Retell dashboard prompt may read it for a service)
-                    "slots_for_services_nct_brakes": 0 if d.weekday() == 5 else left,
-                    "slots_for_general_service": left,
-                    "slots_for_other_jobs": other_left,
-                    "slots_for_diagnostics": hard_left,
-                    "saturday_services_only": d.weekday() == 5})
+        _entry = {"date": iso, "day": d.strftime("%A"),
+                  # (kept as it was: the Retell dashboard prompt may read it for a service)
+                  # (Saturday only: the dashboard prompt may read it for a service - review 19 Oct)
+                  "slots_for_services_nct_brakes": 0 if d.weekday() == 5 else left,
+                  "slots_for_general_service": left,
+                  "slots_for_other_jobs": other_left,
+                  "slots_for_diagnostics": hard_left,
+                  "saturday_services_only": d.weekday() == 5}
+        if services_only_window(d):
+            _entry["services_only"] = True
+        out.append(_entry)
     return out
 
 @app.post("/retell/fn")
@@ -21320,7 +21384,8 @@ async def retell_function(request: Request):
                          "ONLY offer days from open_days - if the caller wants a "
                          "later date, take a message.")
                          # Fully booked, not closed, before BOOKINGS_FROM (12 Oct 2026).
-                         + fully_booked_note(today, voice=True)}
+                         + fully_booked_note(today, voice=True)
+                         + services_week_note(today, voice=True)}
 
     if fn == "book_appointment":
         fields = {"name": (args.get("name") or "").strip(),
@@ -21374,6 +21439,11 @@ async def retell_function(request: Request):
             return {"booked": False, "reason": "we are closed that day — pick from check_availability"}
         need = fields["need"]
         r = day_full_reason(iso, need)
+        if r == "hard" and services_only_window(d) and d.weekday() != 5:
+            _o = first_bookable_day(all_jobs_open_from()).strftime("%A %d %B")
+            return {"booked": False, "reason": f"before {_o} we take general services only - for any other "
+                    f"job the earliest day is {_o}: say we're fully booked for other work until then and offer "
+                    "that day. Never say we are closed and never say 'hard job'"}
         if r == "hard" and d.weekday() == 5:
             return {"booked": False, "reason": "Saturdays take general services only - no repairs, NCT work, checks or diagnostics. Offer the nearest weekday from check_availability"}
         if r == "hard":
