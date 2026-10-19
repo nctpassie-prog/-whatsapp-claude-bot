@@ -3643,7 +3643,11 @@ def db() -> sqlite3.Connection:
                 "ask_ts REAL DEFAULT 0", "chain_ts REAL DEFAULT 0",
                 # [R2 fix, C1] when a repeat was last folded into this alert (F3): the chase
                 # reads "did the bot really answer?" from there
-                "fold_ts REAL DEFAULT 0"):
+                "fold_ts REAL DEFAULT 0",
+                # [Debounce, 13 Oct] when THIS alert's first Telegram post went out (the post waits until
+                # the customer is quiet): the 30-min repost, the 2-h owner ping and the chase count from it
+                # (alert_clock_ts); 0 = posted at once, as before
+                "posted_ts REAL DEFAULT 0"):
         try:
             conn.execute(f"ALTER TABLE alerts ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
@@ -3659,6 +3663,29 @@ def db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE claim_log ADD COLUMN kind TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # [Debounce, owner 13 Oct 2026] An alert's Telegram post waits until the customer has been quiet
+    # (ALERT_DEBOUNCE_SECONDS): ONE waiting post per customer, several raises merge into it. In the
+    # database, not in memory, so a restart or a deploy still posts it (flush_due_alert_posts).
+    # Missing (the database busy the first time): every alert posts at once until it exists.
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS alert_pending ("
+                     " wa_user TEXT PRIMARY KEY, alert_ts REAL, ver INTEGER DEFAULT 1,"
+                     " first_raise_ts REAL, due_ts REAL, cap_ts REAL, kept INTEGER DEFAULT 0,"
+                     " lead_ts REAL DEFAULT 0, lead_cat TEXT DEFAULT '', lead_headline TEXT DEFAULT '',"
+                     " lead_text TEXT DEFAULT '', heads TEXT DEFAULT '[]', ask3 INTEGER DEFAULT 0,"
+                     " bookable_only INTEGER DEFAULT 1, tries INTEGER DEFAULT 0, posting_ts REAL DEFAULT 0,"
+                     " lead_kind TEXT DEFAULT '', lead_topic TEXT DEFAULT '', nb_kind TEXT DEFAULT '',"
+                     " nb_topic TEXT DEFAULT '')")
+    except sqlite3.OperationalError:
+        log.warning("Could not create alert_pending yet - alerts post at once until it exists")
+    # [Debounce R2] the lead raise's kind / topic, and the newest merged raise a booking does not settle (the posted
+    # alert row takes it - L1); a table made by the first build gets them here
+    for ddl in ("lead_kind TEXT DEFAULT ''", "lead_topic TEXT DEFAULT ''", "nb_kind TEXT DEFAULT ''",
+                "nb_topic TEXT DEFAULT ''"):
+        try:
+            conn.execute(f"ALTER TABLE alert_pending ADD COLUMN {ddl}")
+        except sqlite3.OperationalError:
+            pass
     # Fix 1 (O1, 30 Sep): saved bot replies that the promise safety net made read
     # differently to the older promise lists than the reply it was given, with today's
     # reading (older = 1: today's code saw a promise). While PROMISE_WIDE_ALERTS=0 the chase
@@ -5863,6 +5890,810 @@ def buzz_onto_row(user: str, alert_ts: float, handles: list, tg_text: str, headl
     return True
 
 
+# ---------------------------------------------------------------- alert debounce (owner, 13 Oct 2026)
+# Owner: "if customer looking for dima or someone for help you dont send straight away alert wait around 2 min
+# and after send alert, because many times happened what you send me alert and after customer still txt you".
+# An alert that needs a person (alert_owner, needs_reply=True - urgent ones too, the owner's choice) is WRITTEN to
+# the alerts table at once, as before, so every reader of its kind / topic / ts / closed_ts sees it; only its
+# TELEGRAM post waits: until the customer has been quiet for ALERT_DEBOUNCE_SECONDS (each new customer message
+# restarts the wait), and never longer than ALERT_DEBOUNCE_CAP_SECONDS after the first raise. Several raises for
+# one customer in that time are ONE post: the most important leads (category 'urgent' first, else the newest), the
+# others on one '🔀 Also flagged:' line, and the conversation shows their newest messages. A colleague's real
+# WhatsApp reply, Done, or - when every merged raise was about getting booked in - a booking, in the wait: no post
+# at all. The bot's reply to the customer is not delayed; the e-mail still goes at the raise. The 30-min repost,
+# the 2-h owner ping, the chase and the 3rd-ask ping count from the POST (alert_clock_ts). The posts are made by
+# flush_due_alert_posts (alert_post_loop, every ALERT_POST_TICK_SECONDS). ALERT_DEBOUNCE_SECONDS=0 = today's
+# immediate post (and the next flush posts whatever was still waiting). Any error on the way -> the post goes now.
+ALERT_DEBOUNCE_SECONDS = _env_int("ALERT_DEBOUNCE_SECONDS", 120)
+ALERT_DEBOUNCE_CAP_SECONDS = _env_int("ALERT_DEBOUNCE_CAP_SECONDS", 600)
+ALERT_POST_TICK_SECONDS = _env_int("ALERT_POST_TICK_SECONDS", 10)
+_ALERT_PENDING_COLS = ("wa_user", "alert_ts", "ver", "first_raise_ts", "due_ts", "cap_ts", "kept", "lead_ts",
+                       "lead_cat", "lead_headline", "lead_text", "heads", "ask3", "bookable_only", "tries",
+                       "posting_ts", "lead_kind", "lead_topic", "nb_kind", "nb_topic")
+_ALSO_FLAGGED = "\U0001F500 Also flagged: "
+# The ONE post runner: its thread and when it last finished a pass (?action=debouncetest). [R2] boot: when this
+# process started - a post claim older than that was a crash mid-send and may be taken again (_flush_alert_post).
+_ALERT_POST_STATE = {"thread": None, "last_tick": 0.0, "lock": threading.Lock(), "wanted": False,
+                     "boot": time.time()}
+# [Debounce R2, parity F1] Never held: fix3's "THIS CAR NOW HAS TWO BOOKINGS" warning (kind double_booking) is a
+# staff warning the spec keeps immediate. A literal, so it holds whichever release lands first.
+_ALERT_NEVER_WAIT_KINDS = frozenset({"double_booking"})
+# [Debounce R2, parity F2] The claim_log row of a raise merged into another post (never posted on its own) is KEPT -
+# fix3's once-per-yes dedupes read every raise there ("claim_log keeps every alert") - closed with this label; the
+# Monday scoreboard leaves those rows out (one counted row per post, as M1 wanted).
+_ALERT_MERGED_LABEL = "merged into one post"
+
+
+def _alert_debounce_times() -> tuple:
+    """[Debounce] (quiet seconds, cap seconds) as this process runs: the cap is never shorter than the quiet time,
+    a negative quiet time is 0 (off)."""
+    d = max(0, int(ALERT_DEBOUNCE_SECONDS or 0))
+    return d, max(d, int(ALERT_DEBOUNCE_CAP_SECONDS or 0))
+
+
+def _alert_should_wait(needs_reply: bool, kind: str = "") -> bool:
+    """[Debounce] Does this alert's Telegram post wait? Only an alert that needs a person, with the switch on and
+    Telegram set up. [R2, parity F1] Never a kind the spec keeps immediate (_ALERT_NEVER_WAIT_KINDS: the two-bookings
+    warning). Never raises: unsure -> False (the post goes now, as before)."""
+    try:
+        return bool(needs_reply and (kind or "") not in _ALERT_NEVER_WAIT_KINDS and _alert_debounce_times()[0] > 0
+                    and telegram_enabled())
+    except Exception:
+        return False
+
+
+def _alert_pending_get(conn, user: str):
+    """[Debounce] This customer's waiting post as a dict, or None. Raises on a database error (the caller decides)."""
+    r = conn.execute("SELECT " + ", ".join(_ALERT_PENDING_COLS) + " FROM alert_pending WHERE wa_user = ?",
+                     (user,)).fetchone()
+    return dict(zip(_ALERT_PENDING_COLS, r)) if r else None
+
+
+def _alert_clock_from(ts: float, posted_ts: float) -> float:
+    """[Debounce] The ladder's clock for an alert raised at ts: its first Telegram post (posted_ts) when that belongs
+    to THIS alert - inside the longest wait there can be (the cap, the retries, 15 minutes) - else ts: a post that
+    went at once (0), or a stale posted_ts left by an older alert or by restorealert rewinding ts."""
+    ts, p = float(ts or 0.0), float(posted_ts or 0.0)
+    return p if ts <= p <= ts + _alert_debounce_times()[1] + 900 else ts
+
+
+def alert_clock_ts(user: str, ts: float) -> float:
+    """[Debounce] ONE clock for the ladder (the 30-min repost and the 2-h owner ping, the chase, chase_preview): when
+    this alert was POSTED to Telegram, else when it was raised. Its own guarded read, so the callers' own SELECTs are
+    untouched. Never raises: any error (no posted_ts column, a busy database) -> ts, today's clock."""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT COALESCE(posted_ts, 0) FROM alerts WHERE wa_user = ? AND ts = ?",
+                             (user, ts)).fetchone()
+        return _alert_clock_from(ts, r[0] if r else 0.0)
+    except Exception:
+        return ts
+
+
+def _alert_pending_live_new(conn, user: str) -> tuple:
+    """[Debounce] Called in the new alert's transaction BEFORE its row replaces the one there: (this customer's
+    waiting post or None, may this raise MERGE into it?). Only into a post still waiting for the open alert it was
+    raised for - a colleague's real reply or Done may have settled it in the wait (M2) - whose row no other writer
+    replaced, and which is not being sent right now (M3). [R2, F1] "Settled" is the flush's OWN test
+    (_alert_post_cancel): a booking settles the post only when EVERY merged raise was about getting booked in
+    (bookable_only) - the row's kind is only the newest raise's, so alert_resolved let a booking settle an urgent
+    raise merged before a booking-type one, and this raise then wiped it with a fresh post. Never raises: the post
+    unreadable -> no merge (a fresh post of its own); readable but its check failing -> merge (the flush checks again
+    before it posts - the waiting one is never lost)."""
+    e = None
+    try:
+        e = _alert_pending_get(conn, user)
+        if not e:
+            return None, False
+        if e["posting_ts"]:
+            return e, False
+        r = conn.execute("SELECT ts, COALESCE(closed_ts, 0), '', '', COALESCE(kind, ''), COALESCE(topic, '')"
+                         " FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+    except Exception:
+        log.exception("debounce: could not read the waiting post for %s - a fresh one", user)
+        return e, False
+    try:
+        why, _close = _alert_post_cancel(conn, user, e, r, False)
+    except Exception:
+        log.exception("debounce: could not tell whether %s's waiting post is settled - merged into it", user)
+        return e, True
+    return e, not why
+
+
+def _alert_bookable(kind: str, topic: str) -> bool:
+    """[Debounce R2] Would a booking settle a raise of this kind / topic (BOOKING_CLOSES_KINDS / _TOPICS)?"""
+    return (kind or "") in BOOKING_CLOSES_KINDS or (topic or "") in BOOKING_CLOSES_TOPICS
+
+
+def _alert_lead_rank(category: str, kind: str, topic: str) -> tuple:
+    """[Debounce R2] Which raise leads a merged post: an urgent one first, then (L1) one a booking does not settle;
+    on a tie the newer raise (the caller)."""
+    return (category or "") == "urgent", not _alert_bookable(kind, topic)
+
+
+def _alert_heads(raw) -> list:
+    """[Debounce R2] A waiting post's merged headlines as [ts, headline, category], newest first (a first-build
+    [ts, headline] reads as a plain one); anything unreadable is left out. Never raises."""
+    try:
+        items = json.loads(raw or "[]") if isinstance(raw, (str, bytes)) else (raw or [])
+    except Exception:
+        return []
+    out = []
+    for h in items if isinstance(items, list) else []:
+        try:
+            out.append([float(h[0]), str(h[1]), str(h[2]) if len(h) > 2 else ""])
+        except Exception:
+            continue
+    return out
+
+
+def _alert_heads_keep(heads: list, lead_ts: float, limit: int = 6) -> list:
+    """[Debounce R2, F4] At most `limit` merged headlines, newest first: the lead's, then every urgent one, then the
+    newest others - an older urgent raise is never pushed out by newer plain ones."""
+    def key(h):
+        return abs(h[0] - float(lead_ts or 0.0)) < 0.001, h[2] == "urgent", h[0]
+    return sorted(sorted(heads, key=key, reverse=True)[:limit], key=lambda h: h[0], reverse=True)
+
+
+def _alert_pending_fresh(alert_ts: float, head: str, category: str, tg_text: str, kind: str, topic: str,
+                         ask3: bool) -> dict:
+    """[Debounce R2] A fresh waiting post's fields, this raise alone (pure)."""
+    nb = not _alert_bookable(kind, topic)
+    return {"lead_ts": alert_ts, "lead_cat": category or "", "lead_headline": head, "lead_text": tg_text,
+            "lead_kind": kind or "", "lead_topic": topic or "", "nb_kind": (kind or "") if nb else "",
+            "nb_topic": (topic or "") if nb else "",
+            "heads": json.dumps([[alert_ts, head, category or ""]], ensure_ascii=False),
+            "ask3": 1 if ask3 else 0, "bookable_only": 0 if nb else 1}
+
+
+def _alert_pending_merged(prev: dict, alert_ts: float, head: str, category: str, tg_text: str, kind: str,
+                          topic: str, ask3: bool) -> dict:
+    """[Debounce R2] The waiting post `prev` with this raise merged in (pure): the lead is the higher of the two by
+    _alert_lead_rank - urgent first, then (L1) one a booking does not settle, this newer raise on a tie; every
+    headline kept for the '🔀 Also flagged' line with its category (_alert_heads_keep - F4); the 3rd-ask ping
+    carried; 'a booking settles it' only while EVERY raise was about getting booked in (bookable_only - M4); and the
+    newest raise a booking does not settle (nb_kind / nb_topic: the kind the posted row takes - L1)."""
+    f = _alert_pending_fresh(alert_ts, head, category, tg_text, kind, topic, ask3)
+    if _alert_lead_rank(category, kind, topic) < _alert_lead_rank(prev.get("lead_cat"), prev.get("lead_kind"),
+                                                                  prev.get("lead_topic")):
+        for k in ("lead_ts", "lead_cat", "lead_headline", "lead_text", "lead_kind", "lead_topic"):
+            f[k] = prev.get(k) if k == "lead_ts" else (prev.get(k) or "")
+    if not f["nb_kind"]:
+        f["nb_kind"], f["nb_topic"] = prev.get("nb_kind") or "", prev.get("nb_topic") or ""
+    f["heads"] = json.dumps(_alert_heads_keep([[alert_ts, head, category or ""]] + _alert_heads(prev.get("heads")),
+                                              f["lead_ts"]), ensure_ascii=False)
+    f["ask3"] = 1 if (prev.get("ask3") or ask3) else 0
+    f["bookable_only"] = 1 if (prev.get("bookable_only") and f["bookable_only"]) else 0
+    return f
+
+
+def _alert_pending_upsert(conn, user: str, alert_ts: float, now: float, prev, live: bool, kept: bool,
+                          headline: str, category: str, tg_text: str, kind: str, topic: str, ask3: bool) -> None:
+    """[Debounce] Write this raise's waiting post inside the caller's transaction (raises on a database error).
+    live -> MERGE into `prev` (_alert_pending_merged): the newest raise's ts (the row the post's Done button closes),
+    the quiet time restarted, the first raise and the cap kept. The merge happens only if that post is still not
+    being sent (ver unchanged, posting_ts 0). [R2, F1] When another raise wrote or changed this customer's post
+    between our read and this write (our row write holds the database now), this raise merges into THAT one, unless
+    it is being sent (M3). Else - and when not live - a FRESH post: every field new, its own cap ([R2] the 3rd-ask
+    ping of a post being sent right now is carried: its record misses the row this raise replaces, so it cannot
+    ping). [R2, parity F2] A merged or replaced post that was never sent keeps its claim_log row, closed 'merged
+    into one post' (fix3's dedupes read it; the scoreboard leaves it out - one counted row per post, M1); never for
+    a post being sent (it went out) and never for a buzz (kept)."""
+    d, cap = _alert_debounce_times()
+    head = " ".join((headline or "").split())[:200]
+    target = prev if (prev and live) else None
+    seen = prev["ver"] if prev else None
+    cur = None
+    merged = False
+    for _attempt in (1, 2, 3):
+        if target is not None:
+            f = _alert_pending_merged(target, alert_ts, head, category, tg_text, kind, topic, ask3)
+            if conn.execute(
+                    "UPDATE alert_pending SET alert_ts = ?, ver = ver + 1, due_ts = ?, kept = ?, lead_ts = ?,"
+                    " lead_cat = ?, lead_headline = ?, lead_text = ?, heads = ?, ask3 = ?, bookable_only = ?,"
+                    " tries = 0, posting_ts = 0, lead_kind = ?, lead_topic = ?, nb_kind = ?, nb_topic = ?"
+                    " WHERE wa_user = ? AND ver = ? AND COALESCE(posting_ts, 0) = 0",
+                    (alert_ts, now + d, 1 if kept else 0, f["lead_ts"], f["lead_cat"], f["lead_headline"],
+                     f["lead_text"], f["heads"], f["ask3"], f["bookable_only"], f["lead_kind"], f["lead_topic"],
+                     f["nb_kind"], f["nb_topic"], user, target["ver"])).rowcount:
+                merged = True
+                break
+            seen = target["ver"]
+        cur = None if kept else _alert_pending_get(conn, user)
+        if cur and not cur["posting_ts"] and cur["ver"] != seen:
+            target = cur
+            continue
+        break
+    if merged:
+        gone = target if not target["kept"] else None
+    else:
+        f = _alert_pending_fresh(alert_ts, head, category, tg_text, kind, topic, ask3)
+        if cur and not cur["kept"] and cur["posting_ts"] and cur["ask3"]:
+            f["ask3"] = 1
+        gone = cur if (cur and not cur["kept"] and not cur["posting_ts"]) else None
+        conn.execute(
+            "INSERT INTO alert_pending (wa_user, alert_ts, ver, first_raise_ts, due_ts, cap_ts, kept, lead_ts,"
+            " lead_cat, lead_headline, lead_text, heads, ask3, bookable_only, tries, posting_ts, lead_kind,"
+            " lead_topic, nb_kind, nb_topic)"
+            " VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)"
+            " ON CONFLICT(wa_user) DO UPDATE SET alert_ts = excluded.alert_ts, ver = alert_pending.ver + 1,"
+            " first_raise_ts = excluded.first_raise_ts, due_ts = excluded.due_ts, cap_ts = excluded.cap_ts,"
+            " kept = excluded.kept, lead_ts = excluded.lead_ts, lead_cat = excluded.lead_cat,"
+            " lead_headline = excluded.lead_headline, lead_text = excluded.lead_text, heads = excluded.heads,"
+            " ask3 = excluded.ask3, bookable_only = excluded.bookable_only, tries = 0, posting_ts = 0,"
+            " lead_kind = excluded.lead_kind, lead_topic = excluded.lead_topic, nb_kind = excluded.nb_kind,"
+            " nb_topic = excluded.nb_topic",
+            (user, alert_ts, now, now + d, now + cap, 1 if kept else 0, f["lead_ts"], f["lead_cat"],
+             f["lead_headline"], f["lead_text"], f["heads"], f["ask3"], f["bookable_only"], f["lead_kind"],
+             f["lead_topic"], f["nb_kind"], f["nb_topic"]))
+    if gone and not kept and abs((gone["alert_ts"] or 0.0) - alert_ts) >= 0.001:
+        conn.execute("UPDATE claim_log SET closed_ts = ?, closed_by = ? WHERE wa_user = ? AND alert_ts = ?"
+                     " AND COALESCE(closed_ts, 0) = 0", (now, _ALERT_MERGED_LABEL, user, gone["alert_ts"]))
+
+
+def _alert_pending_write(conn, user: str, alert_ts: float, now: float, prev, live: bool, kept: bool,
+                         headline: str, category: str, tg_text: str, kind: str, topic: str, ask3: bool) -> bool:
+    """[Debounce] _alert_pending_upsert inside a SAVEPOINT of the caller's transaction, so its failure is undone on
+    its own and never takes the alert row with it. True when the waiting post was written; False -> the caller posts
+    now (fail open). Raises only when the transaction itself is lost (the caller's own error path)."""
+    try:
+        conn.execute("SAVEPOINT alert_pending_write")
+    except Exception:
+        log.exception("debounce: no savepoint for %s - the post goes now", user)
+        return False
+    try:
+        _alert_pending_upsert(conn, user, alert_ts, now, prev, live, kept, headline, category, tg_text, kind,
+                              topic, ask3)
+        conn.execute("RELEASE SAVEPOINT alert_pending_write")
+        return True
+    except Exception:
+        log.exception("debounce: could not hold the post for %s - it goes now", user)
+        conn.execute("ROLLBACK TO SAVEPOINT alert_pending_write")
+        conn.execute("RELEASE SAVEPOINT alert_pending_write")
+        return False
+
+
+def _alert_hold_buzz(user: str, kept_ts: float, now: float, headline: str, category: str, tg_text: str,
+                     kind: str, topic: str) -> bool:
+    """[Debounce] A repeat's deadline / money buzz on an alert already on Telegram (alert_owner's keep_clock): its
+    post waits too - merged into a buzz still waiting for the same alert, else a fresh waiting post - and when it
+    goes it only ADDS copies to that alert (kept = 1: its clocks are left alone). Never touches claim_log. False on
+    any error (the caller posts it now)."""
+    try:
+        with closing(db()) as conn, conn:
+            e = _alert_pending_get(conn, user)
+            live = bool(e and e["kept"] and abs((e["alert_ts"] or 0.0) - kept_ts) < 0.001 and not e["posting_ts"])
+            return _alert_pending_write(conn, user, kept_ts, now, e, live, True, headline, category, tg_text, kind,
+                                        topic, False)
+    except Exception:
+        log.exception("debounce: could not hold the buzz for %s - it goes now", user)
+        return False
+
+
+def _alert_add_copies(user: str, ts: float, handles: list) -> None:
+    """[Debounce] Fail-open bookkeeping: copies posted at once join this alert's row (a Done edits them, the ladder
+    runs on them), as alert_owner's own write would have done. Never raises."""
+    if not handles:
+        return
+    h = ",".join(handles)
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("UPDATE alerts SET tg_msgs = CASE WHEN COALESCE(tg_msgs, '') = '' THEN ?"
+                         " ELSE tg_msgs || ',' || ? END WHERE wa_user = ? AND ts = ?", (h, h, user, ts))
+    except Exception:
+        log.exception("debounce: could not note the copies of %s's alert", user)
+
+
+def _alert_newer_post_waiting(user: str, ts: float) -> bool:
+    """[Debounce] Is the alert on this customer's row (raised at ts) still waiting for its first Telegram post?
+    close_alert's toast for a Done pressed on an older copy. Switch 0, or unsure: False (today's toast)."""
+    try:
+        if _alert_debounce_times()[0] <= 0:
+            return False
+        with closing(db()) as conn:
+            e = _alert_pending_get(conn, user)
+        return bool(e and not e["kept"] and abs((e["alert_ts"] or 0.0) - (ts or 0.0)) < 0.001)
+    except Exception:
+        return False
+
+
+def _alert_post_at(conn, user: str, e: dict) -> float:
+    """[Debounce] When this waiting post is due: ALERT_DEBOUNCE_SECONDS after the later of its last raise and the
+    customer's newest message (so it keeps waiting while they type), never after its cap. Switch at 0 -> now (the
+    queue drains), except a send that failed, which waits its minute."""
+    d, _cap = _alert_debounce_times()
+    if d <= 0:
+        return float(e.get("due_ts") or 0.0) if e.get("tries") else 0.0
+    newest = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                          (user,)).fetchone()[0] or 0.0
+    return min(max(float(e.get("due_ts") or 0.0), newest + d), float(e.get("cap_ts") or 0.0))
+
+
+def _alert_post_cancel(conn, user: str, e: dict, row, overdue: bool) -> tuple:
+    """[Debounce] (why this waiting post must NOT go out, close the alert as sorted?) - ('', False) to post it. The
+    row is gone (clearwaiting); another writer replaced it (restorealert, claimtest - or a newer raise, whose own
+    post stands); it is closed (Done, or a colleague's real reply closed it); a colleague REALLY replied in the wait
+    (not a 👍 or a "Hi"); a booking, when every merged raise was about getting booked in (bookable_only - M4). [R2]
+    Also the merge test (_alert_pending_live_new: may a raise still join this post?). [R2, F7 / parity F5] Overdue
+    (5 minutes past the cap: something kept failing) no longer skips the checks - a colleague's real reply still
+    drops the post, the switch at 0 too; only when the checks THEMSELVES fail does an overdue post go out as it is
+    (fail open). A failing check otherwise raises (the flush tries again next pass)."""
+    if not row or not row[0]:
+        return "the alert row is gone", False
+    ts = row[0]
+    if abs(ts - float(e.get("alert_ts") or 0.0)) > 0.001:
+        return "the alert row was replaced meanwhile", False
+    if (row[1] or 0) >= ts:
+        return "already closed (Done, or a colleague's reply)", False
+    try:
+        if is_real_staff_reply(conn, user, ts):
+            return "a colleague really replied in WhatsApp", True
+        if e.get("bookable_only") and booking_closes_alert(conn, user, ts, row[4] or "", row[5] or ""):
+            return "they were booked in", True
+    except Exception:
+        if not overdue:
+            raise
+        log.exception("debounce: %s's post is overdue and its checks keep failing - it goes as it is", user)
+    return "", False
+
+
+def _alert_post_text(user: str, e: dict, base: str) -> str:
+    """[Debounce] The text a waiting post goes out with: `base` (the lead raise's alert text) with the conversation
+    read NOW - their newest messages, a few more when they wrote several in the wait - and the other merged
+    headlines on ONE '🔀 Also flagged:' line above the conversation: [R2, F4] every urgent one first (newest first),
+    then the newest others, 3 at least. [R2, parity F4] The longer excerpt only while the post stays under 3900
+    characters, else the 6 lines (as the headlights twin): Telegram's cut at 4000 would take both links. No line of
+    it starts with '➕ ' (_QUIET_REPEAT_MARK: the quiet-repeat fold and the ladder's quote cut an alert's text there -
+    B1)."""
+    text = base or ""
+    lead = " ".join((e.get("lead_headline") or "").split())
+    lead_ts = float(e.get("lead_ts") or 0.0)
+    seen, urgent, plain = {lead}, [], []
+    for hts, hl, cat in _alert_heads(e.get("heads")):
+        hl = " ".join(hl.split())
+        if not hl or hl in seen or abs(hts - lead_ts) < 0.001:
+            continue
+        seen.add(hl)
+        (urgent if cat == "urgent" else plain).append(hl[:120])
+    others = urgent + plain[:max(0, 3 - len(urgent))]
+    line = (_ALSO_FLAGGED + " · ".join(others)) if others else ""
+
+    def also(t: str) -> str:
+        if not line:
+            return t
+        i = t.find("\n\n--- conversation ---")
+        return (t[:i] + "\n" + line + t[i:]) if i >= 0 else (t + "\n" + line)
+
+    out = also(text)
+    a = text.find("--- conversation ---\n")
+    b = text.find("\n\n\U0001F4AC Reply in WhatsApp:", a + 1) if a >= 0 else -1
+    if a >= 0 and b > a:
+        with closing(db()) as conn:
+            n = conn.execute("SELECT COUNT(*) FROM messages WHERE wa_user = ? AND role = 'user' AND ts >= ?",
+                             (user, float(e.get("first_raise_ts") or 0.0))).fetchone()[0] or 0
+        for limit in dict.fromkeys((min(12, 6 + int(n)), 6)):
+            ex = conversation_excerpt(user, limit)
+            if not ex:
+                break
+            cand = also(text[:a + len("--- conversation ---\n")] + ex + text[b:])
+            if len(cand) <= 3900:
+                out = cand
+                break
+    return out.replace(_QUIET_REPEAT_MARK, "\n+ ")[:4000]
+
+
+def _alert_post_record(user: str, ver: int, ts: float, kept: bool, handles: list, stored: str, headline: str,
+                       category: str, now: float, kind_fix=None) -> int:
+    """[Debounce] After a waiting post went out: its copies on the alert row (the first post REPLACES tg_msgs and
+    starts the ladder - posted_ts; a buzz post ADDS its copies and leaves every clock alone), the text Done and the
+    repost show, the lead's headline / category - [R2, L1] and kind_fix's (kind, topic): a merged post a booking does
+    not settle must not read as booking-type, or escalate's auto-close ticks it 'sorted' when they book; then the
+    waiting entry goes (only this version - a raise that arrived during the send keeps its own). [R2, L3] A Done or
+    a colleague's real reply that closed THIS alert (same ts) during the send: the copies still go onto its row and
+    are edited with that close's line at once (close_alert found no copies to edit). Never raises; the number of
+    OPEN alert rows updated (0 for one closed meanwhile: no 3rd-ask ping)."""
+    h = ",".join(handles)
+    kx = ", kind = ?, topic = ?" if kind_fix else ""
+    ka = [kind_fix[0], kind_fix[1]] if kind_fix else []
+
+    def record(conn) -> int:
+        if kept:
+            return conn.execute(
+                "UPDATE alerts SET tg_msgs = CASE WHEN COALESCE(tg_msgs, '') = '' THEN ? ELSE tg_msgs || ',' || ? END,"
+                " tg_text = ? WHERE wa_user = ? AND ts = ? AND COALESCE(closed_ts, 0) < ts",
+                (h, h, stored, user, ts)).rowcount
+        try:
+            return conn.execute(
+                "UPDATE alerts SET tg_msgs = ?, posted_ts = ?, tg_text = ?, headline = ?, category = ?" + kx +
+                " WHERE wa_user = ? AND ts = ? AND COALESCE(closed_ts, 0) < ts",
+                [h, now, stored, headline, category] + ka + [user, ts]).rowcount
+        except sqlite3.OperationalError as ex:
+            if "no such column" not in str(ex):
+                raise
+            # [SN11 style] no posted_ts column (the column loop in db() failed): recorded without it - the ladder
+            # then counts from the raise, as before (M6)
+            return conn.execute(
+                "UPDATE alerts SET tg_msgs = ?, tg_text = ?, headline = ?, category = ?" + kx +
+                " WHERE wa_user = ? AND ts = ? AND COALESCE(closed_ts, 0) < ts",
+                [h, stored, headline, category] + ka + [user, ts]).rowcount
+
+    def closed_meanwhile(conn):
+        # [R2, L3] (closed_by, claimed_by) when THIS alert (same ts) closed during the send - its copies are stored
+        # all the same; None when it is open, gone or replaced by a newer alert (M3: those copies are left alone)
+        r = conn.execute("SELECT COALESCE(closed_ts, 0), COALESCE(claimed_by, '') FROM alerts"
+                         " WHERE wa_user = ? AND ts = ?", (user, ts)).fetchone()
+        if not r or (r[0] or 0) < ts:
+            return None
+        if kept:
+            conn.execute("UPDATE alerts SET tg_msgs = CASE WHEN COALESCE(tg_msgs, '') = '' THEN ?"
+                         " ELSE tg_msgs || ',' || ? END, tg_text = ? WHERE wa_user = ? AND ts = ?",
+                         (h, h, stored, user, ts))
+        else:
+            conn.execute("UPDATE alerts SET tg_msgs = ?, tg_text = ? WHERE wa_user = ? AND ts = ?",
+                         (h, stored, user, ts))
+        c = conn.execute("SELECT COALESCE(closed_by, '') FROM claim_log WHERE wa_user = ? AND alert_ts = ?"
+                         " ORDER BY id DESC LIMIT 1", (user, ts)).fetchone()
+        return (c[0] if c else "") or "", r[1] or ""
+
+    def both(conn) -> tuple:
+        n = record(conn)
+        return n, (None if n else closed_meanwhile(conn))
+
+    hit, late = 0, None
+    try:
+        with closing(db()) as conn, conn:
+            hit, late = both(conn)
+            conn.execute("DELETE FROM alert_pending WHERE wa_user = ? AND ver = ?", (user, ver))
+    except Exception:
+        log.exception("debounce: could not record %s's post - the two steps on their own", user)
+        hit, late = 0, None
+        try:
+            with closing(db()) as conn, conn:
+                hit, late = both(conn)
+        except Exception:
+            log.exception("debounce: %s's post is on Telegram but not on the alert row", user)
+        try:
+            with closing(db()) as conn, conn:
+                conn.execute("DELETE FROM alert_pending WHERE wa_user = ? AND ver = ?", (user, ver))
+        except Exception:
+            log.exception("debounce: %s's waiting post could not be cleared - it may post twice", user)
+    if late is not None:
+        who, claimed = late
+        stamp = now_local().strftime("%H:%M")
+        if who in ("replied in WhatsApp", "sorted (booked or replied)") or who.endswith("(Telegram)"):
+            line = f"\n\n✅ {who} at {stamp}" + (f" — {claimed}" if claimed else "")
+        elif who:
+            line = f"\n\n✅ Done by {who} at {stamp}"
+        else:
+            line = f"\n\n✅ Closed at {stamp}"
+        try:
+            _edit_alert_copies(h, stored + line, None)
+        except Exception:
+            log.exception("debounce: could not tick %s's copies posted as the alert closed", user)
+        log.info("debounce: %s's alert closed during its post (%s) - the copies are on it, ticked", user, who)
+    return hit
+
+
+def _flush_alert_post(e: dict, now: float, force: bool = False) -> int:
+    """[Debounce] One waiting post: due? -> in flight -> still wanted? -> post -> record. 1 when it went out.
+    [R2] force: now, whatever its due time (_alert_post_waiting_now)."""
+    user, ver = e["wa_user"], e["ver"]
+    if not force:
+        with closing(db()) as conn:
+            post_at = _alert_post_at(conn, user, e)
+        if now < post_at:
+            return 0
+    # In flight: a raise that lands while this is being sent starts a fresh post of its own (M3); a merge that landed
+    # since this entry was read changed ver - this pass leaves it. [R2] One poster at a time (this loop, and a raise
+    # that cannot wait posting what waits first): a claim this process holds is never taken twice; one older than
+    # this process (a crash mid-send) or 2 minutes old (a sender that died) is taken again - a duplicate beats a loss.
+    with closing(db()) as conn, conn:
+        if not conn.execute("UPDATE alert_pending SET posting_ts = ? WHERE wa_user = ? AND ver = ? AND alert_ts = ?"
+                            " AND (COALESCE(posting_ts, 0) = 0 OR posting_ts < ? OR posting_ts < ?)",
+                            (now, user, ver, e["alert_ts"], _ALERT_POST_STATE["boot"], now - 120)).rowcount:
+            return 0
+    overdue = now > float(e.get("cap_ts") or 0.0) + 300        # [R2, F7] whatever the switch: a drain can stick too
+    replaced = False
+    with closing(db()) as conn:
+        row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(tg_text, ''), COALESCE(claimed_by, ''),"
+                           " COALESCE(kind, ''), COALESCE(topic, ''), COALESCE(headline, ''),"
+                           " COALESCE(category, '') FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+        a_ts = float(e.get("alert_ts") or 0.0)
+        if row and row[0] and row[0] > a_ts + 0.001:
+            # [R2, F6] a raise landed on this claim before the row was read: it took the row and started a post of
+            # its own (ver moved on). This one goes as it would have a moment later (M3) - on its own Done tag,
+            # judged on its own alert: Done (claim_log), a colleague's real reply or a booking since it.
+            cur = conn.execute("SELECT ver FROM alert_pending WHERE wa_user = ?", (user,)).fetchone()
+            if cur and cur[0] != ver:
+                c = conn.execute("SELECT MAX(COALESCE(closed_ts, 0)) FROM claim_log WHERE wa_user = ? AND alert_ts = ?",
+                                 (user, a_ts)).fetchone()
+                row = (a_ts, (c[0] if c else 0.0) or 0.0, "", "", e.get("lead_kind") or "", e.get("lead_topic") or "",
+                       e.get("lead_headline") or "", e.get("lead_cat") or "")
+                replaced = True
+        why, close_it = _alert_post_cancel(conn, user, e, row, overdue)
+    if why:
+        with closing(db()) as conn, conn:
+            gone = conn.execute("DELETE FROM alert_pending WHERE wa_user = ? AND ver = ?", (user, ver)).rowcount
+        log.info("debounce: not posted for %s - %s", user, why)
+        if close_it and gone and not replaced:
+            # sorted in the wait: closed as the ladder's own auto-close would (not a person's Done); tapped_ts - a
+            # raise that lands now is a newer alert and is not closed (M8)
+            _toast, after = close_alert(user, "sorted (booked or replied)", auto=True, tapped_ts=str(int(row[0])))
+            if after:
+                after()
+        return 0
+    ts = row[0]
+    base = e.get("lead_text") or row[2]
+    text = base
+    if not overdue:
+        try:
+            text = _alert_post_text(user, e, base)
+        except Exception:
+            log.exception("debounce: the post text for %s failed - the alert's own text instead", user)
+            text = base
+    try:
+        # the alert chat list as it is NOW (a chat added with tgadd in the wait gets it too)
+        handles = send_telegram_buttons(text, user, ts, claimed=bool((row[3] or "").strip()))
+    except Exception:
+        log.exception("debounce: sending %s's post failed", user)
+        handles = []
+    if not handles:
+        tries = int(e.get("tries") or 0) + 1
+        with closing(db()) as conn, conn:
+            if tries >= 3:
+                conn.execute("DELETE FROM alert_pending WHERE wa_user = ? AND ver = ?", (user, ver))
+            else:
+                conn.execute("UPDATE alert_pending SET tries = ?, posting_ts = 0, due_ts = ?, cap_ts = ?"
+                             " WHERE wa_user = ? AND ver = ?", (tries, now + 60, now + 60, user, ver))
+        if tries >= 3:
+            log.error("debounce: Telegram took none of %s's post after 3 tries - given up (the e-mail went at the"
+                      " raise; the chase still comes)", user)
+        else:
+            log.warning("debounce: Telegram took none of %s's post (try %d) - again in a minute", user, tries)
+        return 0
+    # a quiet '➕ wrote again' fold made on the alert meanwhile (a buzz waits on an alert already on Telegram) stays
+    # on the stored text, so the repost still quotes it and Done keeps it
+    tail = (row[2] or "").partition(_QUIET_REPEAT_MARK)[2]
+    stored = text + (_QUIET_REPEAT_MARK + tail if tail else "")
+    kept = bool(e.get("kept"))
+    headline = e.get("lead_headline") or row[6]
+    hit = _alert_post_record(user, ver, ts, kept, handles, stored, headline, e.get("lead_cat") or row[7], now,
+                             _alert_post_kind_fix(e, row[4], row[5]))
+    log.info("debounce: posted %s's alert (%d copies, %s, waited %ds)", user, len(handles),
+             "a buzz on the open alert" if kept else ("first post" if not replaced else "an alert a newer raise "
+                                                       "replaced as it went (M3)"),
+             int(now - float(e.get("first_raise_ts") or now)))
+    if e.get("ask3") and not kept and hit:
+        # the 3rd ask of one chain: its private ping goes with the post. [R2, L2] owner_ts = when it went (the post),
+        # as live's ping at the raise wrote its own send time: stall_cover reads an owner_ts EQUAL to ts as "its
+        # ladder was used up as it was raised" (and a stalled message then gets a second alert)
+        _alert_ask3_after_post(user, headline, ts)
+    return 1
+
+
+def _alert_post_kind_fix(e: dict, row_kind: str, row_topic: str):
+    """[Debounce R2, L1] (kind, topic) the posted alert row takes so that a booking cannot settle a post that holds a
+    raise a booking does not settle (bookable_only = 0): the lead's, else the newest such raise's. None when the
+    row's own kind already is one, every raise was about getting booked in, or it is a buzz (kept)."""
+    if e.get("kept") or e.get("bookable_only") or not _alert_bookable(row_kind, row_topic):
+        return None
+    if (e.get("lead_kind") or "") and not _alert_bookable(e.get("lead_kind"), e.get("lead_topic")):
+        return e["lead_kind"], e.get("lead_topic") or ""
+    if e.get("nb_kind"):
+        return e["nb_kind"], e.get("nb_topic") or ""
+    return None
+
+
+def _alert_ask3_after_post(user: str, headline: str, ts: float) -> None:
+    """[Debounce] The 3rd-ask private ping of a post that just went out (the alert raised at ts), with that row's
+    chain. [R2, L2] owner_ts = when the ping went (_ask3_ping's own clock). Never raises."""
+    try:
+        with closing(db()) as conn:
+            fr = conn.execute("SELECT COALESCE(first_ts, 0), COALESCE(chain_ts, 0) FROM alerts"
+                              " WHERE wa_user = ? AND ts = ?", (user, ts)).fetchone()
+        first = fr[0] if (fr and fr[0] and abs((fr[1] or 0.0) - ts) < 0.001) else ts
+    except Exception:
+        first = ts
+    try:
+        _ask3_ping(user, headline, customer_label(user), ts, first)
+    except Exception:
+        log.exception("3rd-ask ping failed for %s", user)
+
+
+def _alert_post_waiting_now(user: str) -> int:
+    """[Debounce R2, parity F1] A needs-a-person raise that does not wait (the two-bookings warning; the switch at 0
+    while the queue drains) takes this customer's alert row at once - a post still waiting for the row there would
+    then be dropped as 'row replaced'. It goes out first, as two alerts in a row did before the wait (its own Done
+    tag; the newer alert takes the row after it). Never raises; 1 when it posted."""
+    try:
+        with closing(db()) as conn:
+            e = _alert_pending_get(conn, user)
+    except sqlite3.OperationalError:
+        return 0            # no alert_pending table (yet): nothing waits
+    except Exception:
+        log.exception("debounce: could not read %s's waiting post", user)
+        return 0
+    if not e:
+        return 0
+    try:
+        return _flush_alert_post(e, time.time(), force=True)
+    except Exception:
+        log.exception("debounce: %s's waiting post could not go first", user)
+        return 0
+
+
+def _alert_fail_open_post(user: str, alert_ts: float, prev, headline: str, category: str, tg_text: str, kind: str,
+                          topic: str, claimed: bool, post_now, ask3_now: bool) -> None:
+    """[Debounce R2, F5] A raise whose post could not wait goes now (fail open). When the customer's previous alert
+    was still waiting to post (prev, live) - this raise's row has just replaced its row, so the flush would drop it -
+    it goes IN this post, merged as the flush would have merged it (the lead, the '🔀 Also flagged' line, the kind a
+    booking does not settle), with the copies and the text on this row; its entry goes, its claim_log row is closed
+    'merged into one post', and its 3rd-ask ping (when this raise has none of its own) goes with the post. Without
+    such a post: today's post, now. Never raises."""
+    if not prev or prev.get("posting_ts"):
+        _alert_add_copies(user, alert_ts, post_now())
+        return
+    try:
+        f = _alert_pending_merged(prev, alert_ts, " ".join((headline or "").split())[:200], category, tg_text,
+                                  kind, topic, False)
+        e = dict(prev, **f)
+        e["alert_ts"], e["kept"] = alert_ts, 0
+        text = _alert_post_text(user, e, f["lead_text"] or tg_text)
+    except Exception:
+        log.exception("debounce: could not merge %s's waiting post into the post going now", user)
+        _alert_add_copies(user, alert_ts, post_now())
+        return
+    try:
+        handles = send_telegram_buttons(text, user, alert_ts, claimed=bool(claimed))
+    except Exception:
+        log.exception("Failed to send Telegram owner alert")
+        handles = []
+    now = time.time()
+    hit = 0
+    if handles:
+        hit = _alert_post_record(user, prev["ver"], alert_ts, False, handles, text, f["lead_headline"],
+                                 f["lead_cat"], now, _alert_post_kind_fix(e, kind, topic))
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("DELETE FROM alert_pending WHERE wa_user = ? AND ver = ?", (user, prev["ver"]))
+            if not prev.get("kept") and abs((prev.get("alert_ts") or 0.0) - alert_ts) >= 0.001:
+                conn.execute("UPDATE claim_log SET closed_ts = ?, closed_by = ? WHERE wa_user = ? AND alert_ts = ?"
+                             " AND COALESCE(closed_ts, 0) = 0", (now, _ALERT_MERGED_LABEL, user, prev["alert_ts"]))
+    except Exception:
+        log.exception("debounce: %s's merged waiting post could not be cleared", user)
+    if hit and prev.get("ask3") and not ask3_now:
+        _alert_ask3_after_post(user, f["lead_headline"], alert_ts)
+
+
+def flush_due_alert_posts(now: float = None) -> int:
+    """[Debounce] Post every waiting alert that is due (alert_post_loop; the first pass at start-up posts what a
+    deploy left waiting). Each on its own - one bad entry never blocks the others; an error is retried next pass.
+    Returns how many went out."""
+    now = time.time() if now is None else now
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT " + ", ".join(_ALERT_PENDING_COLS) + " FROM alert_pending"
+                                " ORDER BY due_ts").fetchall()
+    except sqlite3.OperationalError as ex:
+        if "no such table" in str(ex):
+            return 0
+        raise
+    sent = 0
+    for r in rows:
+        e = dict(zip(_ALERT_PENDING_COLS, r))
+        try:
+            sent += _flush_alert_post(e, now)
+        except Exception:
+            log.exception("debounce: %s's post failed - tried again next pass", e.get("wa_user"))
+            try:
+                # [R2] this pass's own claim only (posting_ts = now) - never one another poster holds right now
+                with closing(db()) as conn, conn:
+                    conn.execute("UPDATE alert_pending SET posting_ts = 0 WHERE wa_user = ? AND ver = ?"
+                                 " AND posting_ts = ?", (e.get("wa_user"), e.get("ver"), now))
+            except Exception:
+                pass
+    return sent
+
+
+def alert_post_loop() -> None:
+    """[Debounce] The ONE runner that posts waiting alerts: a pass at once (a deploy's leftovers go out first thing),
+    then every ALERT_POST_TICK_SECONDS. Exception-safe."""
+    while True:
+        try:
+            flush_due_alert_posts()
+        except Exception:
+            log.exception("Alert post flush error")
+        _ALERT_POST_STATE["last_tick"] = time.time()
+        time.sleep(max(1, ALERT_POST_TICK_SECONDS))
+
+
+def _ensure_alert_post_thread() -> bool:
+    """[Debounce] Start alert_post_loop unless it is running - at start-up, and as a watchdog from
+    telegram_button_loop's minute tick: a dead thread is replaced, a live one is never doubled. True when it
+    started one. Only in a process whose app started (_start_reminder_thread sets 'wanted'): a module imported by a
+    test or a tool that drives telegram_button_loop itself never gets a post loop of its own."""
+    with _ALERT_POST_STATE["lock"]:
+        if not _ALERT_POST_STATE.get("wanted"):
+            return False
+        t = _ALERT_POST_STATE["thread"]
+        if t is not None and t.is_alive():
+            return False
+        restarted = t is not None
+        t = threading.Thread(target=alert_post_loop, daemon=True, name="alert_post_loop")
+        _ALERT_POST_STATE["thread"] = t
+        t.start()
+    if restarted:
+        log.warning("Alert post loop had stopped - restarted")
+    return True
+
+
+def _claimstatus_post_keys(user: str, ts: float, tg_msgs: str, posted: dict, pending: dict, when) -> dict:
+    """[Debounce] claimstatus's three extra keys for one alert row: when it was posted (the ladder's clock), whether
+    its post is still waiting, and when that is due. posted / pending: the guarded reads claimstatus made."""
+    p = posted.get(user)
+    clock = _alert_clock_from(ts, p[1] if (p and abs((p[0] or 0.0) - (ts or 0.0)) < 0.001) else 0.0)
+    e = pending.get(user)
+    waiting = bool(e and abs((e.get("alert_ts") or 0.0) - (ts or 0.0)) < 0.001)
+    copies = len([h for h in (tg_msgs or "").split(",") if ":" in h])
+    return {"posted": when(clock) if copies else "",
+            "post_pending": waiting and not e.get("kept"),
+            "buzz_pending": waiting and bool(e.get("kept")),
+            "post_due": (when(e.get("post_at") or 0.0) if (e.get("post_at") or 0.0) else "now") if waiting else ""}
+
+
+def alert_post_preview(user: str, now: float = None) -> dict:
+    """[Debounce] Read-only, for ?action=debouncetest: this customer's waiting post and what flush_due_alert_posts
+    would do with it at `now` - the same helpers, in its order. Nothing is written, sent or closed. Never raises."""
+    now = time.time() if now is None else now
+    d, _cap = _alert_debounce_times()
+    out: dict = {}
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT ts, COALESCE(closed_ts, 0), COALESCE(tg_text, ''), COALESCE(claimed_by, ''),"
+                               " COALESCE(kind, ''), COALESCE(topic, ''), COALESCE(headline, ''),"
+                               " COALESCE(category, ''), COALESCE(tg_msgs, '') FROM alerts WHERE wa_user = ?",
+                               (user,)).fetchone()
+            newest = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                                  (user,)).fetchone()[0] or 0.0
+            try:
+                e = _alert_pending_get(conn, user)
+            except sqlite3.OperationalError as ex:
+                e = None
+                out["pending_table"] = f"unreadable ({ex})"
+            out["alert"] = None if not row else {
+                "raised": _fmt_ts(row[0]), "closed": (row[1] or 0) >= (row[0] or 0), "kind": row[4],
+                "topic": row[5], "headline": row[6],
+                "telegram_copies": len([h for h in (row[8] or "").split(",") if ":" in h])}
+            out["newest_customer_message"] = _fmt_ts(newest) if newest else ""
+            if not e:
+                out["pending"] = None
+                return out
+            post_at = _alert_post_at(conn, user, e)
+            overdue = now > float(e.get("cap_ts") or 0.0) + 300     # [R2, F7] at 0 too, as the flush
+            why, close_it = _alert_post_cancel(conn, user, e, row, overdue)
+        if row:
+            out["alert"]["posted"] = _fmt_ts(alert_clock_ts(user, row[0])) if out["alert"]["telegram_copies"] else ""
+        out["pending"] = {
+            "for_alert_raised": _fmt_ts(e["alert_ts"] or 0.0), "is_the_current_alert": bool(
+                row and abs((row[0] or 0.0) - (e["alert_ts"] or 0.0)) < 0.001),
+            "kind_of_post": "a buzz on the open alert (adds copies)" if e["kept"] else "the alert's first post",
+            "first_raise": _fmt_ts(e["first_raise_ts"] or 0.0), "due": _fmt_ts(e["due_ts"] or 0.0),
+            "cap": _fmt_ts(e["cap_ts"] or 0.0), "lead": e["lead_headline"], "lead_category": e["lead_cat"],
+            "raises_merged": len(json.loads(e["heads"] or "[]")), "third_ask_ping_with_it": bool(e["ask3"]),
+            "a_booking_settles_it": bool(e["bookable_only"]), "failed_sends": e["tries"],
+            "being_sent_now": bool(e["posting_ts"])}
+        out["post_at"] = _fmt_ts(post_at) if post_at else "now (switch at 0 - the queue drains)"
+        if now < post_at:
+            out.update({"would_post_now": False, "waits_seconds": int(post_at - now)})
+        elif why:
+            out.update({"would_post_now": False, "would_drop_because": why, "would_close_as_sorted": close_it})
+        else:
+            out.update({"would_post_now": True, "overdue": overdue})
+    except Exception as ex:
+        out["error"] = f"could not tell ({type(ex).__name__})"
+    return out
+
+
 def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = True,
                 kind: str = "", keep_clock: bool = False, fold_clock: bool = False,
                 since_ts: float = 0.0) -> None:
@@ -5977,8 +6808,27 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
                 and alert_ts - (prev[2] or 0) < 24 * 3600):
             keep_claim = (prev[1], prev[2])
             tg_text += f"\n\n\U0001F64B Already with {prev[1]}"
+    # [Debounce, owner 13 Oct 2026] an alert that needs a person is not posted here: flush_due_alert_posts posts it
+    # once the customer has been quiet for ALERT_DEBOUNCE_SECONDS (several raises -> one post). The e-mail (and any
+    # WhatsApp copies above) still go now. Switch at 0, an FYI alert, or no Telegram: today's post, now.
+    wait = _alert_should_wait(needs_reply, kind)
+
+    def _post_now() -> list:
+        # [Debounce] fail open: today's post, sent now
+        try:
+            return send_telegram_buttons(tg_text, user, kept["ts"] if kept else alert_ts,
+                                         claimed=bool(keep_claim[0]))
+        except Exception:
+            log.exception("Failed to send Telegram owner alert")
+            return []
+    if needs_reply and not wait and not kept:
+        # [Debounce R2, parity F1] this raise takes the alert row now (it does not wait: the two-bookings warning,
+        # or the switch at 0): a post still waiting for the row there goes out first, as two alerts in a row did
+        _alert_post_waiting_now(user)
     try:
-        if needs_reply:
+        if wait:
+            pass        # [Debounce] posted later by flush_due_alert_posts
+        elif needs_reply:
             tg_handles = send_telegram_buttons(tg_text, user, kept["ts"] if kept else alert_ts,   # [R2 fix, R2C-F2]
                                                claimed=bool(keep_claim[0]))
         else:
@@ -5998,55 +6848,87 @@ def alert_owner(user: str, headline: str, reason: str = "", needs_reply: bool = 
     # check-ins to happy customers.
     if needs_reply and kept:
         # [R2 fix, R2C-F2] the row keeps its clocks; the post's copies join it
-        if not buzz_onto_row(user, kept["ts"], tg_handles, tg_text, headline, topic, category, fold_clock):
+        try:
+            joined = buzz_onto_row(user, kept["ts"], tg_handles, tg_text, headline, topic, category, fold_clock)
+        except Exception:
+            if wait:
+                _post_now()     # [Debounce R2, F3] fail open: the buzz goes now, then today's error (B2's twin)
+            raise
+        if not joined:
             log.warning("Buzz for %s: the open alert changed meanwhile - the post went out on its own", user)
+            if wait:
+                _post_now()     # [Debounce] fail open: the buzz goes on its own now, as it did
+        elif wait:
+            # [Debounce] the buzz's words are on the alert now (a Done in the wait shows them on every copy); its post
+            # waits and then joins the alert's copies (kept = 1: the alert's clocks are left alone)
+            if not _alert_hold_buzz(user, kept["ts"], alert_ts, headline, category, tg_text, kind, topic):
+                _alert_add_copies(user, kept["ts"], _post_now())
     elif needs_reply:
-        with closing(db()) as conn, conn:
-            try:
+        pend_ok = False     # [Debounce] True: the post waits in alert_pending (flush_due_alert_posts)
+        try:
+            with closing(db()) as conn, conn:
+                # [Debounce] this customer's waiting post, judged BEFORE the row below replaces the alert it is for
+                pend_e, pend_live = _alert_pending_live_new(conn, user) if wait else (None, False)
+                try:
+                    conn.execute(
+                        "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
+                        " headline, escalated_ts, owner_ts, closed_ts, kind, topic, category, label,"
+                        " first_ts, ask_count, ask_ts, chain_ts)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)"
+                        " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
+                        " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
+                        " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
+                        " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0,"
+                        " kind = excluded.kind, topic = excluded.topic,"
+                        " category = excluded.category, label = excluded.label,"
+                        " first_ts = excluded.first_ts, ask_count = excluded.ask_count,"
+                        " ask_ts = excluded.ask_ts, chain_ts = excluded.chain_ts",
+                        (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
+                         tg_text, headline, kind, topic, category, label,
+                         chain[0], chain[1], chain[2], alert_ts))
+                except sqlite3.OperationalError:
+                    # Fix 1 [v2 SN11]: the ask-chain columns are missing (the column loop in
+                    # db() failed) - the alert still gets its row, exactly as before Fix 1.
+                    log.exception("Alert row for %s written without the ask chain", user)
+                    conn.execute(
+                        "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
+                        " headline, escalated_ts, owner_ts, closed_ts, kind, topic, category, label)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)"
+                        " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
+                        " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
+                        " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
+                        " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0,"
+                        " kind = excluded.kind, topic = excluded.topic,"
+                        " category = excluded.category, label = excluded.label",
+                        (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
+                         tg_text, headline, kind, topic, category, label))
                 conn.execute(
-                    "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
-                    " headline, escalated_ts, owner_ts, closed_ts, kind, topic, category, label,"
-                    " first_ts, ask_count, ask_ts, chain_ts)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
-                    " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
-                    " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
-                    " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0,"
-                    " kind = excluded.kind, topic = excluded.topic,"
-                    " category = excluded.category, label = excluded.label,"
-                    " first_ts = excluded.first_ts, ask_count = excluded.ask_count,"
-                    " ask_ts = excluded.ask_ts, chain_ts = excluded.chain_ts",
-                    (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
-                     tg_text, headline, kind, topic, category, label,
-                     chain[0], chain[1], chain[2], alert_ts))
-            except sqlite3.OperationalError:
-                # Fix 1 [v2 SN11]: the ask-chain columns are missing (the column loop in
-                # db() failed) - the alert still gets its row, exactly as before Fix 1.
-                log.exception("Alert row for %s written without the ask chain", user)
-                conn.execute(
-                    "INSERT INTO alerts (wa_user, ts, claimed_by, claimed_ts, tg_msgs, tg_text,"
-                    " headline, escalated_ts, owner_ts, closed_ts, kind, topic, category, label)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)"
-                    " ON CONFLICT(wa_user) DO UPDATE SET ts = excluded.ts,"
-                    " claimed_by = excluded.claimed_by, claimed_ts = excluded.claimed_ts,"
-                    " tg_msgs = excluded.tg_msgs, tg_text = excluded.tg_text,"
-                    " headline = excluded.headline, escalated_ts = 0, owner_ts = 0, closed_ts = 0,"
-                    " kind = excluded.kind, topic = excluded.topic,"
-                    " category = excluded.category, label = excluded.label",
-                    (user, alert_ts, keep_claim[0], keep_claim[1], ",".join(tg_handles),
-                     tg_text, headline, kind, topic, category, label))
-            conn.execute(
-                "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts, kind)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (user, alert_ts, headline, keep_claim[0], keep_claim[1], kind))
+                    "INSERT INTO claim_log (wa_user, alert_ts, headline, claimed_by, claimed_ts, kind)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (user, alert_ts, headline, keep_claim[0], keep_claim[1], kind))
+                if wait:
+                    # [Debounce] in a SAVEPOINT: its failure never takes the row with it
+                    pend_ok = _alert_pending_write(conn, user, alert_ts, alert_ts, pend_e, pend_live, False,
+                                                   headline, category, tg_text, kind, topic,
+                                                   chain[1] == 3 and chain[2] == alert_ts)
+        except Exception:
+            if wait:
+                # [Debounce] the alert row could not be written: its post goes now, as before, then today's error (B2)
+                _post_now()
+            raise
+        if wait and not pend_ok:
+            # [Debounce] fail open: the post could not wait - it goes now, as before. [R2, F5] With the customer's
+            # previous alert merged in when its post was still waiting (this row replaced its row: it would be dropped)
+            _alert_fail_open_post(user, alert_ts, pend_e if pend_live else None, headline, category, tg_text, kind,
+                                  topic, bool(keep_claim[0]), _post_now, chain[1] == 3 and chain[2] == alert_ts)
         if since_ts and 0 < since_ts < alert_ts:
             # [R2 fix, RT-1 / R2C-F1] the waiting lists age and order this alert by when the customer wrote
             try:
                 set_setting(f"alert_since:{user}", f"{alert_ts!r}|{since_ts!r}")
             except Exception:
                 log.exception("Could not keep when %s wrote", user)
-        if chain[1] == 3 and chain[2] == alert_ts:
-            _ask3_ping(user, headline, label, alert_ts, chain[0])
+        if chain[1] == 3 and chain[2] == alert_ts and not pend_ok:
+            _ask3_ping(user, headline, label, alert_ts, chain[0])   # [Debounce] a waiting post carries it (ask3)
         mark_person_promised(user, "alert:" + (kind or "?"))
 
 # ---------------------------------------------------------------- Fix 1: the ask counter
@@ -6269,8 +7151,9 @@ def chase_preview(user: str, nowts: float) -> tuple:
             return False, "no alert"
         alert_ts, chased_ts, closed_ts, first_ts, chain_ts, fold_ts = r
         alert_ts = alert_ts or 0.0
-        if alert_ts > nowts - ALERT_CHASE_HOURS * 3600:
-            return False, f"not due yet - the chase comes {ALERT_CHASE_HOURS:g} h after the alert"
+        # [debounce] the ONE ladder clock (alert_clock_ts): due ALERT_CHASE_HOURS after the alert's Telegram post
+        if alert_clock_ts(user, alert_ts) > nowts - ALERT_CHASE_HOURS * 3600:
+            return False, f"not due yet - the chase comes {ALERT_CHASE_HOURS:g} h after the alert's Telegram post"
         if alert_ts < nowts - 24 * 3600:
             return False, "the alert is over 24 h old"
         if (chased_ts or 0) >= alert_ts:
@@ -14859,6 +15742,10 @@ def chase_unresolved_alerts() -> None:
                                                                (cutoff, nowts - 24 * 3600)).fetchall()]
     for user, alert_ts, first_ts, chain_ts, fold_ts in rows:
         try:
+            # [debounce] the ONE ladder clock (alert_clock_ts): due ALERT_CHASE_HOURS after the alert's Telegram
+            # post - an alert posted later than it was raised waits for the next hourly pass
+            if alert_clock_ts(user, alert_ts) > cutoff:
+                continue
             if is_blocked(user) or is_paused(user) or (
                     OWNER_WHATSAPP and user == OWNER_WHATSAPP):
                 continue
@@ -15944,6 +16831,10 @@ def close_alert(user: str, who: str, auto: bool = False, tapped_ts: str = "") ->
             if int(float(tapped_ts)) != int(ts or 0):
                 if (closed_ts or 0) >= (ts or 0):
                     return "That one's already been dealt with - this is an older alert.", None
+                if _alert_newer_post_waiting(user, ts):
+                    # [debounce] their newer alert has not reached Telegram yet - nothing to press Done on yet
+                    return ("Their newer message is about to post as a new alert (within a few minutes) - "
+                            "press Done on that one."), None
                 try:
                     with closing(db()) as conn:
                         wrote = conn.execute(
@@ -16070,7 +16961,7 @@ def escalate_unclaimed_alerts() -> None:
                 continue
             if (claimed_by or "").strip() or not (8 <= hour < 20):
                 continue
-            mins = int((now - ts) / 60)
+            mins = int((now - alert_clock_ts(user, ts)) / 60)    # [debounce] from the alert's Telegram post
             label = customer_label(user)
             # [R3 fix, RT-1 twin] 'waiting since' when the customer wrote, as the alert's first post says it (display
             # only: the ladder's clocks stay on the alert's own time)
@@ -16108,6 +16999,9 @@ def claim_scoreboard_text(days: int = 7) -> str:
         rows = conn.execute(
             "SELECT wa_user, alert_ts, claimed_by, claimed_ts, closed_ts, closed_by, owner_ts "
             "FROM claim_log WHERE alert_ts >= ? ORDER BY alert_ts", (now - days * 86400,)).fetchall()
+    # [Debounce R2] a raise merged into another Telegram post was never a post of its own: its row is kept for fix3's
+    # dedupes (closed 'merged into one post') and not counted here - one counted row per post
+    rows = [r for r in rows if (r[5] or "") != _ALERT_MERGED_LABEL]
     if not rows:
         return ""
     auto_closers = {"replied in WhatsApp", "sorted (booked or replied)"}
@@ -19845,6 +20739,10 @@ def telegram_button_loop() -> None:
                 owner_drafts_sweep()   # an owner's ✅ or note lost mid-way (a restart)
             except Exception:
                 log.exception("Owner drafts sweep error")
+            try:
+                _ensure_alert_post_thread()   # [debounce] the watchdog: the alert post loop runs - and only once
+            except Exception:
+                log.exception("Alert post watchdog error")
 
 UNRESOLVED_DIGEST_HOUR = int(os.environ.get("UNRESOLVED_DIGEST_HOUR", "18"))
 
@@ -20390,6 +21288,11 @@ app = FastAPI(title="WhatsApp Claude Bot")
 
 @app.on_event("startup")
 def _start_reminder_thread() -> None:
+    _ALERT_POST_STATE["wanted"] = True    # [Debounce] this process runs the app: it has the ONE post loop
+    try:
+        _ensure_alert_post_thread()     # [Debounce] first: what a deploy left waiting is posted first thing
+    except Exception:
+        log.exception("Could not start the alert post loop")
     threading.Thread(target=reminder_loop, daemon=True).start()
     threading.Thread(target=telegram_button_loop, daemon=True).start()
     log.info("Reminder scheduler started (template=%s, lang=%s, enabled=%s)",
@@ -20607,6 +21510,8 @@ READ_ONLY_ACTIONS.add("holidays")
 # O2: can WhatsApp take a text to this number now, and what would each path do - reads the time
 # of their last message and their open read-backs only; sends and saves nothing.
 READ_ONLY_ACTIONS.add("windowcheck")
+# Alert debounce (13 Oct 2026): a customer's waiting Telegram post and what the flush would do with it - reads only.
+READ_ONLY_ACTIONS.add("debouncetest")
 
 
 def review_link_token() -> str:
@@ -21060,6 +21965,27 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 " headline, tg_msgs, COALESCE(label,''), COALESCE(kind,''), COALESCE(topic,''),"
                 " COALESCE(category,'') FROM alerts WHERE ts > ? ORDER BY ts ASC LIMIT 200",
                 (nowts - 3 * 86400,)).fetchall()
+        # [Debounce] when each alert was posted and whether its post still waits - guarded reads of their own (the
+        # SELECT above has no missing-column fallback)
+        posted_, pending_ = {}, {}
+        try:
+            with closing(db()) as conn:
+                for u_, t_, p_ in conn.execute("SELECT wa_user, ts, COALESCE(posted_ts, 0) FROM alerts WHERE ts > ?",
+                                               (nowts - 3 * 86400,)).fetchall():
+                    posted_[u_] = (t_, p_)
+        except Exception:
+            posted_ = {}
+        try:
+            with closing(db()) as conn:
+                for r_ in conn.execute("SELECT " + ", ".join(_ALERT_PENDING_COLS) + " FROM alert_pending").fetchall():
+                    e_ = dict(zip(_ALERT_PENDING_COLS, r_))
+                    try:
+                        e_["post_at"] = _alert_post_at(conn, e_["wa_user"], e_)
+                    except Exception:
+                        e_["post_at"] = e_.get("due_ts") or 0.0
+                    pending_[e_["wa_user"]] = e_
+        except Exception:
+            pending_ = {}
         out = []
         for (user, ts, by, cts, clts, ets, ots, headline, tg_msgs, label, kind, topic,
              category) in rows:
@@ -21074,7 +22000,8 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                         "raised": when(ts), "state": state,
                         "reposted_30min": bool(ets and ets >= ts),
                         "sent_to_owner_2h": bool(ots and ots >= ts),
-                        "telegram_copies": len([h for h in (tg_msgs or "").split(",") if ":" in h])})
+                        "telegram_copies": len([h for h in (tg_msgs or "").split(",") if ":" in h]),
+                        **_claimstatus_post_keys(user, ts, tg_msgs, posted_, pending_, when)})
         try:
             tappers = dict(json.loads(get_setting("claim_tappers") or "{}"))
         except Exception:
@@ -22404,6 +23331,35 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
                 "sentences": [{"text": s.strip()[:200], "promise": is_promise_text(s),
                                "fixed": promise_fix(s, chase=chase).strip()[:200]}
                               for s in _PF_SENT_SPLIT_RE.split(reply) if s.strip()][:12]}
+    if action == "debouncetest":
+        # Read-only (alert debounce, 13 Oct 2026) - the deploy probe. Always: the switches this process runs with,
+        # how many posts are waiting, and whether the post loop is alive. need=<number>: that customer's waiting
+        # Telegram post - when it is due, and whether the flush would post it now or drop it (and why). Nothing is
+        # written, sent or closed.
+        d_, cap_ = _alert_debounce_times()
+        t_ = _ALERT_POST_STATE.get("thread")
+        last_ = _ALERT_POST_STATE.get("last_tick") or 0.0
+        try:
+            with closing(db()) as conn:
+                waiting_ = conn.execute("SELECT COUNT(*) FROM alert_pending").fetchone()[0]
+        except Exception as ex:
+            waiting_ = f"unreadable ({type(ex).__name__})"
+        res = {"switches": {"ALERT_DEBOUNCE_SECONDS": ALERT_DEBOUNCE_SECONDS,
+                            "ALERT_DEBOUNCE_CAP_SECONDS": ALERT_DEBOUNCE_CAP_SECONDS,
+                            "ALERT_POST_TICK_SECONDS": ALERT_POST_TICK_SECONDS,
+                            "quiet_seconds_used": d_, "cap_seconds_used": cap_, "telegram_on": telegram_enabled()},
+               "loop_alive": bool(t_ is not None and t_.is_alive()),
+               "loop_started_by_app": bool(_ALERT_POST_STATE.get("wanted")),
+               "loop_last_pass": _fmt_ts(last_) if last_ else "never", "posts_waiting_total": waiting_,
+               # [Debounce R2, parity F6] the same facts under the headlights twin's names, so one deploy / rollback
+               # script reads both bots: pending_total; loop.alive / loop.seconds_since_last_tick
+               "pending_total": waiting_,
+               "loop": {"alive": bool(t_ is not None and t_.is_alive()), "last_tick": _fmt_ts(last_) if last_ else "",
+                        "seconds_since_last_tick": int(time.time() - last_) if last_ else None}}
+        num = normalize_phone(need or phone or "")
+        if num:
+            res.update({"number": num, **alert_post_preview(num)})
+        return res
     if action == "asktest":
         # Read-only (Fix 1). need=<number>: the customer's alert chain, what the counter
         # would do if they asked again now, and whether the chase would message them.
