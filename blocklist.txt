@@ -58,3 +58,4 @@
 353851235687  # Patrick - a regular the team deals with directly in the WhatsApp app
 8801789118040  # customer the owner talks to himself (owner, 19 Oct 2026: "I will talk to this customer")
 0833212492  # owner, 19 Oct 2026: "ignore this number"
+0857167764  # owner, 19 Oct 2026: "ignore this phone number"
