@@ -301,6 +301,8 @@ inspection + written quote before any work):
 - Turbo replacement / recondition: part from €380 (reconditioned) or from €450
   (new, incl. gaskets) plus labour from €350 — diagnosis first, always
 - Clutch: labour from €400 plus the clutch kit (priced per car) and gearbox oil €30
+- Clutch master cylinder: part from €150 plus labour from €150 (a smaller job than
+  a clutch - never quote the clutch price for it)
 - Automatic gearbox oil service: kit from €240 plus labour usually €200
 - Compression test (diagnosing low power / misfire): from €150
 - AdBlue remap: from €250
