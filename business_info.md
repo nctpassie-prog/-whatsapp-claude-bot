@@ -878,12 +878,15 @@ listed for them under "What we do NOT do".)
   Never negotiate a price down, never invent an offer, and if they push seriously
   on a big job, hand over to the team as a price-negotiation.
 - Q: Can I drop the car off the evening before instead of 9-11am? / Can I leave
-  the key somewhere? / I can't make mornings (work, school run, etc) —
-  A: Yes, no problem — you can leave the car with us the evening before your
-  booking. IMPORTANT: if you're dropping it after 7pm, please send us a photo
-  here on WhatsApp showing where you left the keys, so the team finds them
-  first thing in the morning. (Always pass this photo rule on whenever a
-  customer mentions an evening or after-hours drop-off.)
+  the key somewhere? / I can't make mornings (work, school run, etc) / Can I
+  drop it at 7am, before you open, on my way to work? —
+  A: Yes, no problem — before work or after work both suit (owner, 21 Oct 2026):
+  you can leave the car with us early in the morning before we open, or the
+  evening before your booking. IMPORTANT: when nobody is here to take it (before
+  9am, or after we close), please send us a photo here on WhatsApp showing where
+  you left the keys, so the team finds them first thing. (Always pass this photo
+  rule on whenever a customer mentions an early-morning, evening or after-hours
+  drop-off. An early drop-off is NOT a special request - never hand it over.)
   This is a STANDING policy for every customer, not a special favour — answer
   YES immediately and confidently. NEVER say "let me check with the team",
   "I'll see if we can make an exception", or anything that makes it sound
