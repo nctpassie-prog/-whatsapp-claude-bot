@@ -4715,10 +4715,134 @@ def is_long_stay(need: str) -> bool:
         return True
     return bool(_LEAVE_CUE_RE.search(n) and _LONG_DURATION_RE.search(n))
 
+# [calcount, owner 22 Oct 2026] the TEAM's bookings live in the bookings Google Calendar as ALL-DAY events
+# ("152d622 dpf removal +egr block"); the bot writes only timed 9-11 events. Each all-day event counts as one
+# car on every day it covers, unless the reg in its title is already in the diary that day.
+CALENDAR_MANUAL_COUNT = os.environ.get("CALENDAR_MANUAL_COUNT", "1").strip() != "0"
+_CAL_EXTRA = {"ts": 0.0, "ok_ts": 0.0, "days": {}, "busy": False}
+_CAL_EXTRA_LOCK = threading.Lock()
+_CAL_REG_NORM_RE = re.compile(r"[^A-Z0-9]")
+# [calcount r2] an all-day NOTE in the bookings calendar, not a car
+_CAL_NOTE_RE = re.compile(
+    r"\b(?:holiday|holidays|hols|day off|off work|annual leave|leave|sick|closed|shut|training|meeting"
+    r"|reminder|note|birthday|bank holiday|away|vacation|appointment for (?:me|dima|vlad|tadas))\b",
+    re.IGNORECASE)
+
+
+def _calendar_all_day_titles(start, end):
+    """{iso: [title, ...]} for the all-day events in the bookings calendar between start and end (dates),
+    or None when Google could not be read."""
+    tok = _google_access_token("calendar")
+    if not tok:
+        return None
+    items, page = [], ""
+    for _ in range(10):
+        params = {"timeMin": f"{start}T00:00:00Z", "timeMax": f"{end}T23:59:59Z",
+                  "singleEvents": "true", "maxResults": 250}
+        if page:
+            params["pageToken"] = page
+        r = httpx.get(f"https://www.googleapis.com/calendar/v3/calendars/{quote(GOOGLE_CALENDAR_ID)}/events",
+                      params=params, headers={"Authorization": f"Bearer {tok}"}, timeout=10)
+        if r.status_code >= 300:
+            log.warning("Calendar read failed %s: %s", r.status_code, (r.text or "")[:200])
+            return None
+        data = r.json()
+        items.extend(data.get("items", []))
+        page = data.get("nextPageToken") or ""
+        if not page:
+            break
+    out = {}
+    for ev in items:
+        st, en = ev.get("start") or {}, ev.get("end") or {}
+        title = (ev.get("summary") or "").strip()
+        if "date" not in st or not title or ev.get("status") == "cancelled":
+            continue      # timed = the bot's own 9-11 events (or anything else timed): not counted here
+        if _CAL_NOTE_RE.search(title):
+            continue      # [calcount r2] "Dima holiday", "closed", "training": a note, not a car
+        try:
+            d0 = date.fromisoformat(st["date"])
+            d1 = date.fromisoformat(en.get("date") or st["date"])
+        except ValueError:
+            continue
+        if (d1 - d0).days > 1:
+            continue      # [calcount r2] a multi-day all-day event is a note (a holiday), not one car
+        out.setdefault(d0.isoformat(), []).append(title)
+    return out
+
+
+def _calendar_extra_rows(today, days: int = 40) -> list:
+    """[(iso, title)] for the team's calendar bookings from today on (see calendar_extra_needs)."""
+    out = []
+    if not CALENDAR_MANUAL_COUNT:
+        return out
+    if not calendar_enabled():
+        return out
+    by_day = {}      # [calcount r2] the diary regs for the whole range in one query
+    with closing(db()) as conn:
+        for d, r in conn.execute("SELECT date, reg FROM bookings WHERE date >= ?",
+                                 (today.isoformat(),)).fetchall():
+            by_day.setdefault(d, set()).add(_CAL_REG_NORM_RE.sub("", (r or "").upper()))
+    for i in range(days):
+        iso = (today + timedelta(days=i)).isoformat()
+        out.extend((iso, t) for t in calendar_extra_needs(iso, by_day.get(iso, set())))
+    return out
+
+
+def calendar_extra_needs(date_str: str, regs=None) -> list:
+    """The team's all-day calendar bookings on this day that the diary does not already hold (their titles,
+    which serve as the job text). [] when switched off, not connected, or Google cannot be read."""
+    if not CALENDAR_MANUAL_COUNT or not calendar_enabled():
+        return []
+    _calendar_extra_refresh()
+    with _CAL_EXTRA_LOCK:
+        titles = list(_CAL_EXTRA["days"].get(date_str, []))
+    if not titles:
+        return []
+    if regs is None:
+        with closing(db()) as conn:
+            regs = {_CAL_REG_NORM_RE.sub("", (r or "").upper()) for (r,) in conn.execute(
+                "SELECT reg FROM bookings WHERE date = ?", (date_str,)).fetchall()}
+    regs = {r for r in regs if len(r) >= 5}
+    return [t for t in titles if not any(r in _CAL_REG_NORM_RE.sub("", t.upper()) for r in regs)]
+
+
+def _calendar_extra_fetch() -> None:
+    """[calcount r2] One read of the bookings calendar into the cache (runs in its own thread)."""
+    now = time.time()
+    try:
+        today = now_local().date()
+        got = _calendar_all_day_titles(today - timedelta(days=1), today + timedelta(days=45))
+    except Exception:
+        log.exception("Calendar read for the team's bookings failed")
+        got = None
+    with _CAL_EXTRA_LOCK:
+        if got is not None:
+            _CAL_EXTRA.update(ok_ts=now, days=got)
+        elif now - _CAL_EXTRA["ok_ts"] > 1800:
+            _CAL_EXTRA["days"] = {}
+        _CAL_EXTRA["busy"] = False
+
+
+def _calendar_extra_refresh() -> None:
+    """[calcount r2] Start a background read when the cache is over 5 min old - never wait for Google here.
+    The very first read (empty cache, nothing good yet) waits up to 8 s so a fresh start counts at once."""
+    with _CAL_EXTRA_LOCK:
+        if _CAL_EXTRA.get("busy") or time.time() - _CAL_EXTRA["ts"] <= 300:
+            return
+        _CAL_EXTRA["ts"] = time.time()
+        _CAL_EXTRA["busy"] = True
+        first = not _CAL_EXTRA["ok_ts"]
+    t = threading.Thread(target=_calendar_extra_fetch, daemon=True)
+    t.start()
+    if first:
+        t.join(8)
+
+
 def _hard_count(date_str: str) -> int:
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?",
                             (date_str,)).fetchall()
+    rows = list(rows) + [(t,) for t in calendar_extra_needs(date_str)]     # [calcount]
     return sum(1 for (n,) in rows if is_hard_job(n or "") and not is_long_stay(n or "")
                and not service_quick_look(n or ""))
 
@@ -5012,6 +5136,7 @@ def _other_count(date_str: str) -> int:
     with closing(db()) as conn:
         rows = conn.execute("SELECT need FROM bookings WHERE date = ?",
                             (date_str,)).fetchall()
+    rows = list(rows) + [(t,) for t in calendar_extra_needs(date_str)]     # [calcount]
     return sum(1 for (n,) in rows if not counts_as_service(n or "") and not is_long_stay(n or ""))
 
 
@@ -5039,6 +5164,7 @@ def day_full_reason(date_str: str, need: str = "") -> str:
     with closing(db()) as conn:
         n = conn.execute("SELECT COUNT(*) FROM bookings WHERE date = ?",
                          (date_str,)).fetchone()[0]
+    n += len(calendar_extra_needs(date_str))     # [calcount] the team's calendar bookings
     cap = day_capacity(d)
     if n >= cap:
         return "capacity"
@@ -5406,6 +5532,7 @@ def availability_block() -> str:
             "SELECT date, need FROM bookings WHERE date >= ?",
             (today.isoformat(),),
         ).fetchall()
+    rows = list(rows) + _calendar_extra_rows(today)     # [calcount] the team's calendar bookings
     taken, hard, other = {}, {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
@@ -21414,6 +21541,7 @@ h1{margin:0;font-size:18px}
 # Admin actions that only READ. The review key may run these; everything else —
 # clearing bookings, turning the bot off, deleting contacts — needs the master key.
 READ_ONLY_ACTIONS = {"status", "bookingreport", "customers", "gaps", "delivery", "followuptest", "gstatus",
+                     "calextra",
                      "nudgetest",
                      "waiting", "claimboard", "claimtest", "claimstatus", "claimname",
                      # Writes, but only ever adds the owner's OWN bookings to the
@@ -23063,6 +23191,18 @@ def admin(token: str = Query(""), action: str = Query("status"), date: str = Que
         except Exception as exc:
             out["freeform_result"] = {"error": str(exc)[:300]}
         return out
+    if action == "calextra":
+        # [calcount] read-only: the team's all-day calendar bookings the bot now counts, per day (masked)
+        today = now_local().date()
+        days = {}
+        for iso, t in _calendar_extra_rows(today, min(60, int(need)) if (need or "").isdigit() else 14):
+            days.setdefault(iso, []).append(re.sub(r"\+?\d[\d ]{7,14}\d", lambda m: "…" + m.group(0)[-3:], t))
+        return {"switch_on": CALENDAR_MANUAL_COUNT, "calendar_connected": calendar_enabled(),
+                "last_good_read": datetime.fromtimestamp(_CAL_EXTRA["ok_ts"]).strftime("%d %b %H:%M")
+                if _CAL_EXTRA["ok_ts"] else "",
+                "stale": bool(_CAL_EXTRA["ok_ts"]) and time.time() - _CAL_EXTRA["ok_ts"] > 900,
+                "days": days,
+                "per_day": {k: len(v) for k, v in sorted(days.items())}}
     if action == "gstatus":
         # Is Google Contacts connected? (never returns the token itself)
         return {"google_client_id_set": bool(GOOGLE_CLIENT_ID),
@@ -24799,6 +24939,7 @@ def _voice_availability() -> str:
     with closing(db()) as conn:
         rows = conn.execute("SELECT date, need FROM bookings WHERE date >= ?",
                             (today.isoformat(),)).fetchall()
+    rows = list(rows) + _calendar_extra_rows(today)     # [calcount] the team's calendar bookings
     taken, hard, other = {}, {}, {}
     for d, need in rows:
         taken[d] = taken.get(d, 0) + 1
