@@ -3300,6 +3300,20 @@ def prev_message_needs_answer(text: str) -> bool:
             or bool(_ACK_PREV_OFFER_RE.search(t)) or bool(_ACK_PRICE_RE.search(t)))
 
 
+def ack_after_statement(user: str) -> bool:
+    """[owner 22 Oct 2026] The customer's latest message is ONLY an ok / sure / thanks / 👍 and the last
+    message we sent (bot or staff) asked no question. Unsure -> False (the blank alert fires)."""
+    try:
+        if not is_pure_ack(_recent_customer_words(user, 1)):
+            return False
+        with closing(db()) as conn:
+            prev = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role IN"
+                                " ('assistant', 'staff') ORDER BY id DESC LIMIT 1", (user,)).fetchone()
+        return bool(prev) and "?" not in (prev[0] or "")
+    except Exception:
+        return False
+
+
 def pure_thank_you_turn(user: str, customer_text: str) -> bool:
     """The customer's message is ONLY a thank-you/ok/👍 AND the last thing we sent (bot or
     staff) asked nothing, read nothing back, offered nothing and quoted nothing. Call it
@@ -12446,6 +12460,11 @@ def _finish_reply(user: str, answer: str) -> str:
             answer = ""
     else:
         answer = strip_markup_debris(answer)
+    if not answer.strip() and not is_owner and ack_after_statement(user):
+        # [owner 22 Oct 2026] nothing to say to a bare "Sure" after "You're booked in": the short close,
+        # no holding line and no blank alert (a question we asked keeps both, below)
+        log.info("Blank reply for %s to a bare ok after a statement - short close, no alert", user)
+        answer = ack_short_close(user, raw_answer or "")
     if not answer.strip():
         log.warning("Blank reply for %s after marker processing — sending fallback (raw=%r)",
                     user, (raw_answer or "")[:300])
