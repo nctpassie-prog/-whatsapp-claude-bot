@@ -1032,6 +1032,60 @@ def process_cancel(answer: str):
     # request: hand back something truthy and let the phone number find them.
     return clean, (fields or {"_empty": True})
 
+# Day and month names in the customer's language (Thursday build, 23 Oct 2026). Every
+# templated message formats its day with strftime, which is English, so a Romanian
+# customer read "Până la Wednesday 04 November suntem complet ocupați" (Ion, 23 Oct) -
+# and the model copies the English months into its own reply ("miercuri 04 November").
+# Only the words are swapped: no weekday is worked out here, so nothing can move a day.
+_EN_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_EN_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august",
+              "september", "october", "november", "december")
+_LOCAL_WEEKDAYS = {
+    "ro": ("luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică"),
+    "ru": ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"),
+    "lt": ("pirmadienis", "antradienis", "trečiadienis", "ketvirtadienis", "penktadienis",
+           "šeštadienis", "sekmadienis"),
+}
+_LOCAL_MONTHS = {   # the form that follows a day number ("4 noiembrie", "4 ноября", "lapkričio 4 d.")
+    "ro": ("ianuarie", "februarie", "martie", "aprilie", "mai", "iunie", "iulie", "august",
+           "septembrie", "octombrie", "noiembrie", "decembrie"),
+    "ru": ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+           "сентября", "октября", "ноября", "декабря"),
+    "lt": ("sausio", "vasario", "kovo", "balandžio", "gegužės", "birželio", "liepos",
+           "rugpjūčio", "rugsėjo", "spalio", "lapkričio", "gruodžio"),
+}
+_EN_WD_ALT = "|".join(_EN_WEEKDAYS)
+_EN_DATE_WORDS_RE = re.compile(
+    r"\b(?:(?P<wd>" + _EN_WD_ALT + r"),?\s+(?:the\s+)?)?(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+"
+    r"(?:of\s+)?(?P<mon>" + "|".join(_EN_MONTHS) + r")\b"
+    r"|\b(?P<wd2>" + _EN_WD_ALT + r")\b", re.IGNORECASE)
+
+
+def localize_dates(text: str, lang: str = "") -> str:
+    """English day/month names -> the reply's own language (ro, ru, lt). `lang` is the
+    language the text is in; left empty, it is read from the text itself. English, and
+    any language without a table, comes back unchanged."""
+    if not text:
+        return text
+    lang = (lang or _guess_lang_code(text) or "en").strip().lower()[:2]
+    if lang not in _LOCAL_WEEKDAYS:
+        return text
+    wds, mons = _LOCAL_WEEKDAYS[lang], _LOCAL_MONTHS[lang]
+
+    def _one(m):
+        if m.group("wd2"):
+            return wds[_EN_WEEKDAYS.index(m.group("wd2").lower())]
+        wd = wds[_EN_WEEKDAYS.index(m.group("wd").lower())] if m.group("wd") else ""
+        day, mon = int(m.group("day")), mons[_EN_MONTHS.index(m.group("mon").lower())]
+        if lang == "ro":
+            return f"{wd} {day} {mon}".strip()
+        if lang == "ru":
+            return f"{day} {mon}" + (f" ({wd})" if wd else "")
+        return f"{mon} {day} d." + (f" ({wd})" if wd else "")
+
+    return _EN_DATE_WORDS_RE.sub(_one, text)
+
+
 BOOKED_LINE_MSG = {
     "en": "You're booked in for {day} \U0001F44D",
     "ru": "Записали вас на {day} \U0001F44D",
@@ -1070,8 +1124,8 @@ def which_booking_question(rows: list) -> str:
     # Their own language, taken from whichever booking recorded one.
     lang = reminder_lang_code(
         next((b.get("lang", "") for b in rows if b.get("lang")), ""))
-    return WHICH_BOOKING_MSG.get(lang, WHICH_BOOKING_MSG["en"]).format(
-        list="\n".join(lines))
+    return localize_dates(WHICH_BOOKING_MSG.get(lang, WHICH_BOOKING_MSG["en"]).format(
+        list="\n".join(lines)), lang)
 
 def cancel_booking(user: str, fields: dict, allow_multiple: bool = False,
                    date_strict: bool = False, exclude_date: str = "") -> dict:
@@ -4244,8 +4298,8 @@ def closed_day_msg(lang: str, iso: str, alt: str) -> str:
     # `alt` is a day ("Tuesday 27 October") - or, when nothing is free, the helpers'
     # fallback sentence for the owner ("next month — ask the team"): ask instead.
     if not re.fullmatch(r"[A-Z][a-z]+day \d{2} [A-Z][a-z]+", alt or ""):
-        return CLOSED_DAY_NOALT_MSG.get(lang, CLOSED_DAY_NOALT_MSG["en"]).format(day=day)
-    return CLOSED_DAY_MSG.get(lang, CLOSED_DAY_MSG["en"]).format(day=day, alt=alt)
+        return localize_dates(CLOSED_DAY_NOALT_MSG.get(lang, CLOSED_DAY_NOALT_MSG["en"]).format(day=day), lang)
+    return localize_dates(CLOSED_DAY_MSG.get(lang, CLOSED_DAY_MSG["en"]).format(day=day, alt=alt), lang)
 
 
 def booking_year_fix(d, today):
@@ -9788,6 +9842,7 @@ def staff_day_yes_book(user: str, text: str) -> bool:
     if lang == "en" and (fields.get("lang") or "").strip().lower()[:2] in ("ru", "ro", "lt"):
         lang = fields["lang"].strip().lower()[:2]
     line = BOOKED_LINE_MSG.get(lang, BOOKED_LINE_MSG["en"]).format(day=day)
+    line = localize_dates(line, lang)
     send_whatsapp(user, line)
     save_message(user, "assistant", line)
     if fields.get("_note"):
@@ -11335,6 +11390,9 @@ _FOREIGN_OFFER_RE = re.compile(
     r"запис|запиш|заброни|подойд|подход|удобн|предлож|предлаг|свобод|привез|приезж|как\s+насч"
     r"|tinka|tiktų|tiktu|registruo|užregistr|atvež|atvažiuo|laisv|siūl|galime"
     r"|convine|potriv|programa|programez|programăm|aduce|liber|oferi|putem"
+    # [thu29 item 5] "come in" words (Ion, 23 Oct: "poți veni mâine, sâmbătă 24 octombrie")
+    r"|po[țt]i\s+veni|pute[țt]i\s+veni|veni[țt]i|\bvino\b|\bte\s+pun\b|\bv[ăa]\s+pun\b"
+    r"|приех|приед|atvyk"
     r"|pasuj|odpowiad|zapis|umówi|przywie|woln|możemy|proponuj",
     re.IGNORECASE)
 # A day the reply turns DOWN is not an offer. 24 Sep 2026: "Wednesday 30 September
@@ -12045,12 +12103,22 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "",
             # Every day it names, it turns down for the job: judge the first one
             # anyway - the honest message names a day that will take the job.
             pd, need, reason, prop, conversational = skipped
+        # [thu29 item 5] A day before BOOKINGS_FROM is never offered either: the gate
+        # refuses it the moment they say yes (Ion ...020, 23 Oct 2026: a comeback offered
+        # "mâine, sâmbătă 24 octombrie", then "fully booked until 4 November" one line on).
+        if (pd >= today and before_open_date(pd.isoformat())
+                and not _has_booking_on(user, pd.isoformat())):
+            lang = _guess_lang_code(text)
+            opens = bookings_open_from()
+            log.info("Proposal for %s on %s replaced: before BOOKINGS_FROM", user, pd)
+            return localize_dates(NOT_OPEN_MSG.get(lang, NOT_OPEN_MSG["en"]).format(
+                date=first_bookable_day(opens, need).strftime("%A %d %B")), lang)
         if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
             alt = next_day_for_job(need)
             msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
             lang = _guess_lang_code(text)
-            answer = (msg.get(lang, msg["en"]).format(alt=alt)
-                      if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]))
+            answer = localize_dates(msg.get(lang, msg["en"]).format(alt=alt)
+                                    if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]), lang)
             log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
                      user, pd, reason, need[:60],
                      "conversational" if conversational else "confirm-format")
@@ -12209,6 +12277,7 @@ def _finish_reply(user: str, answer: str) -> str:
             missing = "the car make and model" if not clean_car(booking.get("car", "")) else "the registration number"
             log.info("Booking for %s rejected: missing %s", booking.get("date"), missing)
             answer = f"Just before I book you in — could I get {missing} please? 👍"
+            answer = localize_dates(answer)   # [thu29 item 8]
             save_message(user, "assistant", answer)
             return answer
         # Hard safety net: never confirm a booking on a day that is already full.
@@ -12237,6 +12306,7 @@ def _finish_reply(user: str, answer: str) -> str:
                             f"{booking.get('need', '')}). Squeeze them in?", kind="not_open_date")
             except Exception:
                 log.exception("Failed to alert owner about an early-date request")
+            answer = localize_dates(answer)   # [thu29 item 8]
             save_message(user, "assistant", answer)
             return answer
         # A bank holiday is shut (owner, 28 Sep 2026): say so, never "fully booked", and
@@ -12254,6 +12324,7 @@ def _finish_reply(user: str, answer: str) -> str:
             alt = next_day_for_job(booking.get("need", ""), not_before=_stored)
             log.info("Booking for %s rejected: bank holiday", _stored)
             answer = closed_day_msg(reminder_lang_code(booking.get("lang", "")), _stored, alt)
+            answer = localize_dates(answer)   # [thu29 item 8]
             save_message(user, "assistant", answer)
             return answer
         if (not is_owner and not already_booked
@@ -12264,12 +12335,14 @@ def _finish_reply(user: str, answer: str) -> str:
             answer = HARD_FULL_MSG.get(
                 reminder_lang_code(booking.get("lang", "")), HARD_FULL_MSG["en"]
             ).format(alt=alt)
+            answer = localize_dates(answer)   # [thu29 item 8]
             save_message(user, "assistant", answer)
             _saturday_refusal_alert(user, booking)
             return answer
         if not is_owner and not already_booked and day_is_full(booking.get("date", ""), booking.get("need", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
             answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
+            answer = localize_dates(answer)   # [thu29 item 8]
             save_message(user, "assistant", answer)
             return answer
         # The model gets weekday arithmetic wrong. Robbie wrote "Tuesday sound
@@ -12623,6 +12696,7 @@ def _finish_reply(user: str, answer: str) -> str:
         note_older_reading(user, before_net, answer, raw_answer)
     if not is_owner:
         answer = plain_job_words(answer, user)   # last: no internal booking words (1 Oct 2026)
+    answer = localize_dates(answer)   # [thu29 item 8]
     save_message(user, "assistant", answer)
     return answer
 
@@ -14299,6 +14373,14 @@ def send_due_reminders() -> None:
             log.exception("Could not report bookings on a bank holiday")
         return
     for bid, name, phone, car, reg, tt, lang, made_ts in rows:
+        # A blocklisted number (a supplier, a trade customer, a friend) never gets a
+        # bot message, and a reminder is one (owner, 26 Oct 2026: Alan Ak autos was
+        # reminded although the bot is told to ignore him). The team books those by hand.
+        if phone and is_blocked(str(phone)):
+            log.info("Reminder for booking %s skipped - number is on the blocklist", bid)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            continue
         # Somebody who was TOLD the date in chat minutes ago does not need a paid
         # template repeating it back (garage booking 438: reminder 31 minutes
         # after the booking, reading to the customer as a mistake). But "booked
@@ -14456,6 +14538,10 @@ def send_due_reviews() -> None:
             (target,),
         ).fetchall()
     for bid, name, phone, car, lang, need in rows:
+        if phone and is_blocked(str(phone)):
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET review_sent = 1 WHERE id = ?", (bid,))
+            continue
         # For now only service customers get the review ask — they left happiest.
         # (Repair/NCT customers often just paid for bad news; widen later if wanted.)
         nl = (need or "").lower()
