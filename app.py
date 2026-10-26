@@ -1067,7 +1067,9 @@ def localize_dates(text: str, lang: str = "") -> str:
     any language without a table, comes back unchanged."""
     if not text:
         return text
-    lang = (lang or _guess_lang_code(text) or "en").strip().lower()[:2]
+    if not lang:
+        lang = _guess_lang_code(re.sub(r"\b[^\W\d_][\w'’-]*", lambda m: "" if m.group(0)[:1].isupper() else m.group(0), text))
+    lang = (lang or "en").strip().lower()[:2]
     if lang not in _LOCAL_WEEKDAYS:
         return text
     wds, mons = _LOCAL_WEEKDAYS[lang], _LOCAL_MONTHS[lang]
@@ -8126,7 +8128,7 @@ def _maybe_courtesy_close(user: str) -> str | None:
         log.warning("Assist reply for %s not sent - a booking question or read-back while a colleague "
                     "holds the chat (%r): %r", user, _ASSIST_BOOKING_ASK_RE.search(reply).group(0), reply[:200])
         return
-    unguarded = no_false_checking(after_hours_wording(reply))
+    unguarded = no_false_cancel(user, no_invented_ready(user, no_false_checking(after_hours_wording(reply))))   # [thu29 6+7]
     reply = guard_day_proposal(user, unguarded)
     # This path strips the booking marker and never calls process_booking, so an
     # assist reply that says "you're booked in" puts NOTHING in the diary. The
@@ -9900,7 +9902,44 @@ def human_handling(user: str) -> bool:
     with closing(db()) as conn:
         row = conn.execute(
             "SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
-    return bool(row) and (time.time() - (row[0] or 0)) < AUTO_RESUME_HOURS * 3600
+    if bool(row) and (time.time() - (row[0] or 0)) < AUTO_RESUME_HOURS * 3600:
+        return True
+    return colleague_asked_first(user)      # [thu29 item 2]
+
+
+# A colleague's own question or request to the other side: a supplier asked for a part, a
+# customer asked to bring the car in. Whatever comes back is the answer to the colleague.
+_STAFF_ASK_RE = re.compile(
+    r"\?|\b(?:do you have|have you got|maybe you have|can you|could you|would you|send me|please send"
+    r"|when (?:will|can|could|do)|how much|in stock)\b"
+    r"|есть ли|у вас есть|можете|сможете|когда|сколько|пришлите|aveți|aveti|puteți|puteti|când|cand"
+    r"|cât|cat costă|turite|ar galite|kada|kiek|atsiųskite", re.IGNORECASE)
+
+
+def colleague_asked_first(user: str, window_h: float = 24) -> bool:
+    """The newest real colleague line opened the conversation (nothing from the customer in
+    the 3 days before it), asked them something, is under `window_h` hours old, and the
+    bot has not spoken since: the customer's reply belongs to that colleague."""
+    try:
+        now = time.time()
+        with closing(db()) as conn:
+            srows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                 " AND ts >= ? ORDER BY ts DESC LIMIT 6",
+                                 (user, now - window_h * 3600)).fetchall()
+            staff = next(((c, t) for c, t in srows if is_real_staff_text(c or "")), None)
+            if not staff or not _STAFF_ASK_RE.search(staff[0] or ""):
+                return False
+            # the colleague's lines of that opening (several short ones in a row count as one)
+            first = min(t for c, t in srows if t >= staff[1] - 30 * 60)
+            before = conn.execute("SELECT 1 FROM messages WHERE wa_user = ? AND role = 'user'"
+                                  " AND ts < ? AND ts >= ? LIMIT 1",
+                                  (user, first, first - 72 * 3600)).fetchone()
+            bot_since = conn.execute("SELECT 1 FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                                     " AND ts > ? LIMIT 1", (user, staff[1])).fetchone()
+        return not before and not bot_since
+    except Exception:
+        log.exception("colleague_asked_first failed for %s", user)
+        return False
 
 # ---------------------------------------------------------------- Claude
 WELCOME_HINT = (
@@ -9954,6 +9993,33 @@ CUSTOMER_KNOWN_RULE = (
 CUSTOMER_CARS_RULE = (
     " They have MORE THAN ONE car on file: if this chat (or their website booking form) already says which car this "
     "request is for, use that one; otherwise ask which one, naming them — never pick one yourself.")
+
+
+def team_status_note(user: str, days: int = 3) -> str:
+    """[thu29 item 1] The colleague's newest "ready" message (with the bill) in this chat, for
+    the model: "is my car ready?" and "what was the €50 for?" are answered from it, not passed
+    to a person (owner, 22 Oct 2026: fewer alerts for what the chat already says)."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                " AND ts >= ? ORDER BY ts DESC LIMIT 20",
+                                (user, time.time() - days * 86400)).fetchall()
+        hit = next(((c, t) for c, t in rows if is_real_staff_text(c or "")
+                    and _is_staff_ready(c or "")), None)
+        if not hit:
+            return ""
+        when = datetime.fromtimestamp(hit[1], ZoneInfo("Europe/Dublin")).strftime("%a %d %b %H:%M")
+        text = " ".join((hit[0] or "").split())[:600]
+        return ("\n\nWHAT THE TEAM ALREADY TOLD THIS CUSTOMER (internal): on " + when
+                + " a colleague wrote in this chat: \"" + text + "\"\n"
+                "So that job IS done. If they ask whether it is ready, say yes - it is ready to collect "
+                "in opening hours. If they ask what the bill was for, read the items and the total from "
+                "that message exactly as written - never add, change or work out a figure, never add VAT "
+                "it does not say. A discount, paying, a different total or anything else about it is "
+                "still for the team.")
+    except Exception:
+        log.exception("team_status_note failed for %s", user)
+        return ""
 
 
 def customer_context(user: str) -> str:
@@ -12151,6 +12217,160 @@ _FABRICATED_LOOK_RE = re.compile(
     r"|I(?:'ve| have)? ?(?:just )?(?:checked|spoken) with (?:Dima|Vlad|the mechanic|the lads)",
     re.IGNORECASE)
 
+# ── Claims only a colleague can make (Thursday build, 23 Oct 2026) ─────────────
+# The knowledge base forbids both and the model still wrote them: Roxanne (...922) said
+# she was coming to collect and was told "your Insignia is ready to collect today until
+# 6pm" with nobody from the team having said so; Kelsey (...339) asked to move her day and
+# read "I've cancelled tomorrow for you" when nothing was cancelled. Judged per sentence;
+# a question or a condition ("we'll message you when it's ready", "would you like me to
+# cancel it?") is not a claim.
+_CLAIM_SENT_SPLIT_RE = re.compile(r"((?<=[.!?])\s+|\n+)")
+_CLAIM_CONDITION_RE = re.compile(
+    r"\b(?:when|once|as soon as|if|until|till|whether|after|before|unless|would you|do you want|shall i"
+    r"|când|cand|imediat ce|dacă|daca|după ce|dupa ce|până când"
+    r"|когда|как только|если|ли|после того"
+    r"|kai|kai tik|jei|jeigu|ar)\b", re.IGNORECASE)
+_READY_CLAIM_RE = re.compile(
+    r"\b(?:is|'s|’s|are|was)\s+(?:now\s+|all\s+|already\s+|fully\s+)?(?:ready|finished|completed)\b"
+    r"(?!\s+(?:by|on|from|tomorrow|later|soon|in\b|within|to\s+(?:book|go\s+ahead|help)))"
+    r"|\bready (?:to|for) (?:be )?(?:collect\w*|pick\w*)"
+    r"|\b(?:este|e)\s+(?:deja\s+)?gat[aă]\b|\bpoate fi ridicat\w*|\bo pute[țt]i ridica\b"
+    r"|(?:машин\w*|авто\w*|она|он)\s+(?:уже\s+)?готов\w*|можно забирать|можете забрать"
+    r"|\bjau\s+paruošt\w*|\b(?:yra\s+)?paruošt[aa]s?\b(?!\s+(?:rytoj|iki))|galite atsiimti|galite pasiimti",
+    re.IGNORECASE)
+# What a colleague writes when the car is done: "Your Audi 141D6762 is ready", "ready for
+# collection", "можно забирать", "gata", "paruošta" - the ready message with the bill.
+# "Your booking is complete", "the form is finished" - about the booking, not the car.
+_READY_NOT_CAR_RE = re.compile(
+    r"\b(?:book\w*|appointment|reservation|programar\w*|запис\w*|registracij\w*|form|details"
+    r"|invoice|receipt|quote|estimate|price|parts?|order|courier|parcel|ship\w*|post\w*)\b"
+    # a future or a usual time: "should be ready to collect by 4pm", "usually ready in 2 hours"
+    r"|\b(?:should|will|'ll|would|usually|normally|typically|expect\w*|hope\w*|might|may|could|by)\b"
+    r"|\b(?:ar trebui|va fi|de obicei|будет|обычно|turėtų|bus|paprastai)\b",
+    re.IGNORECASE)
+_STAFF_READY_RE = re.compile(
+    r"\b(?:is|'s|\u2019s|are|now)\s+(?:all\s+)?ready\b(?!\s+(?:by|on|at|from|tomorrow|later|soon|in\b|after))"
+    r"|^\W*(?:all\s+)?ready\W*$|\bready (?:for|to) (?:collect\w*|pick\w*)\b(?!\s+(?:by|on|at|from|tomorrow|later))"
+    r"|\b(?:e|este)\s+gat[aă]\b|можно забирать|можете забрать|\bjau\s+paruošt\w*|galite atsiimti|galite pasiimti",
+    re.IGNORECASE)
+# ...and not when the same message says it is not, or not yet: "not ready yet", "will be ready".
+_STAFF_NOT_READY_RE = re.compile(
+    r"\bnot\s+(?:\w+\s+)?ready\b|\bnot yet\b|\b(?:will|should|might|may|could)\s+be\s+ready\b|\bнеготов|\bне готов"
+    r"|\bnu\s+e\s+gat|\bdar nepar", re.IGNORECASE)
+
+
+def _is_staff_ready(text: str) -> bool:
+    return bool(_STAFF_READY_RE.search(text or "")) and not _STAFF_NOT_READY_RE.search(text or "")
+_CANCEL_CLAIM_RE = re.compile(
+    r"\b(?:i'?ve|i\u2019ve|i have|we'?ve|we\u2019ve|we have)\s+(?:now\s+|just\s+|gone ahead and\s+)?cancel+ed\b"
+    r"|\b(?:is|'s|\u2019s)\s+(?:now\s+)?cancel+ed for you\b"
+    r"|\bam anulat\b|\b(?:я\s+)?отменил[аи]?\b|\batšaukiau\b",
+    re.IGNORECASE)
+_READY_HOLD_MSG = {
+    "en": "I can't see the workshop from the chat, so I've asked the team to confirm it's ready "
+          "before you come over — they'll reply here.",
+    "ru": "Я не вижу мастерскую из чата, поэтому попросил команду подтвердить, что всё сделано, "
+          "прежде чем вы приедете — вам ответят здесь.",
+    "lt": "Iš pokalbio nematau dirbtuvių, todėl paprašiau komandos patvirtinti, kad darbas baigtas, "
+          "prieš jums atvykstant — jums atsakys čia.",
+    "ro": "Nu văd atelierul din chat, așa că am rugat echipa să confirme că lucrarea e terminată "
+          "înainte să veniți — vă răspund aici.",
+}
+_CANCEL_HOLD_MSG = {
+    "en": "I've passed this to the team to check the diary — they'll get back to you here \U0001F64f",
+    "ru": "Я передал это команде, чтобы проверить запись — вам ответят здесь \U0001F64f",
+    "lt": "Perdaviau komandai patikrinti registraciją — jums atsakys čia \U0001F64f",
+    "ro": "Am transmis echipei să verifice programarea — vă vor răspunde aici \U0001F64f",
+}
+
+
+def _claim_sentences(text: str, rx) -> list:
+    """Indexes (in the split list) of the sentences that make the claim outright."""
+    parts = _CLAIM_SENT_SPLIT_RE.split(text or "")
+    hits = []
+    for i in range(0, len(parts), 2):
+        sent = parts[i]
+        if "<<<" in sent or not rx.search(sent):
+            continue
+        if sent.rstrip().endswith("?") or _CLAIM_CONDITION_RE.search(sent[:rx.search(sent).start()]):
+            continue
+        hits.append(i)
+    return hits
+
+
+def staff_said_ready(user: str, days: int = 3) -> bool:
+    """A colleague told this customer their car is ready, in this chat, in the last few days."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                " AND ts >= ?", (user, time.time() - days * 86400)).fetchall()
+        return any(_is_staff_ready(c or "") for (c,) in rows)
+    except Exception:
+        log.exception("staff_said_ready failed for %s", user)
+        return True     # cannot tell: leave the reply as the model wrote it
+
+
+def no_invented_ready(user: str, answer: str) -> str:
+    """Item 6: a "your car is ready" no colleague gave becomes the honest hold line, and a
+    person is asked (the customer may be on the way to collect)."""
+    try:
+        if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
+            return answer
+        parts0 = _CLAIM_SENT_SPLIT_RE.split(answer or "")
+        hits = [i for i in _claim_sentences(answer, _READY_CLAIM_RE)
+                if not _READY_NOT_CAR_RE.search(parts0[i])]
+        if not hits or staff_said_ready(user):
+            return answer
+        parts = _CLAIM_SENT_SPLIT_RE.split(answer)
+        lang = _guess_lang_code(answer)
+        said = " ".join(parts[i] for i in hits)
+        for k, i in enumerate(hits):
+            parts[i] = _READY_HOLD_MSG.get(lang, _READY_HOLD_MSG["en"]) if k == 0 else ""
+        out = re.sub(r"[ \t]{2,}", " ", "".join(parts)).strip()
+        log.warning("Reply to %s said the car was ready with no colleague saying so: %r", user, said[:200])
+        try:
+            alert_owner(user, "🔎 Is this car ready? The customer may be on the way",
+                        "The bot was about to tell them it is ready, but nobody from the team "
+                        "has said so in this chat. They were told the team will confirm.",
+                        kind="handover")
+        except Exception:
+            log.exception("ready-claim alert failed for %s", user)
+        return out
+    except Exception:
+        log.exception("no_invented_ready failed (reply sent unchanged)")
+        return answer
+
+
+def no_false_cancel(user: str, answer: str) -> str:
+    """Item 7: called only when this turn cancelled nothing. A sentence saying it did is
+    taken out; if nothing is left, the team line, and a person checks the diary."""
+    try:
+        if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
+            return answer
+        hits = _claim_sentences(answer, _CANCEL_CLAIM_RE)
+        if not hits:
+            return answer
+        parts = _CLAIM_SENT_SPLIT_RE.split(answer)
+        said = " ".join(parts[i] for i in hits)
+        for i in hits:
+            parts[i] = ""
+        out = re.sub(r"[ \t]{2,}", " ", "".join(parts)).strip()
+        log.warning("Reply to %s said something was cancelled, nothing was: %r", user, said[:200])
+        if not re.search(r"\w{3,}", re.sub(r"<<<.*?>>>", "", out, flags=re.S)):
+            lang = _guess_lang_code(answer)
+            out = (_CANCEL_HOLD_MSG.get(lang, _CANCEL_HOLD_MSG["en"]) + "\n" + out).strip()
+            try:
+                alert_owner(user, "❌ The bot nearly said a booking was cancelled — nothing was",
+                            "Please check what they want: their booking is still in the diary.",
+                            kind="cancel_failed")
+            except Exception:
+                log.exception("false-cancel alert failed for %s", user)
+        return out
+    except Exception:
+        log.exception("no_false_cancel failed (reply sent unchanged)")
+        return answer
+
+
 def no_false_checking(text: str) -> str:
     """Remove claims that the bot walked to the workshop or rang someone. It did
     neither. Fabricated findings are handled separately, by alerting a person."""
@@ -12231,6 +12451,7 @@ def _finish_reply(user: str, answer: str) -> str:
             except Exception:
                 log.exception("Failed to alert owner about truncated marker")
     answer = no_false_checking(after_hours_wording(answer))
+    answer = no_invented_ready(user, answer)     # [thu29 item 6]
     answer, booking = process_booking(answer)
     is_owner = bool(OWNER_WHATSAPP) and user == OWNER_WHATSAPP
     # OFFER-THEN-RETRACT guard (2026-09-02, the #1 customer-facing defect that day:
@@ -12454,6 +12675,8 @@ def _finish_reply(user: str, answer: str) -> str:
     which_car = ""
     freed_dates = []   # diary days this turn's cancellation really deleted
     answer, cancel = process_cancel(answer)
+    if not cancel:
+        answer = no_false_cancel(user, answer)   # [thu29 item 7]
     if cancel and not is_owner:
         # Explicit flag, set only on a real cancellation: the call sits in a bare
         # try/except that just logs, so an exception used to leave the model's
@@ -12714,7 +12937,7 @@ def ask_claude(user: str, text: str, transcript_note: str = "") -> str:
     if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
         dynamic += OWNER_HINT
     else:
-        dynamic += contact_hint(user) + customer_context(user)
+        dynamic += contact_hint(user) + customer_context(user) + team_status_note(user)
         if len(messages) <= 1:  # first message we've ever seen from this customer
             dynamic += WELCOME_HINT
     return _finish_reply(user, _call_claude_visible(
@@ -12727,7 +12950,7 @@ def ask_claude_image(user: str, images: list, caption: str) -> str:
             f"[Customer sent {len(images)} photos]"
     save_message(user, "user", (label + " " + note).strip())
     history = get_history(user)
-    dynamic = availability_block() + contact_hint(user) + customer_context(user)
+    dynamic = availability_block() + contact_hint(user) + customer_context(user) + team_status_note(user)
     if len(history) <= 1:
         dynamic += WELCOME_HINT
     system_prompt = (load_system_prompt(), dynamic)
@@ -12755,7 +12978,7 @@ def ask_claude_pdf(user: str, pdf_b64: str, caption: str, filename: str = "") ->
     save_message(user, "user",
                  ("[Customer sent a document] " + (filename or "") + " " + note).strip())
     history = get_history(user)
-    dynamic = availability_block() + contact_hint(user) + customer_context(user)
+    dynamic = availability_block() + contact_hint(user) + customer_context(user) + team_status_note(user)
     if len(history) <= 1:
         dynamic += WELCOME_HINT
     system_prompt = (load_system_prompt(), dynamic)
@@ -15992,7 +16215,7 @@ def chase_unresolved_alerts() -> None:
             # sticker, or the bot's own "a colleague will come back to you" is not an
             # answer - before Stage 2a any bot line after any customer line counted.
             with closing(db()) as conn:
-                resolved = alert_resolved(conn, user, alert_ts)
+                resolved = alert_resolved(conn, user, alert_ts) or staff_done_covers(conn, user, alert_ts)   # [thu29 item 3]
                 moved = None if resolved else bot_really_moved_on(conn, user, max(alert_ts, fold_ts or 0), nowts)
             if not resolved and moved is None:
                 # Their newest message is minutes old: the next pass decides. Except on
@@ -16917,6 +17140,88 @@ def _bot_spoke_since(conn, user: str, since: float) -> bool:
                 and not c.startswith(UNDELIVERED_PREFIX) and not promise_not_an_answer(conn, user, c, ts)):
             return True
     return False
+
+
+# ── A colleague has the chat (Thursday build, 23 Oct 2026) ────────────────────
+# A colleague's "Done" / "booked" / "sorted": the job they were asked for is dealt with.
+_STAFF_DONE_RE = re.compile(
+    r"^\W*(?:all\s+)?(?:done|booked(?:\s+in)?|sorted|you'?re\s+booked|that'?s\s+booked|confirmed|"
+    r"готово|записал\w*|gata|programat\w*|užregistrav\w*|padaryta)\b", re.IGNORECASE)
+
+
+def colleague_wrote_since(user: str, since: float) -> bool:
+    """A real colleague message (not a 👍 or a photo placeholder) to this customer at or after `since`."""
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'staff'"
+                                " AND ts >= ?", (user, since)).fetchall()
+        return any(is_real_staff_text(c or "") for (c,) in rows)
+    except Exception:
+        log.exception("colleague_wrote_since failed for %s", user)
+        return False
+
+
+def _booked_since(user: str, since: float) -> bool:
+    tail = "".join(ch for ch in user if ch.isdigit())[-9:]
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT phone FROM bookings WHERE COALESCE(created_ts, 0) >= ?",
+                                (since,)).fetchall()
+        return any("".join(ch for ch in (p or "") if ch.isdigit()).endswith(tail) for (p,) in rows)
+    except Exception:
+        return True     # cannot tell: send it, as before
+
+
+def hold_reply_for_colleague(user: str, answer: str, since: float) -> bool:
+    """Item 4: True = do not send. A colleague wrote while the bot was answering, and the
+    reply confirms nothing the diary now holds (a booking made this turn is still told)."""
+    # 30 s before the customer's message too: an echo carries WhatsApp's own send time, and a
+    # colleague who wrote just before them is in the middle of the conversation anyway.
+    if not colleague_wrote_since(user, since - 30) or _booked_since(user, since):
+        return False
+    if _CANCEL_CLAIM_RE.search(answer or ""):
+        return False     # this turn cancelled something (no_false_cancel removed any untrue claim)
+    try:
+        with closing(db()) as conn, conn:
+            conn.execute("DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE"
+                         " wa_user = ? AND role = 'assistant' AND ts >= ? AND content = ?)",
+                         (user, since, answer))
+    except Exception:
+        log.exception("Could not take the unsent reply out of %s's history", user)
+    log.warning("Reply to %s not sent - a colleague wrote while it was being written: %r",
+                user, (answer or "")[:200])
+    return True
+
+
+def staff_done_covers(conn, user: str, alert_ts: float) -> bool:
+    """Item 3: the newest colleague line before this alert was a "Done" (at most 12 hours
+    earlier), and since then the customer only said thanks or gave details - no question."""
+    row = conn.execute("SELECT content, ts FROM messages WHERE wa_user = ? AND role = 'staff'"
+                       " AND ts <= ? ORDER BY ts DESC LIMIT 1", (user, alert_ts + 60)).fetchone()
+    if not row or not _STAFF_DONE_RE.search(row[0] or "") or alert_ts - (row[1] or 0) > 12 * 3600:
+        return False
+    said = [c or "" for (c,) in conn.execute(
+        "SELECT content FROM messages WHERE wa_user = ? AND role = 'user' AND ts > ?",
+        (user, row[1])).fetchall()]
+    return all(_done_followup_ok(c) for c in said)
+
+
+_DONE_ACK_RE = re.compile(
+    r"^\W*(?:thanks?|thank you|thx|ty|cheers|ok(?:ay)?|grand|perfect|great|brilliant|lovely|super|sound|no problem"
+    r"|mersi|mulțumesc|multumesc|спасибо|ок|ačiū|aciu|gerai)\b[\w\s!.,👍🙏😊]*$"
+    r"|^\W*\[customer sent a (?:sticker|reaction)[^\]]*\]\W*$|^[\W👍🙏😊]+$", re.IGNORECASE)
+_DONE_CARINFO_RE = re.compile(
+    r"^\W*(?:\d{2,3}\s*-?\s*[a-z]{1,2}\s*-?\s*\d{1,6}|(?:toyota|vw|volkswagen|ford|nissan|honda|bmw|audi|"
+    r"mercedes|skoda|seat|opel|vauxhall|renault|peugeot|citroen|hyundai|kia|mazda|volvo|fiat|dacia|lexus|mini|"
+    r"mitsubishi|suzuki|subaru|jeep|tesla)\b)[\w\s.,-]{0,40}$", re.IGNORECASE)
+_DONE_TROUBLE_RE = re.compile(r"\b(?:not|no|wrong|still|again|but|problem|leak\w*|broken|noise|light)\b", re.IGNORECASE)
+
+
+def _done_followup_ok(text: str) -> bool:
+    t = (text or "").strip()
+    if "?" in t or len(t) > 60 or _DONE_TROUBLE_RE.search(t):
+        return False
+    return bool(_DONE_ACK_RE.search(t) or _DONE_CARINFO_RE.search(t))
 
 
 def alert_resolved(conn, user: str, alert_ts: float) -> bool:
@@ -24703,6 +25008,8 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         pause = REPLY_DELAY_SECONDS - (time.time() - _t0)
         if pause > 0:
             time.sleep(pause)
+        if hold_reply_for_colleague(sender, answer, _t0):   # [thu29 item 4]
+            return
     send_whatsapp(sender, answer)
 
 # Things a customer sends that carry REAL content we can't read (a fail sheet PDF,
