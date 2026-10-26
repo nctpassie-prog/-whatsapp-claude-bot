@@ -17208,7 +17208,8 @@ def staff_done_covers(conn, user: str, alert_ts: float) -> bool:
 
 _DONE_ACK_RE = re.compile(
     r"^\W*(?:thanks?|thank you|thx|ty|cheers|ok(?:ay)?|grand|perfect|great|brilliant|lovely|super|sound|no problem"
-    r"|mersi|mulțumesc|multumesc|спасибо|ок|ačiū|aciu|gerai)\b[\w\s!.,👍🙏😊]*$"
+    r"|mersi|mulțumesc|multumesc|спасибо|ок|ačiū|aciu|gerai)\b"
+    r"(?:[\s!.,👍🙏😊]|\b(?:you|so|very|much|a lot|again|lads|guys|man|thanks?|ok|great|see you|then|mate)\b)*$"
     r"|^\W*\[customer sent a (?:sticker|reaction)[^\]]*\]\W*$|^[\W👍🙏😊]+$", re.IGNORECASE)
 _DONE_CARINFO_RE = re.compile(
     r"^\W*(?:\d{2,3}\s*-?\s*[a-z]{1,2}\s*-?\s*\d{1,6}|(?:toyota|vw|volkswagen|ford|nissan|honda|bmw|audi|"
