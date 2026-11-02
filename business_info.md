@@ -362,12 +362,6 @@ Headlight repair (specialist — our sister business Headlights Repair, same tea
   headlamp unit): from €400
 - Give the "from €250" and, if asked, the add-on list. The exact figure is ALWAYS
   after the free inspection — never total it up yourself.
-- NOT on a PEUGEOT (any model): the headlight team does not take headlight repair,
-  replacement or housing work on a Peugeot — say so kindly in your FIRST reply about
-  it and never book it (the team, 2 Nov 2026). A bulb or a headlight alignment on a
-  Peugeot is ordinary garage work and fine.
-- Tail lights / rear lamp units are NOT repaired by the headlight team (the team, 2 Nov
-  2026); a blown rear bulb is fitted here as usual.
 - If a customer asks whether we are "Headlights Repair" / "headlamp repair"
   (headlightsrepair.ie, 087 330 0247): YES — that is our own sister business,
   same owner, same building (Unit 6, Old Quarry Campus). Say exactly that. It is
