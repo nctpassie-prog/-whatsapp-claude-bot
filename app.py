@@ -5410,6 +5410,34 @@ FULL_DAY_MSG = {
           "Spuneți-mi o altă zi potrivită și rezolv eu.",
 }
 
+# [2 Nov 2026] The full day is NAMED and the nearest day that takes the job offered: the bare
+# "that day is now fully booked" read as the bot taking back the day it had just offered
+# (…296, …052, 2 Nov). The bare line above stays only for when no other day can be found.
+FULL_DAY_ALT_MSG = {
+    "en": "Sorry — {day} is now fully booked. \U0001F64f The nearest day I can offer you is {alt} "
+          "— would that suit?",
+    "ru": "К сожалению, {day} уже полностью занят. \U0001F64f Ближайший день, который могу "
+          "предложить — {alt}. Подойдёт?",
+    "lt": "Atsiprašome, {day} jau visiškai užimta. \U0001F64f Artimiausia diena, kurią galiu "
+          "pasiūlyti — {alt}. Ar tiktų?",
+    "ro": "Ne pare rău — {day} este deja complet ocupată. \U0001F64f Cea mai apropiată zi pe care "
+          "o pot oferi este {alt} — vă convine?",
+}
+
+
+def full_day_text(lang: str, day_iso: str, need: str = "") -> str:
+    """The honest 'that day is full' line: the day by name and the nearest day after it that
+    takes this job; the old bare line when either is unknown."""
+    lang = lang if lang in FULL_DAY_MSG else "en"
+    try:
+        day = date.fromisoformat((day_iso or "")[:10]).strftime("%A %d %B")
+        alt = next_day_for_job(need, not_before=day_iso)
+    except Exception:
+        return FULL_DAY_MSG[lang]
+    if not re.fullmatch(r"[A-Z][a-z]+day \d{2} [A-Z][a-z]+", alt or ""):
+        return FULL_DAY_MSG[lang]
+    return FULL_DAY_ALT_MSG[lang].format(day=day, alt=alt)
+
 def all_jobs_open_from() -> "datetime.date | None":
     """First date we take EVERY kind of job (BOOKINGS_FROM), or None for no limit."""
     if not BOOKINGS_FROM:
@@ -8059,6 +8087,9 @@ def _maybe_courtesy_close(user: str) -> str | None:
     history = _assist_history(user)      # fix3 1A: each colleague line labelled as the colleague's
     if not history or history[-1]["role"] != "user":
         return
+    if late_answer_to_colleague(user):
+        log.info("Assist for %s skipped - a late answer to a colleague's own question", user)
+        return
     # fix3 1D: a "nearly confirmed" alert raised at or after their newest message (open, Done or sorted)
     # already stands for it - nothing new to say about that "yes": no model call, no second post. (The
     # stalled-staff sweep re-ran the assist on garage …195's "Yes please" 1 h 45 min later and raised it
@@ -8165,9 +8196,59 @@ def _maybe_courtesy_close(user: str) -> str | None:
     reply = promise_safety_net(user, reply)
     note_older_reading(user, before_net, reply, raw)
     reply = plain_job_words(reply, user)   # last: no internal booking words (1 Oct 2026)
+    if _LATE_ACK_REPLY_RE.search(reply.strip()) and _newest_customer_age(user) > LATE_ASSIST_MIN * 60:
+        # [2 Nov 2026] "Grand job 👍" two hours on, after the colleague had it: say nothing
+        log.info("Assist for %s not sent - only a late acknowledgement: %r", user, reply[:80])
+        return
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
     log.info("Assisted while staff handling: %s", user)
+
+
+# [2 Nov 2026] The stalled-staff sweep runs the assist an hour or more after the customer wrote.
+# Garage …916: colleague "Do you want to do aswell?" 09:39, customer "Yes please" 09:39, bot "Grand
+# job 👍" 11:33 (…560, …687, …001 the same day). Past LATE_ASSIST_MIN minutes the assist does not
+# answer a message that answered a colleague (the sweep's own stalled alert stands for it), and
+# never sends a reply that is only an acknowledgement.
+LATE_ASSIST_MIN = 20
+_LATE_ACK_REPLY_RE = re.compile(
+    r"^\W*(?:grand(?: job)?|great|perfect|brilliant|lovely|sound|super|cheers|thanks?|thank you|ok(?:ay)?"
+    r"|no problem|no worries|you'?re (?:very )?welcome|glad to hear|see you|nice one)\b[^?\d]{0,60}$",
+    re.IGNORECASE)
+
+
+def _newest_customer_age(user: str) -> float:
+    """Seconds since the customer's newest message (0 when there is none)."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT MAX(ts) FROM messages WHERE wa_user = ? AND role = 'user'",
+                               (user,)).fetchone()
+    except Exception:
+        return 0
+    return max(0.0, time.time() - (row[0] or time.time())) if row and row[0] else 0
+
+
+def late_answer_to_colleague(user: str) -> bool:
+    """The customer's newest message is over LATE_ASSIST_MIN minutes old and answered a real
+    colleague line (the line just before their newest run of messages, under 30 minutes earlier)."""
+    if _newest_customer_age(user) <= LATE_ASSIST_MIN * 60:
+        return False
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT role, content, ts FROM messages WHERE wa_user = ? "
+                                "ORDER BY ts DESC, id DESC LIMIT 12", (user,)).fetchall()
+    except Exception:
+        return False
+    first_ts = None
+    for role, content, ts in rows:
+        if role == "user":
+            first_ts = ts
+            continue
+        if first_ts is None:
+            return False                  # the bot or a colleague spoke after the customer
+        return (role == "staff" and is_real_staff_text(content or "")
+                and (first_ts or 0) - (ts or 0) <= 30 * 60)
+    return False
 
 # Words that suggest a booking may have just been agreed in a staff conversation —
 # a cheap gate so we only spend an API call when it could matter.
@@ -8868,13 +8949,15 @@ def double_booking_alert(user: str, bf: dict, floor_iso: str, source: str = "") 
     booked for later, G …892 / …381 / …523 / …821) - only a real second FUTURE day raises the alerts row; a today-only
     pair keeps today's plain line. The owner's own bookings (`source` "owner booking ...", reviews N1 / F7) keep the
     plain line. The alert remembers both days (it closes on Done or once the diary changes - review R3A-7)."""
-    other = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), floor_iso)
+    other = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), floor_iso,
+                                 not_date=bf.get("date", ""))   # [2 Nov 2026] never the new row itself
     if not other or other[1] == bf.get("date"):
         return ""
     today_iso = now_local().date().isoformat()
     today_pair = other[1] == today_iso
     if today_pair:
-        nxt = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), today_iso)
+        nxt = later_booking_exists(0, bf.get("phone", ""), bf.get("reg", ""), today_iso,
+                                   not_date=bf.get("date", ""))
         if nxt and nxt[1] != bf.get("date"):
             other, today_pair = nxt, False
     reason = (f"{bf.get('name') or 'no name'} {clean_car(bf.get('car','')) or ''} "
@@ -10924,7 +11007,61 @@ def fix_weekday_mentions(text: str) -> str:
             return f"{real_day} {day_num} {month_name}"
         return m.group(0)
     text = _DATE_IN_TEXT_RE.sub(fix, text)
+    text = _DATE_IS_RE.sub(_fix_weekday_is_date, text)
+    text = _DATE_LOOSE_RE.sub(fix_loose, text)
     return _fix_today_weekday_claims(text)
+
+
+def _weekday_text_date(day_num: int, month_name: str):
+    """The date a "<d> <Month>" in a reply means (this year, or next once it is >30 days past)."""
+    today = now_local().date()
+    month_num = _MONTHS.index(month_name) + 1
+    try:
+        d = date(today.year, month_num, day_num)
+        if d < today - timedelta(days=30):
+            d = date(today.year + 1, month_num, day_num)
+    except ValueError:
+        return None
+    return d
+
+
+# [2 Nov 2026] "next Saturday is 8 November" (…927, Mon 2 Nov: Saturday was the 7th). A reply that
+# says WHICH date a weekday is has the weekday right and the arithmetic wrong: the date is put
+# right (the nearest such weekday, at most 3 days off); further off, it is left alone.
+_DATE_IS_RE = re.compile(
+    r"\b(" + "|".join(_WEEKDAYS) + r")(\s+(?:is|will be|falls on|would be)\s+(?:the\s+)?)"
+    r"(\d{1,2})(st|nd|rd|th)?(\s+(?:of\s+)?)(" + "|".join(_MONTHS) + r")\b")
+
+
+def _fix_weekday_is_date(m):
+    said_day, mid, num, suf, gap, month_name = m.groups()
+    d = _weekday_text_date(int(num), month_name)
+    if d is None or _WEEKDAYS[d.weekday()] == said_day:
+        return m.group(0)
+    want = _WEEKDAYS.index(said_day)
+    for k in (1, -1, 2, -2, 3, -3):
+        c = d + timedelta(days=k)
+        if c.weekday() == want:
+            return f"{said_day}{mid}{c.day}{suf or ''}{gap}{_MONTHS[c.month - 1]}"
+    return m.group(0)
+
+
+# "Saturday, 8th November" / "Saturday the 8th of November" / "Saturday 8th November": the same
+# weekday check as the plain "<Weekday> <d> <Month>" above (the weekday follows the date).
+_DATE_LOOSE_RE = re.compile(
+    r"\b(" + "|".join(_WEEKDAYS) + r")(,?\s+(?:the\s+)?)(\d{1,2})(st|nd|rd|th)?(\s+(?:of\s+)?)("
+    + "|".join(_MONTHS) + r")\b")
+
+
+def fix_loose(m):
+    said_day, mid, num, suf, gap, month_name = m.groups()
+    if not suf and mid.strip() == "" and not gap.strip():
+        return m.group(0)          # the plain form - _DATE_IN_TEXT_RE judged it already
+    d = _weekday_text_date(int(num), month_name)
+    if d is None:
+        return m.group(0)
+    real_day = _WEEKDAYS[d.weekday()]
+    return m.group(0) if real_day == said_day else f"{real_day}{mid}{num}{suf or ''}{gap}{month_name}"
 
 # Second, separate failure mode found 2026-08-30 (on the headlights bot, same
 # underlying model behaviour so ported here too): the model can flatly assert
@@ -12181,10 +12318,11 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "",
                 date=first_bookable_day(opens, need).strftime("%A %d %B")), lang)
         if reason and pd >= today and not _has_booking_on(user, pd.isoformat()):
             alt = next_day_for_job(need)
-            msg = HARD_FULL_MSG if reason == "hard" else FULL_DAY_MSG
             lang = _guess_lang_code(text)
-            answer = localize_dates(msg.get(lang, msg["en"]).format(alt=alt)
-                                    if "{alt}" in msg.get(lang, msg["en"]) else msg.get(lang, msg["en"]), lang)
+            if reason == "hard":
+                answer = localize_dates(HARD_FULL_MSG.get(lang, HARD_FULL_MSG["en"]).format(alt=alt), lang)
+            else:
+                answer = localize_dates(full_day_text(lang, pd.isoformat(), need), lang)
             log.info("Proposal for %s on %s replaced: %s-full (job=%r, %s)",
                      user, pd, reason, need[:60],
                      "conversational" if conversational else "confirm-format")
@@ -12562,8 +12700,9 @@ def _finish_reply(user: str, answer: str) -> str:
             return answer
         if not is_owner and not already_booked and day_is_full(booking.get("date", ""), booking.get("need", "")):
             log.info("Booking for full day %s rejected for %s", booking.get("date"), user)
-            answer = FULL_DAY_MSG.get(reminder_lang_code(booking.get("lang", "")), FULL_DAY_MSG["en"])
-            answer = localize_dates(answer)   # [thu29 item 8]
+            answer = full_day_text(reminder_lang_code(booking.get("lang", "")), booking.get("date", ""),
+                                   booking.get("need", ""))
+            answer = localize_dates(answer, reminder_lang_code(booking.get("lang", "")))   # [thu29 item 8]
             save_message(user, "assistant", answer)
             return answer
         # The model gets weekday arithmetic wrong. Robbie wrote "Tuesday sound
@@ -13157,6 +13296,12 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
         log.info("Skipping empty message to %s", to)
         return
     text = fix_mojibake(text)
+    if "<<<" in text:
+        # [2 Nov 2026] a hidden marker (one closed with ">>" on 31 Oct) must never reach a customer
+        text = strip_marker_leftovers(text)
+        if not text.strip():
+            log.warning("Message to %s was only a hidden marker - not sent", to)
+            return
     # Never send the exact same text to the same customer twice in quick
     # succession — that is only ever a glitch (double webhook, two triggers
     # firing together), and customers got identical doubles from it.
@@ -13227,6 +13372,12 @@ def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
     if not (text and text.strip()):
         return "", "the message is empty"
     text = fix_mojibake(text)
+    if "<<<" in text:
+        # [2 Nov 2026] a hidden marker (one closed with ">>" on 31 Oct) must never reach a customer
+        text = strip_marker_leftovers(text)
+        if not text.strip():
+            log.warning("Message to %s was only a hidden marker - not sent", to)
+            return "", "the message is empty"
     try:
         with closing(db()) as conn:
             dup = conn.execute(
@@ -14494,7 +14645,7 @@ def send_parts_orders() -> None:
 # asked for "the 6th of October instead of 21st September" and the 21st stayed.
 # Both would have been texted "your car is booked in tomorrow" for a day they had
 # cancelled, while their old slot stayed blocked against everyone else.
-def later_booking_exists(bid: int, phone: str, reg: str, date_: str):
+def later_booking_exists(bid: int, phone: str, reg: str, date_: str, not_date: str = ""):
     """The row after this one for the SAME car: (id, date) or None.
 
     Matched on reg when there is one, otherwise on the phone's last 9 digits.
@@ -14510,14 +14661,14 @@ def later_booking_exists(bid: int, phone: str, reg: str, date_: str):
             if r:
                 row = conn.execute(
                     "SELECT id, date FROM bookings WHERE UPPER(TRIM(COALESCE(reg,''))) = ?"
-                    " AND date > ? AND id > ? ORDER BY date LIMIT 1",
-                    (r, date_ or "", bid)).fetchone()
+                    " AND date > ? AND id > ? AND date <> ? ORDER BY date LIMIT 1",
+                    (r, date_ or "", bid, not_date or "")).fetchone()
             else:
                 row = conn.execute(
                     "SELECT id, date FROM bookings WHERE"
                     " REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
-                    " AND date > ? AND id > ? ORDER BY date LIMIT 1",
-                    ("%" + digits[-9:], date_ or "", bid)).fetchone()
+                    " AND date > ? AND id > ? AND date <> ? ORDER BY date LIMIT 1",
+                    ("%" + digits[-9:], date_ or "", bid, not_date or "")).fetchone()
         return (row[0], row[1]) if row else None
     except Exception:
         log.exception("Could not check for a later booking on %s", reg or phone)
@@ -15258,7 +15409,7 @@ def _make_followup(user: str) -> str:
                            "(Internal: the customer has gone quiet. Decide per your rules — "
                            "reply SKIP if a follow-up is not appropriate, otherwise write it.)"}]
     raw = _call_claude(messages, FOLLOWUP_SYSTEM) or ""
-    text = re.sub(r"<<<.*?>>>", "", raw).strip()
+    text = strip_marker_leftovers(raw)
     text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a follow-up with no words in it
     if (not text or re.search(r"\bSKIP\b", text) or not reply_has_words(text)
             or (text.startswith("(") and text.endswith(")"))):
@@ -15298,7 +15449,7 @@ def _make_chase(user: str) -> str:
     raw = _call_claude(messages, CHASE_SYSTEM + (_CHASE_LABEL_NOTE if ASSIST_LABEL_STAFF else "")) or ""
     if raw.startswith(MODEL_FAILED_PREFIX):
         return ""    # never send the outage line as a holding message; the staff note says "NOT messaged"
-    text = re.sub(r"<<<.*?>>>", "", raw).strip()
+    text = strip_marker_leftovers(raw)
     text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a chase with no words in it
     if not text or text.upper().startswith("SKIP") or not reply_has_words(text):
         return ""
