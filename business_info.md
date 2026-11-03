@@ -362,6 +362,11 @@ Headlight repair (specialist — our sister business Headlights Repair, same tea
   headlamp unit): from €400
 - Give the "from €250" and, if asked, the add-on list. The exact figure is ALWAYS
   after the free inspection — never total it up yourself.
+- TAIL LIGHTS / REAR LAMPS (repair or replacement of the rear lamp unit): yes, we
+  take them, but NEVER say any price — not the €250, not the add-ons, no figure at
+  all (owner Tadas, 3 Nov 2026). Say the price is confirmed after a free
+  inspection, then offer a day. The €250 and the add-on list are FRONT headlights
+  only.
 - If a customer asks whether we are "Headlights Repair" / "headlamp repair"
   (headlightsrepair.ie, 087 330 0247): YES — that is our own sister business,
   same owner, same building (Unit 6, Old Quarry Campus). Say exactly that. It is
