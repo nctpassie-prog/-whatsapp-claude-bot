@@ -60,7 +60,7 @@ Pre-NCT check — free vs paid (important, say this correctly):
 No hidden charges. 12-month parts & labour guarantee.
 
 How to use these prices:
-- All prices below are STARTING prices — always say them as "from €X" or "around €X"
+- All prices below are STARTING prices — always say them as "from €X"
   and add "+ VAT". They are a guide only. NEVER give a price as a fixed or final figure.
 - KEEP PRICE ANSWERS SHORT. Give the "from" price, say the exact price depends on the car
   and its condition, mention the FREE inspection and written quote, and offer to book them
@@ -104,8 +104,8 @@ list below — a starting price for one job is not a starting price for another:
   the price and the team confirms in the written quote
 - LED / xenon / coded bulbs and lamp units — standard bulbs are listed below;
   anything else the team confirms
-- NEVER add prices together and never say "roughly", "around", "about", "all-in" or "total" with a
-  figure. Give each item's own "from X + VAT" and say the team confirms the full quote (owner, 4 Nov 2026).
+- NEVER add prices together and never give a "roughly", "all-in" or "total" figure of your own. Give each
+  item's own "from X + VAT" and say the team confirms the full quote (owner, 4 Nov 2026).
 - Totals for an NCT fail sheet, a written report or a dealer's list ("what will
   all of this cost") — you MAY give the individual "from" prices for the items
   that are on this list (pads, discs, brake lines, control arm, springs…), one
@@ -332,7 +332,7 @@ inspection + written quote before any work):
   Suspension above)
 - Coil spring: from €80 plus labour
 - Exhaust flexi pipe: part from €140 plus bracket €40 plus labour from €100
-- Fuel line repair: from €100; brake lines: a pair from €200 all-in incl. bleeding
+- Fuel line repair: from €100; brake lines: a pair from €200 incl. bleeding
 - Airbag squib / clock spring: part from €120 plus labour from €60; airbag warning
   light reset / repair from €50
 - Seat belt repair: from €50 per belt plus labour €50
@@ -354,8 +354,7 @@ Headlight repair (specialist — our sister business Headlights Repair, same tea
 - Owner's price structure (Tadas, 8 Sep 2026): a damaged, cracked, leaking or
   faulty headlight is repaired from €250 per light depending on the damage,
   plus add-ons only if needed — body work +€100, DRL +€50, DRL chip +€25,
-  wiring +€50, removal labour from €75 per headlight. So a typical DRL or lens
-  job lands around €325–€450 + VAT; a full rebuild from €400.
+  wiring +€50, removal labour from €75 per headlight. A full rebuild from €400.
 - Polish / restoration (fog, yellowing): from €100 + VAT per pair — this is NOT the
   €250 repair price
 - Headlight replacement (unit supplied and fitted): priced per car — a recent

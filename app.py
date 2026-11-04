@@ -8225,7 +8225,7 @@ _LATE_ACK_REPLY_RE = re.compile(
 
 
 _NEEDS_REAL_ANSWER_RE = re.compile(
-    r"\?|^\W*(?:will|when|what|can|could|is|are|how|do|did|does)\b"
+    r"\?|^\W*(?:(?:will|can)(?!\s+do\b)|what(?!\s+a\b)|when|could|is|are|how|do|did|does)\b"
     r"|\b(?:collect\w*|pick(?:ing)? (?:it )?up|for the car)\b", re.IGNORECASE)
 _ASSIST_PROMISES_WORK_RE = re.compile(
     r"\bwe(?:'|\u2019)?ll (?:\w+ )?(?:sort|fix|repair|replace|change|do|take care of|look after)\b", re.IGNORECASE)
@@ -10014,7 +10014,7 @@ def human_handling(user: str) -> bool:
             "SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
     if bool(row) and (time.time() - (row[0] or 0)) < AUTO_RESUME_HOURS * 3600:
         return True
-    return colleague_asked_first(user) or addressed_to_colleague(user)      # [thu29 item 2], [4 Nov 2026]
+    return colleague_asked_first(user)      # [thu29 item 2]
 
 
 # [4 Nov 2026] …775, 17:00: "Dima tat normal cu mașina?" six hours after Dima's last line got the bot's
@@ -10024,11 +10024,10 @@ _TO_COLLEAGUE_RE = re.compile(
     r"(?:dima|vlad|дима|влад)\b", re.IGNORECASE)
 
 
-def addressed_to_colleague(user: str) -> bool:
-    """The customer's newest message opens with a colleague's name and a real colleague line
-    is under 24 hours old."""
+def addressed_to_colleague(user: str, text: str) -> bool:
+    """This message opens with a colleague's name and a real colleague line is under 24 hours old."""
     try:
-        if not _TO_COLLEAGUE_RE.search(_newest_customer_text(user)):
+        if not _TO_COLLEAGUE_RE.search(text or ""):
             return False
         with closing(db()) as conn:
             rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?"
@@ -10401,8 +10400,16 @@ _ORPHAN_CLOSE_RE = re.compile(r"^[\s\u200b-\u200d\ufeff]*>+[\s\u200b-\u200d\ufef
 _DELIBERATION_RE = re.compile(
     r"\bfollow-?up (?:is|would be|seems|isn't|is not) (?:\w+ )?(?:appropriate|warranted|needed|inappropriate)\b"
     r"|\b(?:they|the customer) (?:simply |just |has |have )?(?:gone|went) quiet\b"
-    r"|\bbooking commitment\b|\bper (?:my|your|the) rules\b",
+    r"|\bbooking commitment\b",
     re.IGNORECASE)
+
+
+def _deliberation_alert(to: str) -> None:
+    try:
+        alert_owner(to, "A bot reply to this customer was blocked",
+                    "It was the bot's own reasoning, so it was not sent - please reply by hand.", kind="blank")
+    except Exception:
+        log.exception("Blocked-reply alert failed for %s", to)
 
 
 def strip_marker_leftovers(text: str) -> str:
@@ -11586,7 +11593,7 @@ def _match_case(old: str, new: str) -> str:
 
 # [4 Nov 2026] Headlights …946, Tue 3 Nov 15:02: "We're closed now - we open again tomorrow at 9am."
 _FALSE_CLOSED_RE = re.compile(
-    r"We(?:'|\u2019| a)?re closed (?:right )?now\b[^.!\n]*[.!]?[ \t]*"
+    r"We(?:'|\u2019| a)?re closed (?:right )?now\b[^.!\n<]*[.!]?[ \t]*"
     r"(?:The team will see this here when they(?:'|\u2019)re back\.?[ \t]*)?", re.IGNORECASE)
 
 
@@ -12300,10 +12307,13 @@ def need_with_confirmed_service(user: str, booking: dict) -> str:
             if rb:
                 start, end, pre = _readback_job(rb)
                 seg = re.sub(r"\([^)]*\)", " ", pre + ", " + rb[start:end])
-                if not counts_as_service(seg) and not any(
-                        _JOB_NAMES_SERVICE_RE.search(t) for t, _ in _customer_turns(user, rb_ts + 0.001)):
-                    log.info("Booking for %s: job as read back, without the service: %r", user, rb[start:end][:80])
-                    return rb[start:end].strip()
+                rest = re.sub(r"^\s*(?:\w+\s+)?service\s*(?:\+|&|,|and\b)\s*", "", need, flags=re.IGNORECASE).strip()
+                if (rest != need.strip() and rest.lower() == rb[start:end].strip().lower()
+                        and not counts_as_service(seg)
+                        and not any(_JOB_NAMES_SERVICE_RE.search(t) or counts_as_service(t)
+                                    for t, _ in _customer_turns(user, rb_ts + 0.001))):
+                    log.info("Booking for %s: job as read back, without the service: %r", user, rest[:80])
+                    return rest
             return need
         if not need.strip():
             return need
@@ -13391,6 +13401,7 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
             return
     if _DELIBERATION_RE.search(text):
         log.warning("Message to %s was the model's own reasoning - not sent: %r", to, text[:200])
+        _deliberation_alert(to)
         return
     # Never send the exact same text to the same customer twice in quick
     # succession — that is only ever a glitch (double webhook, two triggers
@@ -13470,6 +13481,7 @@ def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
             return "", "the message is empty"
     if _DELIBERATION_RE.search(text):
         log.warning("Message to %s was the model's own reasoning - not sent: %r", to, text[:200])
+        _deliberation_alert(to)
         return "", "the message is empty"
     try:
         with closing(db()) as conn:
@@ -25205,7 +25217,7 @@ def handle_message(sender: str, text: str, arrived_on: str = "", transcript_note
         log.info("Chat with %s is paused; skipping auto-reply", sender)
         save_message(sender, "user", transcript_note or text)
         return
-    if not is_owner and human_handling(sender):
+    if not is_owner and (human_handling(sender) or addressed_to_colleague(sender, text)):
         # A colleague is already dealing with this customer in the app. We stay out of
         # the conversation, but keep watching in case it turns sour — and if the
         # customer is just wrapping up ("thanks, I'll monitor and let you know"),
