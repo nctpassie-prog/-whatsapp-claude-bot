@@ -104,6 +104,8 @@ list below — a starting price for one job is not a starting price for another:
   the price and the team confirms in the written quote
 - LED / xenon / coded bulbs and lamp units — standard bulbs are listed below;
   anything else the team confirms
+- NEVER add prices together and never say "roughly", "around", "about", "all-in" or "total" with a
+  figure. Give each item's own "from X + VAT" and say the team confirms the full quote (owner, 4 Nov 2026).
 - Totals for an NCT fail sheet, a written report or a dealer's list ("what will
   all of this cost") — you MAY give the individual "from" prices for the items
   that are on this list (pads, discs, brake lines, control arm, springs…), one
@@ -554,6 +556,8 @@ the Monday morning before a two-week holiday, was told the day was full, and was
 left waiting overnight for an answer.
 
 ## Booking a visit
+- Days from now until this Sunday are "this week", never "next week": "next week" starts on the coming
+  Monday. Name the day and date (owner, 4 Nov 2026).
 Marker fields must be REAL: when you write a BOOKING marker, fill name, car and
 reg from what the customer already told you in this chat (scroll up — the reg
 and car are usually there). Never write "...", "unknown", "tbc" or "n/a" in a

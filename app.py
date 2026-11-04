@@ -5387,15 +5387,12 @@ def next_day_for_job(need: str, not_before: str = "") -> str:
 
 # The honest message when a day's hard-job quota is used up.
 HARD_FULL_MSG = {
-    "en": "Sorry — that day is already fully booked for this kind of work. 🙏 "
-          "The nearest day I can offer you is {alt} — would that suit?",
-    "ru": "К сожалению, на этот день записи для такой работы уже нет. 🙏 "
-          "Ближайший день, который могу предложить — {alt}. Подойдёт?",
-    "lt": "Deja, tą dieną tokiam darbui vietų nebėra. 🙏 "
-          "Artimiausia diena, kurią galiu pasiūlyti — {alt}. Ar tiktų?",
-    "ro": "Ne pare rău — în ziua respectivă nu mai sunt locuri pentru acest tip de "
-          "lucrare. 🙏 Cea mai apropiată zi pe care o pot oferi este {alt} — "
-          "vă convine?",
+    # [4 Nov 2026] no "that day": most had named none (…580 asked "can you fix?", …972, …471, …796)
+    "en": "Sorry — for this kind of work, the nearest free day I have is {alt}. 🙏 Would that suit?",
+    "ru": "К сожалению, для такой работы ближайший свободный день — {alt}. 🙏 Подойдёт?",
+    "lt": "Deja, tokiam darbui artimiausia laisva diena — {alt}. 🙏 Ar tiktų?",
+    "ro": "Ne pare rău — pentru acest tip de lucrare, cea mai apropiată zi liberă este {alt}. 🙏 "
+          "Vă convine?",
 }
 
 # Templated "that day is full" message, per language (used when a booking hits a full day).
@@ -5718,9 +5715,10 @@ def availability_block() -> str:
         "an easy job can still be booked (never on a Sunday or a bank holiday); for hard jobs offer the latest listed day "
         "with hard space instead. STRICTLY INTERNAL: never reveal ANY of this system to "
         "customers — never mention quotas, 'hard jobs', 'easy jobs', or that certain days "
-        "are kept for services. When their day doesn't work for their job, say ONLY that "
-        "the day is already fully booked for that kind of work and offer the nearest day "
-        "that suits — nothing about why. A day marked CLOSED is different: say we're "
+        "are kept for services. When a day they NAMED doesn't work for their job, say ONLY that "
+        "that day is already fully booked for that kind of work and offer the nearest day "
+        "that suits — nothing about why. If they have not named a day, never say a day is full: "
+        "just offer the nearest day. A day marked CLOSED is different: say we're "
         "closed that day for the bank holiday and offer the nearest day after it.")
 
 def seen_before(msg_id: str) -> bool:
@@ -8200,6 +8198,15 @@ def _maybe_courtesy_close(user: str) -> str | None:
         # [2 Nov 2026] "Grand job 👍" two hours on, after the colleague had it: say nothing
         log.info("Assist for %s not sent - only a late acknowledgement: %r", user, reply[:80])
         return
+    # [4 Nov 2026] "Will I collect it at 6?" / "my customer is on the way for the car" -> "No problem - see
+    # you soon" (…756, …473): an acknowledgement is no answer. Promising the colleague's work never (…826:
+    # "Not today" -> "we'll sort the DPF and remap today"). The stalled sweep tells staff.
+    if _LATE_ACK_REPLY_RE.search(reply.strip()) and _NEEDS_REAL_ANSWER_RE.search(_newest_customer_text(user)):
+        log.info("Assist for %s not sent - an acknowledgement to a real question: %r", user, reply[:80])
+        return
+    if _ASSIST_PROMISES_WORK_RE.search(reply):
+        log.warning("Assist for %s not sent - it promised work in a colleague's chat: %r", user, reply[:200])
+        return
     send_whatsapp(user, reply)
     save_message(user, "assistant", reply)
     log.info("Assisted while staff handling: %s", user)
@@ -8215,6 +8222,24 @@ _LATE_ACK_REPLY_RE = re.compile(
     r"^\W*(?:grand(?: job)?|great|perfect|brilliant|lovely|sound|super|cheers|thanks?|thank you|ok(?:ay)?"
     r"|no problem|no worries|you'?re (?:very )?welcome|glad to hear|see you|nice one)\b[^?\d]{0,60}$",
     re.IGNORECASE)
+
+
+_NEEDS_REAL_ANSWER_RE = re.compile(
+    r"\?|^\W*(?:will|when|what|can|could|is|are|how|do|did|does)\b"
+    r"|\b(?:collect\w*|pick(?:ing)? (?:it )?up|for the car)\b", re.IGNORECASE)
+_ASSIST_PROMISES_WORK_RE = re.compile(
+    r"\bwe(?:'|\u2019)?ll (?:\w+ )?(?:sort|fix|repair|replace|change|do|take care of|look after)\b", re.IGNORECASE)
+
+
+def _newest_customer_text(user: str) -> str:
+    """The customer's newest message ('' when there is none)."""
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'user'"
+                               " ORDER BY ts DESC, id DESC LIMIT 1", (user,)).fetchone()
+    except Exception:
+        return ""
+    return (row[0] or "") if row else ""
 
 
 def _newest_customer_age(user: str) -> float:
@@ -8244,6 +8269,8 @@ def late_answer_to_colleague(user: str) -> bool:
         if role == "user":
             first_ts = ts
             continue
+        if role == "staff" and not is_real_staff_text(content or ""):
+            continue                      # [4 Nov 2026] a 👍 is not a line (Passat …826)
         if first_ts is None:
             return False                  # the bot or a colleague spoke after the customer
         return (role == "staff" and is_real_staff_text(content or "")
@@ -9987,7 +10014,29 @@ def human_handling(user: str) -> bool:
             "SELECT ts FROM human_takeover WHERE wa_user = ?", (user,)).fetchone()
     if bool(row) and (time.time() - (row[0] or 0)) < AUTO_RESUME_HOURS * 3600:
         return True
-    return colleague_asked_first(user)      # [thu29 item 2]
+    return colleague_asked_first(user) or addressed_to_colleague(user)      # [thu29 item 2], [4 Nov 2026]
+
+
+# [4 Nov 2026] …775, 17:00: "Dima tat normal cu mașina?" six hours after Dima's last line got the bot's
+# "nearest day is Thursday 12 November". The same person's message to a colleague is for that colleague.
+_TO_COLLEAGUE_RE = re.compile(
+    r"^\W*(?:(?:hi|hey|hello|hiya|salut|bun[aă]|привет|здравствуйте|labas)\W+)?"
+    r"(?:dima|vlad|дима|влад)\b", re.IGNORECASE)
+
+
+def addressed_to_colleague(user: str) -> bool:
+    """The customer's newest message opens with a colleague's name and a real colleague line
+    is under 24 hours old."""
+    try:
+        if not _TO_COLLEAGUE_RE.search(_newest_customer_text(user)):
+            return False
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?"
+                                " ORDER BY ts DESC LIMIT 6", (user, time.time() - 24 * 3600)).fetchall()
+        return any(is_real_staff_text(r[0] or "") for r in rows)
+    except Exception:
+        log.exception("addressed_to_colleague failed for %s", user)
+        return False
 
 
 # A colleague's own question or request to the other side: a supplier asked for a part, a
@@ -10346,11 +10395,22 @@ def visible_text(answer: str) -> str:
 # (Francis, 24 Aug). This catches any marker-ish debris however it's closed.
 LENIENT_MARKER_RE = re.compile(r"<<<[A-Z]+\|.*?(?:>>>|>>|>|$)", re.DOTALL)
 
+_ORPHAN_CLOSE_RE = re.compile(r"^[\s\u200b-\u200d\ufeff]*>+[\s\u200b-\u200d\ufeff]*$", re.MULTILINE)
+# [4 Nov 2026] The model thinking aloud about the customer, sent as the message: "We haven't made a booking
+# commitment ... they simply went quiet ... A gentle follow-up is appropriate." (headlights …998, 3 Nov)
+_DELIBERATION_RE = re.compile(
+    r"\bfollow-?up (?:is|would be|seems|isn't|is not) (?:\w+ )?(?:appropriate|warranted|needed|inappropriate)\b"
+    r"|\b(?:they|the customer) (?:simply |just |has |have )?(?:gone|went) quiet\b"
+    r"|\bbooking commitment\b|\bper (?:my|your|the) rules\b",
+    re.IGNORECASE)
+
+
 def strip_marker_leftovers(text: str) -> str:
     out = LENIENT_MARKER_RE.sub("", text or "")
     # An orphan closing '>>>' (model wrote '...>>>>>>' or put '>>>' on its own
     # line) survives the pattern above and reached a customer on 1 Sep.
-    out = re.sub(r"^\s*>{2,}\s*$", "", out, flags=re.MULTILINE)
+    # [4 Nov 2026] ...and a single '>' after a zero-width space (headlights …546, 3 Nov).
+    out = _ORPHAN_CLOSE_RE.sub("", out)
     out = re.sub(r">{3,}", "", out)
     out = re.sub(r"\n\s*[.…]\s*$", "", out)  # stripped markers leave lone dots behind
     return out.strip()
@@ -10389,7 +10449,7 @@ _DATE_IN_TEXT_RE = re.compile(
 # Captures the job text (for the hard-job quota) and the proposed date so the
 # capacity gate can run BEFORE the customer says yes (see _finish_reply).
 _PROPOSAL_RE = re.compile(
-    r"(?:\)\s*,\s*(?P<need>[^\n]{3,120}?)\s*,\s*)?drop-?off\s+(?:on\s+)?"
+    r"(?:\)\s*,\s*(?P<need>[^\n]{3,120}?)\s*,\s*)?drop-?off\s+(?:on\s+)?(?:(?:tomorrow|today),?\s+)?"
     r"(?P<wd>" + "|".join(_WEEKDAYS) + r")\s+(?P<day>\d{1,2})\s+(?P<mon>" + "|".join(_MONTHS) + r")"
     r"[^\n]{0,80}?\bShall I book you in\b",
     re.IGNORECASE)
@@ -11524,6 +11584,21 @@ def _match_case(old: str, new: str) -> str:
     return new
 
 
+# [4 Nov 2026] Headlights …946, Tue 3 Nov 15:02: "We're closed now - we open again tomorrow at 9am."
+_FALSE_CLOSED_RE = re.compile(
+    r"We(?:'|\u2019| a)?re closed (?:right )?now\b[^.!\n]*[.!]?[ \t]*"
+    r"(?:The team will see this here when they(?:'|\u2019)re back\.?[ \t]*)?", re.IGNORECASE)
+
+
+def no_false_closed(text: str) -> str:
+    """While we are OPEN, a sentence saying we're closed goes (only if words are left)."""
+    out = _FALSE_CLOSED_RE.sub("", text or "").strip()
+    if out == (text or "").strip() or not reply_has_words(out):
+        return text
+    log.info("Reply said we were closed during opening hours - sentence removed")
+    return out
+
+
 def after_hours_wording(text: str) -> str:
     """When the workshop is closed, swap the model's 'shortly' / 'right back to
     you' / 'straight away' for 'once the team is back in' - never a clock time (Fix 1,
@@ -11536,7 +11611,7 @@ def after_hours_wording(text: str) -> str:
     try:
         line = clock_line()
         if "is CLOSED" not in line:
-            return text
+            return no_false_closed(text)
         m = _CLOCK_WHEN_RE.search(line)
         when = m.group(1) if m else "when we open"
     except Exception:
@@ -12218,7 +12293,19 @@ def need_with_confirmed_service(user: str, booking: dict) -> str:
     it. Never raises."""
     need = booking.get("need") or ""
     try:
-        if not need.strip() or _JOB_NAMES_SERVICE_RE.search(need):
+        if need.strip() and _JOB_NAMES_SERVICE_RE.search(need):
+            # [4 Nov 2026] The model's line still says "service + ..." but the read-back they said
+            # yes to has no service: the read-back decides, unless they asked for one since.
+            rb, rb_ts = _last_readback(user)
+            if rb:
+                start, end, pre = _readback_job(rb)
+                seg = re.sub(r"\([^)]*\)", " ", pre + ", " + rb[start:end])
+                if not counts_as_service(seg) and not any(
+                        _JOB_NAMES_SERVICE_RE.search(t) for t, _ in _customer_turns(user, rb_ts + 0.001)):
+                    log.info("Booking for %s: job as read back, without the service: %r", user, rb[start:end][:80])
+                    return rb[start:end].strip()
+            return need
+        if not need.strip():
             return need
         why = ""
         rb, rb_ts = _last_readback(user)
@@ -13296,12 +13383,15 @@ def send_whatsapp(to: str, text: str, from_phone_id: str = "") -> None:
         log.info("Skipping empty message to %s", to)
         return
     text = fix_mojibake(text)
-    if "<<<" in text:
+    if "<<<" in text or _ORPHAN_CLOSE_RE.search(text):
         # [2 Nov 2026] a hidden marker (one closed with ">>" on 31 Oct) must never reach a customer
         text = strip_marker_leftovers(text)
         if not text.strip():
             log.warning("Message to %s was only a hidden marker - not sent", to)
             return
+    if _DELIBERATION_RE.search(text):
+        log.warning("Message to %s was the model's own reasoning - not sent: %r", to, text[:200])
+        return
     # Never send the exact same text to the same customer twice in quick
     # succession — that is only ever a glitch (double webhook, two triggers
     # firing together), and customers got identical doubles from it.
@@ -13372,12 +13462,15 @@ def send_whatsapp_checked(to: str, text: str, since: float = 0) -> tuple:
     if not (text and text.strip()):
         return "", "the message is empty"
     text = fix_mojibake(text)
-    if "<<<" in text:
+    if "<<<" in text or _ORPHAN_CLOSE_RE.search(text):
         # [2 Nov 2026] a hidden marker (one closed with ">>" on 31 Oct) must never reach a customer
         text = strip_marker_leftovers(text)
         if not text.strip():
             log.warning("Message to %s was only a hidden marker - not sent", to)
             return "", "the message is empty"
+    if _DELIBERATION_RE.search(text):
+        log.warning("Message to %s was the model's own reasoning - not sent: %r", to, text[:200])
+        return "", "the message is empty"
     try:
         with closing(db()) as conn:
             dup = conn.execute(
@@ -15398,7 +15491,8 @@ FOLLOWUP_SYSTEM = (
     "have any questions, or would like to book in. Do NOT offer, promise or mention any specific "
     "service, repair or price, and NEVER imply we can do something we didn't already confirm we "
     "do. One friendly sentence, no hidden markers. Never say that a person will reply, "
-    "call or be in touch, and never give a time."
+    "call or be in touch, and never give a time. Write ONLY the message or SKIP: never your "
+    "reasoning, and never talk about the customer as 'they'."
 )
 
 def _make_followup(user: str) -> str:
@@ -15412,6 +15506,7 @@ def _make_followup(user: str) -> str:
     text = strip_marker_leftovers(raw)
     text = strip_markup_debris(text)     # [Fix 1b, s6-01] never a follow-up with no words in it
     if (not text or re.search(r"\bSKIP\b", text) or not reply_has_words(text)
+            or _DELIBERATION_RE.search(text)        # [4 Nov 2026] its reasoning, not a message
             or (text.startswith("(") and text.endswith(")"))):
         return ""
     # It runs 9-20h every day, so often while we are closed (28 Sep review).
