@@ -1133,6 +1133,77 @@ def which_booking_question(rows: list) -> str:
     return localize_dates(WHICH_BOOKING_MSG.get(lang, WHICH_BOOKING_MSG["en"]).format(
         list="\n".join(lines)), lang)
 
+# Owner 11 Nov 2026: when a customer MOVES their booking in chat and the reply booked the new day but never cancelled
+# the old one, the old row goes by itself (it used to stay and raise "THIS CAR NOW HAS TWO BOOKINGS"). Only when all
+# hold: the same car (reg) on exactly one other day after today, that row on this customer's phone (or no phone), and
+# the customer's own recent words ask to move. Anything less keeps the two-bookings alert. AUTO_MOVE_CANCEL=0 undoes.
+AUTO_MOVE_CANCEL = os.environ.get("AUTO_MOVE_CANCEL", "1") == "1"
+_DAY_WORDS = r"(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*|tomorrow|next\s+\w+|the\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}(?:st|nd|rd|th)"
+# Only words about moving the BOOKING (review 11 Nov: "schimb ulei", "поменять масло", "pakeisti tepalus" = change the oil,
+# "instead of the bulb", "move the car" must never delete a booking).
+_MOVE_INTENT_RE = re.compile(
+    r"\b(?:reschedul\w*|re-schedul\w*|postpon\w*)\b"
+    r"|\bmov(?:e|ing)\s+(?:my\s+(?:booking|appointment|slot|date|day)|the\s+(?:booking|appointment|slot|date|day))\b"
+    r"|\bmov(?:e|ing)\s+(?:it\s+)?to\s+(?:" + _DAY_WORDS + r")\b"
+    r"|\bchange\s+(?:the\s+|my\s+|our\s+)?(?:booking|appointment|day|date)\b"
+    r"|\b(?:can'?t|cannot|can\u2019t|won'?t|won\u2019t|not\s+able\s+to|unable\s+to)\s+make\s+(?:it\s+(?:on\s+)?(?:" + _DAY_WORDS + r")|my\s+(?:booking|appointment)|the\s+(?:booking|appointment)|that\s+day|" + _DAY_WORDS + r")\b"
+    r"|\bmut(?:a|\u0103|a\u021bi|ati|am)\s+(?:programarea|rezervarea|ziua|data)\b"
+    r"|\bschimb(?:a|\u0103|a\u021bi|ati|am)?\s+(?:programarea|rezervarea|ziua|data)\b"
+    r"|\b\u043f\u0435\u0440\u0435\u043d\u0435\u0441\w*|\b\u043f\u0435\u0440\u0435\u043d\u043e\u0441\w*"
+    r"|\bperkel\w*",
+    re.IGNORECASE)
+_JOB_WORD_RE = re.compile(r"[a-z\u0400-\u04ff\u0100-\u017f]{4,}", re.IGNORECASE)
+
+
+# Owner 11 Nov 2026: a service and an NCT (pre-test) check are one visit - the check is free with the service.
+_SERVICE_FAMILY_RE = re.compile(r"\b(?:servic\w*|nct|pre-?nct|pre-?test\w*|oil)\b", re.IGNORECASE)
+
+
+def _same_job(old_need: str, new_need: str) -> bool:
+    """Both jobs written down and sharing no word of 4+ letters: two different jobs, not a move.
+    A service and an NCT check count as the same job."""
+    a = {w.lower() for w in _JOB_WORD_RE.findall(old_need or "")}
+    b = {w.lower() for w in _JOB_WORD_RE.findall(new_need or "")}
+    if _SERVICE_FAMILY_RE.search(old_need or ""):
+        a.add("service")
+    if _SERVICE_FAMILY_RE.search(new_need or ""):
+        b.add("service")
+    return not (a and b) or bool(a & b)
+
+
+def auto_cancel_moved_booking(user: str, booking: dict, freed: list = None) -> str:
+    """The old day of a chat MOVE, cancelled - or '' (nothing done, the two-bookings check then runs as before).
+    `freed`: days this reply's own CANCEL already deleted - then the move is done and nothing more goes."""
+    if not AUTO_MOVE_CANCEL or freed:
+        return ""
+    try:
+        reg = clean_reg((booking or {}).get("reg", ""))
+        new_date = ((booking or {}).get("date") or "").strip()
+        digits = "".join(c for c in str(user or "") if c.isdigit())
+        if not reg or not new_date or len(digits) < 9:
+            return ""
+        if not any(_MOVE_INTENT_RE.search(m or "") for m in _recent_customer_messages(user, limit=6, hours=6)):
+            return ""
+        today = now_local().date().isoformat()
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT id, date, COALESCE(need,'') FROM bookings WHERE UPPER(TRIM(COALESCE(reg,''))) = ? AND date > ? AND date <> ?"
+                " AND (TRIM(COALESCE(phone,'')) = '' OR REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?)",
+                (reg, today, new_date, "%" + digits[-9:])).fetchall()
+        if len(rows) != 1 or not _same_job(rows[0][2], (booking or {}).get("need", "")):
+            return ""
+        old_id, old_date = rows[0][0], rows[0][1]
+        res = cancel_booking(user, {"reg": reg, "date": old_date}, date_strict=True)
+        if (res or {}).get("cancelled") != 1:
+            return ""
+        send_telegram(f"\U0001f501 Booking moved by the customer: {reg} +{digits}\n"
+                      f"Old day {old_date} removed (id {old_id}) - now {new_date}.")
+        return old_date
+    except Exception:
+        log.exception("Auto-cancel of the moved booking failed for %s", user)
+        return ""
+
+
 def cancel_booking(user: str, fields: dict, allow_multiple: bool = False,
                    date_strict: bool = False, exclude_date: str = "") -> dict:
     """Cancel a booking: free the slot and remove the calendar entry.
@@ -13154,6 +13225,7 @@ def _finish_reply(user: str, answer: str) -> str:
         # fix3 round 3b (F4 / R3A-2): this turn's cancellation (a move) is done - two days for the car now are two
         try:
             two_check_after["phone"] = two_check_after.get("phone") or user
+            auto_cancel_moved_booking(user, two_check_after, freed_dates)   # [11 Nov 2026] a move with no CANCEL
             double_booking_alert(user, two_check_after, (now_local().date() - timedelta(days=1)).isoformat(),
                                  source="chat booking")
         except Exception:
