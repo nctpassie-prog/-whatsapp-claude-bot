@@ -1013,9 +1013,8 @@ def send_invoice_request(user: str, fields: dict) -> None:
                 + "Please check with Lenka that this actually goes out today.")
         except Exception:
             log.exception("Repeat-invoice escalation failed")
-    send_telegram("🧾 Invoice request\n"
-                  f"{fields.get('name', '?')} — {fields.get('reg', '?')}\n"
-                  f"Email: {fields.get('email', '?')}\n"
+    # Owner 11 Nov 2026: the Telegram note carries the full details too, every time.
+    send_telegram("🧾 Invoice request\n" + body + "\n"
                   + ("Sent to Lenka's WhatsApp ✓" if delivered else
                      "⚠️ WhatsApp didn't go — emailed as backup instead"))
 
