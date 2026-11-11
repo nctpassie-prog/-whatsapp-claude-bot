@@ -10410,7 +10410,7 @@ _STRAY_TAG_RE = re.compile(
     r"(?<!<)</?\s*(?:handover|customer|booking|cancel|invoice|job|feedback|charge|unknown|recovery|code|pre"
     r"|reply|message|response|answer|output)\b(?!\s*\|)[^<>|\n]{0,40}>", re.IGNORECASE)
 _SELF_NOTE_RE = re.compile(
-    r"[ \t]*\[(?:(?:if|note)\b[^\]\n€]*|[^\]\n€]*\b(?:please disregard|note to self|placeholder|system note"
+    r"[ \t]*\[(?:(?:if|note)\b[^\]\n€]{12,}|[^\]\n€]*\b(?:please disregard|note to self|placeholder|system note"
     r"|do not send|awaiting full)\b[^\]\n€]*)\]", re.IGNORECASE)
 _STRAY_FENCE_RE = re.compile(r"(?m)^[ \t]*`{1,3}[a-z]*[ \t]*$|`{3}")
 
@@ -11669,7 +11669,7 @@ _WRONG_TOMORROW_RE = re.compile(
 # [11 Nov 2026] "could range from around €250–€400+" (headlights …943), "from €20–€30 fitted" (garage
 # …062): the owner's rule is each item's own "from €X", never a range or a rough figure. Every reply
 # path passes after_hours_wording, so the range becomes its "from" figure here.
-_NUM = r"\d[\d,]*(?:\.\d\d)?(?![\d,.:/]|[A-Za-z]|\s*(?:am|pm|h|hrs?|hours?|days?|mins?|minutes?|%|years?)\b)"
+_NUM = r"\d[\d,]*(?:\.\d\d)?(?![\d,.:/%]|[A-Za-z]|\s*(?:%|(?:am|pm|h|hrs?|hours?|days?|mins?|minutes?|years?|km|kms|miles?|m)\b))"
 _PRICE_RANGE_RE = re.compile(
     r"(?:(?:could|would|will|may|can)\s+)?(?:range\s+)?(?:from\s+)?(?:(?P<btw>(?:somewhere\s+)?between\s+)"
     r"|(?:at\s+)?around\s+|about\s+|roughly\s+|approx(?:imately|\.)?\s+)?(?:from\s+)?"
@@ -12447,11 +12447,17 @@ _BOOKING_STATUS_Q_RE = re.compile(
     r"|\bi(?:'ve|\u2019ve|\s+have|\s+had)\s+book(?:ed)?\s+(?:my|the|it|in|for)\b"
     r"|\bi\s+booked\s+(?:my|the|it|in|for)\b"
     r"|\b(?:my|our)\s+(?:booking|appointment)\s+(?:is|for|on)\b", re.IGNORECASE)
+# The days a message names - one held booking names one ("I'm booked Thursday, is Friday ok?" is two).
+_DAY_WORD_RE = re.compile(
+    r"\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\b(?:tomorrow|today|tonight|tmrw|tmr)\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+    r"|\b\d{1,2}/\d{1,2}\b", re.IGNORECASE)
 _BOOKING_CHANGE_RE = re.compile(
     r"\b(?:move|moving|change|changing|rearrange|re-?schedule|re-?book|swap|postpone|bring\s+(?:it\s+)?forward"
     r"|earlier|sooner|later\s+date|another\s+day|different\s+day|other\s+day|instead|cancel\w*"
     r"|can'?t\s+make|cannot\s+make|can\u2019t\s+make|not\s+free|free|need|but|want|would\s+like"
-    r"|(?:can|could|may)\s+(?:i|we|you)\s+(?:book|come|bring|do|drop|have)|could\s+we)\b", re.IGNORECASE)
+    r"|(?:can|could|may)\s+(?:i|we|you)\s+(?:book|come|bring|do|drop|have)|could\s+we"
+    r"|what\s+about|how\s+about|or|also|another|other)\b", re.IGNORECASE)
 
 
 def guard_day_proposal(user: str, answer: str, need_hint: str = "",
@@ -12475,7 +12481,8 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "",
         # tomorrow - what time?" (…984) got "the nearest free day is ..." - their own booking day
         # judged as a new offer. A question about a booking they hold is not one.
         newest = _newest_customer_text(user)
-        if _BOOKING_STATUS_Q_RE.search(newest) and not _BOOKING_CHANGE_RE.search(newest):
+        if (_BOOKING_STATUS_Q_RE.search(newest) and not _BOOKING_CHANGE_RE.search(newest)
+                and len({w.lower()[:3] for w in _DAY_WORD_RE.findall(newest)}) <= 1):
             return answer
         prop = _PROPOSAL_RE.search(text)
         if prop:
