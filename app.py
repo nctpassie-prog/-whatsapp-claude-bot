@@ -8102,6 +8102,7 @@ def _maybe_courtesy_close(user: str) -> str | None:
                                    "the customer's last message — answer the simple "
                                    "thing or close warmly, else SKIP.)"}],
                        system_prompt) or ""
+    raw = repair_markers(raw)       # [11 Nov 2026]
     if raw.startswith(MODEL_FAILED_PREFIX):
         log.warning("Assist reply for %s skipped - the model could not be reached", user)
         # [R1 fix, N4] "alerted": an alert covers this message (raised now, or already), so
@@ -10336,7 +10337,7 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
     automatic fall-through to Claude on any error."""
     if _use_gemini(user):
         try:
-            return repair_markers(_call_gemini(messages, system_prompt))
+            return _call_gemini(messages, system_prompt)
         except Exception:
             log.exception("Gemini call failed — falling back to Claude")
     if isinstance(system_prompt, tuple):
@@ -10367,9 +10368,9 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
             timeout=90,
         )
         resp.raise_for_status()
-        return repair_markers("".join(
+        return "".join(
             b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"
-        ).strip())
+        ).strip()
     except Exception:
         log.exception("Claude API call failed")
         return (
@@ -10409,8 +10410,8 @@ _STRAY_TAG_RE = re.compile(
     r"(?<!<)</?\s*(?:handover|customer|booking|cancel|invoice|job|feedback|charge|unknown|recovery|code|pre"
     r"|reply|message|response|answer|output)\b(?!\s*\|)[^<>|\n]{0,40}>", re.IGNORECASE)
 _SELF_NOTE_RE = re.compile(
-    r"[ \t]*\[[^\]\n]*\b(?:disregard|ignore this|internal|note to self|placeholder|system note|do not send"
-    r"|awaiting full|for the team)\b[^\]\n]*\]", re.IGNORECASE)
+    r"[ \t]*\[(?:(?:if|note)\b[^\]\n€]*|[^\]\n€]*\b(?:please disregard|note to self|placeholder|system note"
+    r"|do not send|awaiting full)\b[^\]\n€]*)\]", re.IGNORECASE)
 _STRAY_FENCE_RE = re.compile(r"(?m)^[ \t]*`{1,3}[a-z]*[ \t]*$|`{3}")
 
 
@@ -10427,8 +10428,8 @@ def repair_markers(text: str) -> str:
         out = _STRAY_TAG_RE.sub("", out)
         out = _SELF_NOTE_RE.sub("", out)
         out = _STRAY_FENCE_RE.sub("", out).strip()
-        if raw.strip() and not re.search(r"\w{2,}", re.sub(r"<<<.*?>>>", "", out, flags=re.S)) \
-                and "<<<" not in out:
+        if out != raw.strip() and not re.search(r"\w{2,}", re.sub(r"<<<.*?>>>", "", out, flags=re.S)) \
+                and "<<<" not in out:       # debris was taken out and nothing is left (a bare "👍" stays)
             log.warning("Model reply was only debris %r - team line + handover instead", raw[:120])
             out = ("I've passed this to the team — they'll reply here.\n"
                    "<<<HANDOVER|reason=the bot could not answer this message - please reply>>>")
@@ -11213,7 +11214,7 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
     """Call Claude, and if the reply has no visible words (only hidden markers, or
     nothing at all), ask once more. Stops customers getting silence or a holding line
     when a real answer was possible."""
-    answer = _call_claude(messages, system_prompt, user)
+    answer = repair_markers(_call_claude(messages, system_prompt, user))   # [11 Nov 2026]
     if visible_text(answer):
         return answer
     log.warning("Claude returned no visible text for %s (raw=%r) — retrying once",
@@ -11222,7 +11223,7 @@ def _call_claude_visible(messages: list, system_prompt, user: str = "") -> str:
         retry = (system_prompt[0], (system_prompt[1] or "") + RETRY_NUDGE)
     else:
         retry = system_prompt + RETRY_NUDGE
-    return _call_claude(messages, retry, user)
+    return repair_markers(_call_claude(messages, retry, user))
 
 # "We're open until 6pm today" said on a Saturday (26 Sep 2026, 09:14 - Saturday
 # closes at 2pm). The clock line is the real fix; this only catches the model
@@ -11661,26 +11662,42 @@ def no_false_closed(text: str) -> str:
 
 
 _WRONG_TOMORROW_RE = re.compile(
-    r"\b((?:open(?:s|ing)?(?: again)?|(?:be|we'?re|we\u2019re|we are|we'll be|we\u2019ll be|we will be)"
-    r" (?:back|here|in|open))(?: again)?)\s+tomorrow\b", re.IGNORECASE)
+    r"\b((?:we\s+)?open(?:s)? again|(?:we'll|we\u2019ll|we will) be (?:back|here|open))\s+tomorrow"
+    r"(?=\s+(?:morning\s+)?(?:at|from)\s+9(?::00)?\s*(?:am|a\.m\.)?\b)", re.IGNORECASE)
 
 
 # [11 Nov 2026] "could range from around €250–€400+" (headlights …943), "from €20–€30 fitted" (garage
 # …062): the owner's rule is each item's own "from €X", never a range or a rough figure. Every reply
 # path passes after_hours_wording, so the range becomes its "from" figure here.
+_NUM = r"\d[\d,]*(?:\.\d\d)?(?![\d,.:/]|[A-Za-z]|\s*(?:am|pm|h|hrs?|hours?|days?|mins?|minutes?|%|years?)\b)"
 _PRICE_RANGE_RE = re.compile(
-    r"(?:(?:could|would|will|may|can)\s+)?(?:range\s+)?(?:from\s+)?(?:(?:somewhere\s+)?between\s+"
+    r"(?:(?:could|would|will|may|can)\s+)?(?:range\s+)?(?:from\s+)?(?:(?P<btw>(?:somewhere\s+)?between\s+)"
     r"|(?:at\s+)?around\s+|about\s+|roughly\s+|approx(?:imately|\.)?\s+)?(?:from\s+)?"
-    r"€\s?(\d[\d,.]*)\s*(?:–|—|-|to|and)\s*€?\s?\d[\d,.]*(?!\s*(?:am|pm|h\b|hrs?|hours?|days?|mins?|minutes?|%|years?))\+?",
+    r"€\s?(?P<lo>\d[\d,]*(?:\.\d\d)?)\s*(?P<sep>–|—|-|to|and)\s*(?P<eur>€\s?)?(?P<hi>" + _NUM + r")\+?",
     re.IGNORECASE)
-_PRICE_ROUGH_RE = re.compile(r"\b(?:at\s+)?(?:around|roughly|approximately|approx\.?)\s+(?:from\s+)?€", re.IGNORECASE)
+_PRICE_ROUGH_RE = re.compile(
+    r"\b(?:from\s+)?(?:at\s+)?(?:around|roughly|approximately|approx\.?)\s+(?:from\s+)?€", re.IGNORECASE)
+
+
+def _range_to_from(m) -> str:
+    """Only a real price range: 'and' only after 'between'; the second figure bigger than the first."""
+    try:
+        if m.group("sep").lower() == "and" and not m.group("btw"):
+            return m.group(0)
+        lo, hi = (float(m.group(k).replace(",", "")) for k in ("lo", "hi"))
+        if hi <= lo:
+            return m.group(0)
+    except Exception:
+        return m.group(0)
+    return "from €" + m.group("lo")
 
 
 def no_price_range(text: str) -> str:
     try:
         parts = re.split(r"(<<<.*?>>>)", text or "", flags=re.S)
         for i in range(0, len(parts), 2):
-            new = _PRICE_ROUGH_RE.sub("from €", _PRICE_RANGE_RE.sub(lambda m: "from €" + m.group(1), parts[i]))
+            new = _PRICE_ROUGH_RE.sub("from €", _PRICE_RANGE_RE.sub(_range_to_from, parts[i]))
+            new = re.sub(r"\bfrom\s+from\b", "from", new, flags=re.IGNORECASE)
             if new != parts[i]:
                 log.info("Price range/rough figure made a 'from' price: %r", parts[i][:160])
                 parts[i] = new
@@ -12427,12 +12444,14 @@ def need_with_confirmed_service(user: str, booking: dict) -> str:
 _BOOKING_STATUS_Q_RE = re.compile(
     r"\b(?:am\s+i|i'?m|i\u2019m|i\s+am|we'?re|we\u2019re|we\s+are|are\s+we|is\s+(?:it|my\s+\w+|the\s+\w+))"
     r"\s+(?:still\s+|already\s+|all\s+)?booked\b"
-    r"|\bi(?:'ve|\u2019ve|\s+have|\s+had)?\s+book(?:ed)?\s+(?:my|the|it|in|for)\b"
-    r"|\b(?:my|our)\s+(?:booking|appointment)\b", re.IGNORECASE)
+    r"|\bi(?:'ve|\u2019ve|\s+have|\s+had)\s+book(?:ed)?\s+(?:my|the|it|in|for)\b"
+    r"|\bi\s+booked\s+(?:my|the|it|in|for)\b"
+    r"|\b(?:my|our)\s+(?:booking|appointment)\s+(?:is|for|on)\b", re.IGNORECASE)
 _BOOKING_CHANGE_RE = re.compile(
     r"\b(?:move|moving|change|changing|rearrange|re-?schedule|re-?book|swap|postpone|bring\s+(?:it\s+)?forward"
     r"|earlier|sooner|later\s+date|another\s+day|different\s+day|other\s+day|instead|cancel\w*"
-    r"|can'?t\s+make|cannot\s+make|can\u2019t\s+make|not\s+free)\b", re.IGNORECASE)
+    r"|can'?t\s+make|cannot\s+make|can\u2019t\s+make|not\s+free|free|need|but|want|would\s+like"
+    r"|(?:can|could|may)\s+(?:i|we|you)\s+(?:book|come|bring|do|drop|have)|could\s+we)\b", re.IGNORECASE)
 
 
 def guard_day_proposal(user: str, answer: str, need_hint: str = "",
