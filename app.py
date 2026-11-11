@@ -975,12 +975,14 @@ def send_invoice_request(user: str, fields: dict) -> None:
         f"Customer phone: +{user}\n\n"
         f"Conversation: {PUBLIC_URL}/chats?token={review_link_token()}&user={user}\n"
     )
-    wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
     delivered = False
-    if wa:
+    for i, wa in enumerate(invoice_whatsapp_numbers()):
         # Template first — an approved template delivers any time; the plain-text
         # copy with the full details lands whenever her 24h reply window is open.
-        delivered = bool(send_invoice_template(wa, fields, user))
+        # Only the first number (the accountant's, when set) decides the email fallback.
+        ok_wa = bool(send_invoice_template(wa, fields, user))
+        if i == 0:
+            delivered = ok_wa
         try:
             send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body)
         except Exception:
@@ -4378,6 +4380,21 @@ def clock_line(now=None) -> str:
             "to them. A special request about a future booking is not 'just answer' unless the "
             "business information answers it. If they ask whether we are open, the answer is NO - say when we open "
             f"again. Bookings for future days are still fine. {_HOURS_SENTENCE}" + ahead)
+
+# Owner 11 Nov 2026: every invoice request ALSO goes to this WhatsApp, on top of the
+# accountant number in the invoice_whatsapp setting. INVOICE_WHATSAPP_EXTRA="" turns it off.
+INVOICE_WHATSAPP_EXTRA = os.environ.get("INVOICE_WHATSAPP_EXTRA", "0857569930")
+
+
+def invoice_whatsapp_numbers() -> list:
+    """The accountant's number from the setting, then the extra one - each once."""
+    out = []
+    for raw in (get_setting("invoice_whatsapp", ""), INVOICE_WHATSAPP_EXTRA):
+        d = normalize_phone(raw)
+        if d and d not in out:
+            out.append(d)
+    return out
+
 
 def normalize_phone(phone: str) -> str:
     """Digits only, Irish numbers in international form: '086 389 1825',
@@ -22004,7 +22021,7 @@ def chase_outstanding_invoices() -> None:
     now = now_local()
     if not (9 <= now.hour < 19) or now.weekday() == 6 or bank_holiday_name(now):
         return
-    wa = "".join(ch for ch in get_setting("invoice_whatsapp", "") if ch.isdigit())
+    wa_list = invoice_whatsapp_numbers()
     for key, n, first_ts, last_ts, chased in outstanding_invoices(min_hours=20):
         if chased:
             continue
@@ -22015,7 +22032,7 @@ def chase_outstanding_invoices() -> None:
                 + f"Asked {n} time(s), first {days} day(s) ago." + chr(10)
                 + f"Details: {PUBLIC_URL}/chats?token={review_link_token()}&user={phone}")
         try:
-            if wa:
+            for wa in wa_list:
                 send_whatsapp(wa, note)
             send_telegram_private(note)
         except Exception:
@@ -26203,7 +26220,8 @@ def _is_internal_number(digits: str) -> bool:
     if not want:
         return False
     ours = [OWNER_WHATSAPP, MANAGER_WHATSAPP,
-            get_setting("invoice_whatsapp", ""), get_setting("recovery_whatsapp", "")]
+            get_setting("invoice_whatsapp", ""), get_setting("recovery_whatsapp", ""),
+            INVOICE_WHATSAPP_EXTRA]
     ours += list(ALERT_NUMBERS)
     return want in {normalize_phone(o) for o in ours if o}
 
