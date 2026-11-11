@@ -911,6 +911,9 @@ def process_invoice(answer: str):
     return clean, fields
 
 INVOICE_TEMPLATE = "invoice_request"
+# Owner 11 Nov 2026: invoice WhatsApps always go out from 086 667 7666. The 085 line's
+# WhatsApp account has no payment method, so Meta refuses its templates (error 131042).
+INVOICE_FROM_PHONE_ID = os.environ.get("INVOICE_FROM_PHONE_ID", "335852741443330")  # 086
 
 def send_invoice_template(to: str, fields: dict, user: str) -> bool:
     """Template message to the accountant — deliverable at ANY time, no 24h window."""
@@ -919,7 +922,7 @@ def send_invoice_template(to: str, fields: dict, user: str) -> bool:
               (fields.get("job") or "(not given)") + f" / customer +{user}",
               fields.get("email") or "(not given)"]
     try:
-        url, tok = send_endpoint(phone_id_for_customer(to))
+        url, tok = send_endpoint(INVOICE_FROM_PHONE_ID or phone_id_for_customer(to))
         r = httpx.post(url, headers={"Authorization": f"Bearer {tok}"},
                        json={"messaging_product": "whatsapp", "to": to,
                              "type": "template",
@@ -984,7 +987,7 @@ def send_invoice_request(user: str, fields: dict) -> None:
         if i == 0:
             delivered = ok_wa
         try:
-            send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body)
+            send_whatsapp(wa, "🧾 Invoice request (NCTPass bot)\n" + body, INVOICE_FROM_PHONE_ID)
         except Exception:
             log.exception("Invoice WhatsApp to accountant failed")
     if not delivered:
@@ -22033,7 +22036,7 @@ def chase_outstanding_invoices() -> None:
                 + f"Details: {PUBLIC_URL}/chats?token={review_link_token()}&user={phone}")
         try:
             for wa in wa_list:
-                send_whatsapp(wa, note)
+                send_whatsapp(wa, note, INVOICE_FROM_PHONE_ID)
             send_telegram_private(note)
         except Exception:
             log.exception("Invoice chase failed for %s", key)
