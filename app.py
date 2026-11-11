@@ -10020,18 +10020,20 @@ def human_handling(user: str) -> bool:
 # [4 Nov 2026] …775, 17:00: "Dima tat normal cu mașina?" six hours after Dima's last line got the bot's
 # "nearest day is Thursday 12 November". The same person's message to a colleague is for that colleague.
 _TO_COLLEAGUE_RE = re.compile(
-    r"^\W*(?:(?:hi|hey|hello|hiya|salut|bun[aă]|привет|здравствуйте|labas)\W+)?"
-    r"(?:dima|vlad|дима|влад)\b", re.IGNORECASE)
+    r"^\W*(?:(?:hi|hey|hello|hiya|dear|(?:good\s+)?(?:morning|afternoon|evening)|salut|bun[aă](?:\s+ziua)?"
+    r"|привет|здравствуйте|доброе утро|добрый день|labas(?:\s+rytas)?)\W+)?"
+    r"(?:dima|vlad|дима|дим|влад)(?![\w-])", re.IGNORECASE)   # [11 Nov 2026] "Good morning Dima" …962, "Дим," …382
 
 
 def addressed_to_colleague(user: str, text: str) -> bool:
-    """This message opens with a colleague's name and a real colleague line is under 24 hours old."""
+    """This message opens with a colleague's name and a real colleague line is under 3 days old
+    ([11 Nov 2026] was 24 hours: Jonathan …962 writes to Dima every few days)."""
     try:
         if not _TO_COLLEAGUE_RE.search(text or ""):
             return False
         with closing(db()) as conn:
             rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ?"
-                                " ORDER BY ts DESC LIMIT 6", (user, time.time() - 24 * 3600)).fetchall()
+                                " ORDER BY ts DESC LIMIT 6", (user, time.time() - 72 * 3600)).fetchall()
         return any(is_real_staff_text(r[0] or "") for r in rows)
     except Exception:
         log.exception("addressed_to_colleague failed for %s", user)
@@ -10334,7 +10336,7 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
     automatic fall-through to Claude on any error."""
     if _use_gemini(user):
         try:
-            return _call_gemini(messages, system_prompt)
+            return repair_markers(_call_gemini(messages, system_prompt))
         except Exception:
             log.exception("Gemini call failed — falling back to Claude")
     if isinstance(system_prompt, tuple):
@@ -10365,9 +10367,9 @@ def _call_claude(messages: list, system_prompt, user: str = "") -> str:
             timeout=90,
         )
         resp.raise_for_status()
-        return "".join(
+        return repair_markers("".join(
             b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"
-        ).strip()
+        ).strip())
     except Exception:
         log.exception("Claude API call failed")
         return (
@@ -10392,7 +10394,50 @@ def visible_text(answer: str) -> str:
 # The model sometimes closes a marker with '>>' instead of '>>>' — one such
 # HANDOVER marker sailed past the strict regexes and was SENT to a customer
 # (Francis, 24 Aug). This catches any marker-ish debris however it's closed.
-LENIENT_MARKER_RE = re.compile(r"<<<[A-Z]+\|.*?(?:>>>|>>|>|$)", re.DOTALL)
+LENIENT_MARKER_RE = re.compile(r"<<<[A-Za-z_]+\|.*?(?:>>>|>>|>|$)", re.DOTALL)
+
+# [11 Nov 2026] Hidden notes in shapes nothing else read, every one sent to a customer:
+# "<<<HANDover|reason=..." with no close (garage …982), "</handover>" alone (garage …623 - no
+# alert either), "CUSTOMER|name=|reg=11D20248" with no <<< (headlights …366), "[If reg is
+# incomplete or unclear, please disregard - awaiting full reg]" (headlights …863), a stray
+# "</code>" (…690) or backtick (…480).
+_MARKER_NAMES = "BOOKING|CUSTOMER|UNKNOWN|CHARGE|FEEDBACK|HANDOVER|CANCEL|INVOICE|JOB|RECOVERY"
+_MARKER_CASE_RE = re.compile(r"<<<\s*(" + _MARKER_NAMES + r")\s*\|", re.IGNORECASE)
+_MARKER_UNCLOSED_RE = re.compile(r"<<<(?:" + _MARKER_NAMES + r")\|(?:(?!>>>|<<<).)*$", re.DOTALL)
+_MARKER_BARE_RE = re.compile(r"(?m)^[ \t]*(" + _MARKER_NAMES + r")\|(\w+=[^\n]*?)[ \t]*(?:>{1,3})?[ \t]*$")
+_STRAY_TAG_RE = re.compile(
+    r"(?<!<)</?\s*(?:handover|customer|booking|cancel|invoice|job|feedback|charge|unknown|recovery|code|pre"
+    r"|reply|message|response|answer|output)\b(?!\s*\|)[^<>|\n]{0,40}>", re.IGNORECASE)
+_SELF_NOTE_RE = re.compile(
+    r"[ \t]*\[[^\]\n]*\b(?:disregard|ignore this|internal|note to self|placeholder|system note|do not send"
+    r"|awaiting full|for the team)\b[^\]\n]*\]", re.IGNORECASE)
+_STRAY_FENCE_RE = re.compile(r"(?m)^[ \t]*`{1,3}[a-z]*[ \t]*$|`{3}")
+
+
+def repair_markers(text: str) -> str:
+    """The model's reply with its hidden notes put back in the one shape the parsers read, and the
+    debris no customer should see taken out. An empty reply that was only debris becomes the team
+    line plus a HANDOVER, so a person still answers (…623)."""
+    try:
+        raw = text or ""
+        out = _MARKER_CASE_RE.sub(lambda m: "<<<" + m.group(1).upper() + "|", raw)
+        out = _MARKER_BARE_RE.sub(lambda m: "<<<" + m.group(1).upper() + "|" + m.group(2) + ">>>", out)
+        if _MARKER_UNCLOSED_RE.search(out):
+            out = out.rstrip(" >") + ">>>"
+        out = _STRAY_TAG_RE.sub("", out)
+        out = _SELF_NOTE_RE.sub("", out)
+        out = _STRAY_FENCE_RE.sub("", out).strip()
+        if raw.strip() and not re.search(r"\w{2,}", re.sub(r"<<<.*?>>>", "", out, flags=re.S)) \
+                and "<<<" not in out:
+            log.warning("Model reply was only debris %r - team line + handover instead", raw[:120])
+            out = ("I've passed this to the team — they'll reply here.\n"
+                   "<<<HANDOVER|reason=the bot could not answer this message - please reply>>>")
+        if out != raw.strip():
+            log.info("Hidden-note repair: %r -> %r", raw[-160:], out[-160:])
+        return out
+    except Exception:
+        log.exception("repair_markers failed (reply unchanged)")
+        return text
 
 _ORPHAN_CLOSE_RE = re.compile(r"^[\s\u200b-\u200d\ufeff]*>+[\s\u200b-\u200d\ufeff]*$", re.MULTILINE)
 # [4 Nov 2026] The model thinking aloud about the customer, sent as the message: "We haven't made a booking
@@ -10419,6 +10464,10 @@ def strip_marker_leftovers(text: str) -> str:
     # [4 Nov 2026] ...and a single '>' after a zero-width space (headlights …546, 3 Nov).
     out = _ORPHAN_CLOSE_RE.sub("", out)
     out = re.sub(r">{3,}", "", out)
+    out = _STRAY_TAG_RE.sub("", out)                 # [11 Nov 2026] "</handover>", "</code>"
+    out = _SELF_NOTE_RE.sub("", out)                 # [11 Nov 2026] "[... please disregard ...]"
+    out = re.sub(r"(?m)^[ \t]*(?:" + _MARKER_NAMES + r")\|\w+=[^\n]*$", "", out)   # bare "CUSTOMER|name=..."
+    out = _STRAY_FENCE_RE.sub("", out)
     out = re.sub(r"\n\s*[.…]\s*$", "", out)  # stripped markers leave lone dots behind
     return out.strip()
 
@@ -11597,13 +11646,48 @@ _FALSE_CLOSED_RE = re.compile(
     r"(?:The team will see this here when they(?:'|\u2019)re back\.?[ \t]*)?", re.IGNORECASE)
 
 
+# [11 Nov 2026] Headlights …828, Tue 10 Nov 15:17 (open): "The team will see your messages here when
+# we're back". While open, "when we're back" is simply dropped.
+_FALSE_BACK_RE = re.compile(r"[ \t]+when (?:we|they)(?:'|\u2019| a)?re back\b(?! from)", re.IGNORECASE)
+
+
 def no_false_closed(text: str) -> str:
     """While we are OPEN, a sentence saying we're closed goes (only if words are left)."""
-    out = _FALSE_CLOSED_RE.sub("", text or "").strip()
+    out = _FALSE_BACK_RE.sub("", _FALSE_CLOSED_RE.sub("", text or "")).strip()
     if out == (text or "").strip() or not reply_has_words(out):
         return text
     log.info("Reply said we were closed during opening hours - sentence removed")
     return out
+
+
+_WRONG_TOMORROW_RE = re.compile(
+    r"\b((?:open(?:s|ing)?(?: again)?|(?:be|we'?re|we\u2019re|we are|we'll be|we\u2019ll be|we will be)"
+    r" (?:back|here|in|open))(?: again)?)\s+tomorrow\b", re.IGNORECASE)
+
+
+# [11 Nov 2026] "could range from around €250–€400+" (headlights …943), "from €20–€30 fitted" (garage
+# …062): the owner's rule is each item's own "from €X", never a range or a rough figure. Every reply
+# path passes after_hours_wording, so the range becomes its "from" figure here.
+_PRICE_RANGE_RE = re.compile(
+    r"(?:(?:could|would|will|may|can)\s+)?(?:range\s+)?(?:from\s+)?(?:(?:somewhere\s+)?between\s+"
+    r"|(?:at\s+)?around\s+|about\s+|roughly\s+|approx(?:imately|\.)?\s+)?(?:from\s+)?"
+    r"€\s?(\d[\d,.]*)\s*(?:–|—|-|to|and)\s*€?\s?\d[\d,.]*(?!\s*(?:am|pm|h\b|hrs?|hours?|days?|mins?|minutes?|%|years?))\+?",
+    re.IGNORECASE)
+_PRICE_ROUGH_RE = re.compile(r"\b(?:at\s+)?(?:around|roughly|approximately|approx\.?)\s+(?:from\s+)?€", re.IGNORECASE)
+
+
+def no_price_range(text: str) -> str:
+    try:
+        parts = re.split(r"(<<<.*?>>>)", text or "", flags=re.S)
+        for i in range(0, len(parts), 2):
+            new = _PRICE_ROUGH_RE.sub("from €", _PRICE_RANGE_RE.sub(lambda m: "from €" + m.group(1), parts[i]))
+            if new != parts[i]:
+                log.info("Price range/rough figure made a 'from' price: %r", parts[i][:160])
+                parts[i] = new
+        return "".join(parts)
+    except Exception:
+        log.exception("no_price_range failed")
+        return text
 
 
 def after_hours_wording(text: str) -> str:
@@ -11614,13 +11698,17 @@ def after_hours_wording(text: str) -> str:
     customer's own arrival gets the opening time, as before Fix 1. Only runs
     outside opening hours - except "open until 6pm today" on a Saturday
     (saturday_hours_wording), which every reply path gets through here."""
-    text = saturday_hours_wording(text)
+    text = no_price_range(saturday_hours_wording(text))
     try:
         line = clock_line()
         if "is CLOSED" not in line:
             return no_false_closed(text)
         m = _CLOCK_WHEN_RE.search(line)
         when = m.group(1) if m else "when we open"
+        if when.lower().startswith(("this morning", "today")):
+            # [11 Nov 2026] Garage …803, Mon 9 Nov 08:20: "we open again tomorrow at 9am" - we opened
+            # that morning. Before opening on an open day it is today.
+            text = _WRONG_TOMORROW_RE.sub(lambda t: t.group(1) + " today", text)
     except Exception:
         return text
     out = []
@@ -12336,6 +12424,17 @@ def need_with_confirmed_service(user: str, booking: dict) -> str:
     return need
 
 
+_BOOKING_STATUS_Q_RE = re.compile(
+    r"\b(?:am\s+i|i'?m|i\u2019m|i\s+am|we'?re|we\u2019re|we\s+are|are\s+we|is\s+(?:it|my\s+\w+|the\s+\w+))"
+    r"\s+(?:still\s+|already\s+|all\s+)?booked\b"
+    r"|\bi(?:'ve|\u2019ve|\s+have|\s+had)?\s+book(?:ed)?\s+(?:my|the|it|in|for)\b"
+    r"|\b(?:my|our)\s+(?:booking|appointment)\b", re.IGNORECASE)
+_BOOKING_CHANGE_RE = re.compile(
+    r"\b(?:move|moving|change|changing|rearrange|re-?schedule|re-?book|swap|postpone|bring\s+(?:it\s+)?forward"
+    r"|earlier|sooner|later\s+date|another\s+day|different\s+day|other\s+day|instead|cancel\w*"
+    r"|can'?t\s+make|cannot\s+make|can\u2019t\s+make|not\s+free)\b", re.IGNORECASE)
+
+
 def guard_day_proposal(user: str, answer: str, need_hint: str = "",
                        readback_done: bool = False) -> str:
     """If a reply offers a day this job cannot actually have, swap in the honest
@@ -12352,6 +12451,12 @@ def guard_day_proposal(user: str, answer: str, need_hint: str = "",
         # same goes for a booking or a handover. A reply carrying a marker is a
         # confirmation, not an offer, so there is nothing here to guard anyway.
         if "<<<" in text:
+            return answer
+        # [11 Nov 2026] "I'm booked in for Thursday yes?" (…945, twice) and "I have book my van for
+        # tomorrow - what time?" (…984) got "the nearest free day is ..." - their own booking day
+        # judged as a new offer. A question about a booking they hold is not one.
+        newest = _newest_customer_text(user)
+        if _BOOKING_STATUS_Q_RE.search(newest) and not _BOOKING_CHANGE_RE.search(newest):
             return answer
         prop = _PROPOSAL_RE.search(text)
         if prop:
@@ -12519,7 +12624,7 @@ _CANCEL_HOLD_MSG = {
 }
 
 
-def _claim_sentences(text: str, rx) -> list:
+def _claim_sentences(text: str, rx, clause_q: bool = False) -> list:
     """Indexes (in the split list) of the sentences that make the claim outright."""
     parts = _CLAIM_SENT_SPLIT_RE.split(text or "")
     hits = []
@@ -12527,10 +12632,21 @@ def _claim_sentences(text: str, rx) -> list:
         sent = parts[i]
         if "<<<" in sent or not rx.search(sent):
             continue
-        if sent.rstrip().endswith("?") or _CLAIM_CONDITION_RE.search(sent[:rx.search(sent).start()]):
+        if _CLAIM_CONDITION_RE.search(sent[:rx.search(sent).start()]):
+            continue
+        if sent.rstrip().endswith("?") and not (clause_q and _claim_clause_end(sent, rx)):
             continue
         hits.append(i)
     return hits
+
+
+def _claim_clause_end(sent: str, rx) -> int:
+    """[11 Nov 2026] Where the claim's own clause ends in a sentence that goes on to ask something
+    ("I've cancelled Wednesday for you, and the earliest day is ... would that suit?"), 0 when the
+    claim itself is the question ("Have I cancelled it?")."""
+    m = rx.search(sent)
+    b = re.search(r"\s*(?:[,;]|\s[\u2014\u2013-])\s*(?:(?:and|but|so)\s+)?", sent[m.end():]) if m else None
+    return (m.end() + b.end()) if b and re.search(r"\w{3,}", sent[m.end() + b.end():]) else 0
 
 
 def staff_said_ready(user: str, days: int = 3) -> bool:
@@ -12582,13 +12698,22 @@ def no_false_cancel(user: str, answer: str) -> str:
     try:
         if OWNER_WHATSAPP and user == OWNER_WHATSAPP:
             return answer
-        hits = _claim_sentences(answer, _CANCEL_CLAIM_RE)
+        hits = _claim_sentences(answer, _CANCEL_CLAIM_RE, clause_q=True)
         if not hits:
             return answer
         parts = _CLAIM_SENT_SPLIT_RE.split(answer)
         said = " ".join(parts[i] for i in hits)
         for i in hits:
-            parts[i] = ""
+            sent = parts[i]
+            end = _claim_clause_end(sent, _CANCEL_CLAIM_RE) if sent.rstrip().endswith("?") else 0
+            if end:
+                # Only the claim's clause goes; the question after it stays (11 Nov 2026).
+                start = _CANCEL_CLAIM_RE.search(sent).start()
+                cut = max(sent.rfind(",", 0, start), sent.rfind(";", 0, start))
+                keep, rest = (sent[:cut + 1] + " ", sent[end:]) if cut >= 0 else ("", sent[end:])
+                parts[i] = keep + (rest[:1].upper() + rest[1:] if not keep else rest)
+            else:
+                parts[i] = ""
         out = re.sub(r"[ \t]{2,}", " ", "".join(parts)).strip()
         log.warning("Reply to %s said something was cancelled, nothing was: %r", user, said[:200])
         if not re.search(r"\w{3,}", re.sub(r"<<<.*?>>>", "", out, flags=re.S)):
