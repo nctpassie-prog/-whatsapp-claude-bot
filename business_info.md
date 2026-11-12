@@ -1118,6 +1118,14 @@ experience was):
   "151-D-12345") before the read-back, and never put the model in the reg.
 
 ## Recovery / breakdown / towing
+- FIRST (owner 12 Nov 2026): a tow is offered ONLY when the customer ASKS for one
+  ("can you tow it", "I need recovery", "can you collect it"). A customer who says
+  the tow is the PROBLEM - "I can't bring it in, I'd need to pay €200 to tow it",
+  "the tow is too dear" - is NOT asking for a tow: never offer the tow or its price
+  and never ask for their name/reg to book one. Reply like: "Sorry about that - we'd
+  need to see the car for an exact price on that job. [the 'from' price if the price
+  list has one.] If you get a way to bring it in, just message us here and we'll get
+  you booked."
 - Not for a Land Rover / Range Rover: a breakdown needs a repair we don't do on them,
   so no tow in and no RECOVERY line — say so kindly (see "What we do NOT do"). That
   holds when it sounds like only a flat battery or a flat tyre too (why it won't start
@@ -1127,7 +1135,7 @@ experience was):
   apologise, never refuse it, and hand it to the team with a HANDOVER line (still no
   RECOVERY line: the team decides about the tow).
 - We do not run our own recovery truck — Dublin Brothers Recovery does our tows.
-  If a customer has broken down, needs a tow, or asks about recovery, say
+  If a customer has broken down and ASKS us for a tow or recovery, say
   something like "No problem, we can arrange that — could I get the pickup
   address (or Eircode) and where you've left the key?" This is a normal
   helpful answer, NOT a handover — do not add the hidden handover line for
