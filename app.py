@@ -533,6 +533,20 @@ def clean_car(car: str) -> str:
 # still looks like a real reg — only the customer can catch that), but it
 # does catch a badly garbled voice capture (too short, all-digits, etc).
 _PLAUSIBLE_REG_RE = re.compile(r"^(?=.*[A-Z])(?=.*\d)[A-Z0-9]{4,10}$")
+_MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9-]+")
+# 520D, 118I, 330CI, C220, E350, X5, RS6 - a plate such as ABC123 or AB12CDE does not have this shape
+_MODEL_CODE_SHAPE_RE = re.compile(r"^(?:\d{2,3}[A-Z]{1,3}|[A-Z]{1,2}\d{1,3}[A-Z]?)$")
+
+
+def reg_is_model_code(reg: str, car: str) -> bool:
+    """[owner 12 Nov 2026] The reg is just the model code from the car ("BMW 520D" with reg "520D", H …480 11 Nov):
+    not a plate. Only when that exact word is in the car text and it is not an Irish plate shape - so a real or a
+    cherished plate the customer typed on its own is never touched (no endless asking)."""
+    r = clean_reg(reg)
+    if not r or len(r) > 6 or _IRISH_REG_RE.match(r) or not _MODEL_CODE_SHAPE_RE.match(r):
+        return False
+    words = {w.replace("-", "").upper() for w in _MODEL_TOKEN_RE.findall(car or "")}
+    return r in words
 
 def reg_looks_off(reg: str) -> bool:
     r = clean_reg(reg)
@@ -12954,6 +12968,12 @@ def _finish_reply(user: str, answer: str) -> str:
         if example_reg_not_given(user, booking.get("reg", "")):
             log.warning("Booking for %s: the reg %r is the prompt's example and the customer never typed it - "
                         "not stored", user, booking.get("reg"))
+            booking["reg"] = ""
+        # [owner 12 Nov 2026] ...nor the model code read back as the reg ("BMW 520D (520D)"): not stored, so the
+        # missing-reg ask gets the real plate.
+        if reg_is_model_code(booking.get("reg", ""), booking.get("car", "")):
+            log.warning("Booking for %s: the reg %r is the model code from the car %r - not stored",
+                        user, booking.get("reg"), booking.get("car"))
             booking["reg"] = ""
     if booking:
         # A re-confirmation of a booking already in the diary sails past every
