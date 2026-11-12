@@ -1031,6 +1031,58 @@ def send_invoice_request(user: str, fields: dict) -> None:
     send_telegram("🧾 Invoice request\n" + body + "\n"
                   + ("Sent to Lenka's WhatsApp ✓" if delivered else
                      "⚠️ WhatsApp didn't go — emailed as backup instead"))
+    send_invoice_telegram_extra("🧾 Invoice request (NCTPass)\n" + body)
+
+# Owner 12 Nov 2026: the invoice note also goes to these Telegram people (usernames, comma-separated; "" = off).
+# A bot can only write to someone who has opened it and pressed Start; the button poller then sees them (tgchat)
+# and the chat is found here by the username. Only private chats (positive id), never a group named like them.
+INVOICE_TELEGRAM_EXTRA = [u.strip().lstrip("@").lower()
+                          for u in os.environ.get("INVOICE_TELEGRAM_EXTRA", "darss_kyy").split(",") if u.strip()]
+
+
+def invoice_telegram_extra_chats() -> list:
+    out = []
+    try:
+        seen = tg_seen_chats()
+    except Exception:
+        seen = {}
+    try:
+        group = {str(c) for c in telegram_chat_ids()}
+    except Exception:
+        group = set()
+    for u in INVOICE_TELEGRAM_EXTRA:
+        key = "invoice_tg_chat_" + u
+        cid = get_setting(key, "")          # pinned once found: a later look-alike name never takes it over
+        if not cid:
+            for c, name in seen.items():
+                words = str(name or "").lower().split()
+                if str(c).isdigit() and len(words) >= 2 and words[-1] == "@" + u:
+                    cid = str(c)
+                    set_setting(key, cid)   # remembered: the seen list only keeps the last 30 chats
+                    break
+        if cid and cid not in group and cid not in out:
+            out.append(cid)
+    return out
+
+
+def send_invoice_telegram_extra(text: str) -> None:
+    """Never raises - an invoice request must not fail over a Telegram copy."""
+    try:
+        chats = invoice_telegram_extra_chats()
+        # no chat link here: it carries the admin key, and this person needs the invoice details only
+        text = "\n".join(ln for ln in (text or "").split("\n") if "token=" not in ln)
+    except Exception:
+        log.exception("Invoice Telegram extra: chat lookup failed")
+        return
+    if not chats and INVOICE_TELEGRAM_EXTRA:
+        log.warning("Invoice Telegram extra: %s has not pressed Start on the alert bot yet - not sent",
+                    ", ".join("@" + u for u in INVOICE_TELEGRAM_EXTRA))
+    for cid in chats:
+        try:
+            tg_api("sendMessage", chat_id=cid, text=(text or "")[:4000], disable_web_page_preview=True)
+        except Exception:
+            log.exception("Invoice Telegram extra to %s failed", cid)
+
 
 def process_cancel(answer: str):
     """Pull the hidden cancellation marker out of the reply."""
