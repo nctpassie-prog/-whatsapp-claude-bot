@@ -63,3 +63,5 @@
 0868989559  # owner, 21 Oct 2026: "IGNORE"
 353852009922  # Diesel Injector Repair - supplier, quotes pumps/injectors (week check 19 Nov 2026)
 353879474819  # injector supplier, talks to the team in Russian (week check 19 Nov 2026)
+353852319873  # staff - owner, 19 Nov 2026: "ignore both numbers this is staff"
+353851290438  # staff - owner, 19 Nov 2026: "ignore both numbers this is staff"
