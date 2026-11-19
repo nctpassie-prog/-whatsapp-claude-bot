@@ -5965,6 +5965,12 @@ def get_history(user: str) -> list[dict]:
             for r, c in reversed(rows)]
 
 def is_paused(user: str) -> bool:
+    # Owner 19 Nov 2026: the bot is quiet with Dasa (staff, company paperwork) for good - a paused chat
+    try:
+        if INVOICE_WHATSAPP_EXTRA and normalize_phone(user) == normalize_phone(INVOICE_WHATSAPP_EXTRA):
+            return True
+    except Exception:
+        pass
     with closing(db()) as conn:
         return conn.execute("SELECT 1 FROM paused WHERE wa_user = ?", (user,)).fetchone() is not None
 
