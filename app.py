@@ -12929,6 +12929,54 @@ def _car_maybe_with_us(user: str) -> bool:
         return True
 
 
+# Owner 19 Nov 2026: "I think I will have to see can I find someone else" (g …924) left row 753 in the diary.
+# Nothing is deleted by itself - the team gets a Done alert naming the row, once per booking.
+_BACKOUT_RE = re.compile(
+    r"\b(?:find|get|try|found|use|go\s+(?:to|with)|take\s+it\s+to)\s+(?:someone|somebody|somewhere|another\s+(?:garage|mechanic|place))(?:\s+else)?\b"
+    r"|\b(?:going|gone|go|taking\s+it|take\s+it)\s+elsewhere\b"
+    r"|\bno\s+longer\s+(?:need|needed|interested|required)\b|\bnot\s+(?:going\s+ahead|interested\s+any\s*more)\b"
+    r"|\bforget\s+(?:it|about\s+(?:it|the\s+booking))\b"
+    r"|в\s+друг(?:ой|ом|ую)\s+(?:сервис|месте|гараж)|\bîn\s+alt[aă]\s+parte\b|\balt\s+service\b",
+    re.IGNORECASE)
+# ...but a move is not a back-out: "someone else will drop it in tomorrow", "go elsewhere until Friday"
+_BACKOUT_NOT_RE = re.compile(r"\binstead\b|\btomorrow\b|\buntil\b|\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*day\b"
+                             r"|\b(?:mon|tues?|wed|thurs?|fri|sat|sun)\b", re.IGNORECASE)
+
+
+def backout_check(user: str) -> None:
+    try:
+        msgs = _recent_customer_messages(user, limit=1, hours=1)
+        if not msgs or not _BACKOUT_RE.search(msgs[0] or "") or _BACKOUT_NOT_RE.search(msgs[0] or ""):
+            return
+        digits = "".join(c for c in str(user or "") if c.isdigit())
+        if len(digits) < 9:
+            return
+        with closing(db()) as conn:
+            rows = conn.execute(
+                "SELECT id, date, COALESCE(car,''), COALESCE(reg,''), COALESCE(need,'') FROM bookings WHERE date >= ?"
+                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? ORDER BY date",
+                (now_local().date().isoformat(), "%" + digits[-9:])).fetchall()
+        rows = [r for r in rows if get_setting(f"backout_{r[0]}") != "1"]
+        if not rows:
+            return
+        listed = "; ".join(f"{d} {(clean_car(c) or '').strip()} {clean_reg(g) or ''} - {n[:40]} (id {i})"
+                           for i, d, c, g, n in rows)
+        # an alert of theirs still open (a complaint, a price question) is not replaced - the team is on the chat
+        with closing(db()) as conn:
+            a = conn.execute("SELECT ts FROM alerts WHERE wa_user = ?", (user,)).fetchone()
+            open_alert = bool(a) and not alert_resolved(conn, user, a[0])
+        if open_alert:
+            log.warning("Back-out for %s (%s) - an alert is already open, not raised again", user, listed)
+            return
+        alert_owner(user, "🗑 Said they'll go elsewhere - booking still in the diary",
+                    f"Their words: \"{(msgs[0] or '')[:120]}\". Still booked: {listed}. "
+                    "Check with them, and remove the row if they are not coming.", kind="handover")
+        for r in rows:
+            set_setting(f"backout_{r[0]}", "1")
+    except Exception:
+        log.exception("backout_check failed for %s", user)
+
+
 def no_invented_ready(user: str, answer: str) -> str:
     """Item 6: a "your car is ready" no colleague gave becomes the honest hold line, and a
     person is asked (the customer may be on the way to collect)."""
@@ -13305,6 +13353,16 @@ def _finish_reply(user: str, answer: str) -> str:
             send_recovery_request(user, recovery)
         except Exception:
             log.exception("Failed to process recovery request for %s", user)
+        if not is_owner:
+            # [owner 19 Nov 2026] a tow nobody followed up (g …995 waited 2.5 days): a needs-a-person alert with the
+            # Done button - repost after 30 min, the owner after 2 h - until someone confirms the pickup time.
+            try:
+                alert_owner(user, "🚚 Tow requested - ring them and Dublin Brothers to confirm the pickup time",
+                            f"Car: {recovery.get('car', '?')} {recovery.get('reg', '')}. "
+                            f"Pickup: {recovery.get('address', '(not given)')}. When: {recovery.get('when', '?')}. "
+                            "Press Done once the pickup time is agreed with the customer.", kind="handover")
+            except Exception:
+                log.exception("Tow alert failed for %s", user)
     # Set here, not inside the branch below: it is read unconditionally further
     # down, and most replies carry no cancellation at all.
     which_car = ""
@@ -13312,6 +13370,8 @@ def _finish_reply(user: str, answer: str) -> str:
     answer, cancel = process_cancel(answer)
     if not cancel:
         answer = no_false_cancel(user, answer)   # [thu29 item 7]
+        if not is_owner:
+            backout_check(user)                  # [owner 19 Nov 2026] "I'll find someone else" with a row still in
     if cancel and not is_owner:
         # Explicit flag, set only on a real cancellation: the call sits in a bare
         # try/except that just logs, so an exception used to leave the model's
@@ -15217,6 +15277,42 @@ def already_confirmed_since(phone: str, since_ts: float) -> bool:
         log.exception("Could not check whether %s was already told", digits[-9:])
         return False
 
+_STAFF_SENT_FILE_RE = re.compile(r"^\[colleague sent (?:a photo|a document|something \(unsupported\))", re.IGNORECASE)
+# Review 19 Nov: a part or quote photo between booking and visit is normal - only a file or a "ready" sent on a day
+# this customer's car was booked in (a visit) says the job is done.
+
+
+def job_done_since(phone: str, made_ts: float) -> str:
+    """'Mon 16 Nov' when, after the booking was made (and not the same day), a colleague sent this customer a
+    photo/document or a ready message - else ''. Same-day files are the booking chat itself (quotes, part photos)."""
+    try:
+        digits = "".join(c for c in str(phone or "") if c.isdigit())
+        if len(digits) < 9 or not made_ts:
+            return ""
+        start = datetime.fromtimestamp(made_ts, ZoneInfo("Europe/Dublin")).replace(
+            hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        today = now_local().date().isoformat()
+        with closing(db()) as conn:
+            visits = {r[0] for r in conn.execute(
+                "SELECT date FROM bookings WHERE date >= ? AND date <= ?"
+                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?",
+                (start.date().isoformat(), today, "%" + digits[-9:])).fetchall()}
+            if not visits:
+                return ""
+            rows = conn.execute(
+                "SELECT content, ts FROM messages WHERE role = 'staff' AND ts >= ? AND wa_user LIKE ? ORDER BY ts",
+                (start.timestamp(), "%" + digits[-9:])).fetchall()
+        for content, ts in rows:
+            c = content or ""
+            day = datetime.fromtimestamp(ts, ZoneInfo("Europe/Dublin"))
+            if day.date().isoformat() in visits and (_STAFF_SENT_FILE_RE.search(c) or _is_staff_ready(c)):
+                return day.strftime("%a %d %b")
+        return ""
+    except Exception:
+        log.exception("job_done_since failed for %s", phone)
+        return ""
+
+
 def send_due_reminders() -> None:
     """Send reminders for appointments happening tomorrow (once each, during daytime)."""
     if not REMINDER_ENABLED:
@@ -15259,6 +15355,23 @@ def send_due_reminders() -> None:
             log.info("Reminder for booking %s skipped - number is on the blocklist", bid)
             with closing(db()) as conn, conn:
                 conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            continue
+        # [owner 19 Nov 2026] the job looks done already: after this booking was made a colleague sent the customer
+        # a photo/document (the invoice) or a "ready" message (g …856 JJ: fixed on the 16th, reminded on the 19th
+        # for the 20th). No reminder - the team is told, in case the day really is still on.
+        done_on = job_done_since(phone, made_ts)
+        if done_on:
+            log.info("Reminder for booking %s held - staff sent ready/invoice on %s", bid, done_on)
+            with closing(db()) as conn, conn:
+                conn.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (bid,))
+            try:
+                send_telegram(
+                    "📅 Reminder NOT sent - looks done already\n"
+                    f"{name or 'no name'} {clean_car(car) or ''} ({clean_reg(reg) or 'no reg'}) +{phone} is booked "
+                    f"tomorrow ({tomorrow}), but on {done_on} a colleague sent them a photo/document or a 'ready' "
+                    "message. If tomorrow is still on, tell them yourself; if not, remove the booking.")
+            except Exception:
+                log.exception("Could not report the held reminder")
             continue
         # Somebody who was TOLD the date in chat minutes ago does not need a paid
         # template repeating it back (garage booking 438: reminder 31 minutes
@@ -21985,6 +22098,51 @@ def send_unresolved_digest() -> None:
 WAITING_DAYS = int(os.environ.get("WAITING_DAYS", "7"))
 
 
+# Owner 19 Nov 2026: the waiting list again at 14:00 for the team (the 8:00 briefing has the morning one), Mon-Sat;
+# anyone waiting two days or more also goes to the owner's private chat. "" turns it off.
+TEAM_WAITING_HOURS = [int(h) for h in os.environ.get("TEAM_WAITING_HOURS", "14").split(",") if h.strip().isdigit()]
+
+
+def send_team_waiting_list() -> None:
+    now = now_local()
+    if not TEAM_WAITING_HOURS or now.weekday() == 6 or now.hour >= 20:
+        return
+    due = [h for h in TEAM_WAITING_HOURS if now.hour >= h]   # the loop sleeps an hour and drifts: never miss one
+    if not due:
+        return
+    key = f"{now.date().isoformat()}-{max(due)}"
+    if get_setting("team_waiting_sent") == key:
+        return
+    set_setting("team_waiting_sent", key)
+    try:
+        if bank_holiday_name(now.date().isoformat()):
+            return
+    except Exception:
+        pass
+    nowts = time.time()
+    with closing(db()) as conn:
+        waiting, _older = waiting_alerts(conn)
+    if not waiting:
+        return
+    lines = [f"📋 Customers waiting for an answer ({len(waiting)}), longest first:"]
+    long_wait = []
+    for u, ts, label, headline in waiting[:15]:
+        hrs = (nowts - (ts or nowts)) / 3600
+        when = f"{int(hrs)}h" if hrs < 48 else f"{int(hrs // 24)} days"
+        what = f" — {headline[:60]}" if headline else ""
+        line = f"• {_alert_label(u, label)} — waiting {when}{what} — wa.me/{u}"
+        lines.append(line)
+        if hrs >= 48:
+            long_wait.append(line)
+    if len(waiting) > 15:
+        lines.append(more_waiting_line(waiting[15:]))
+    lines.append("Reply to them in WhatsApp - each one drops off this list when you do.")
+    send_telegram("\n".join(lines))
+    if long_wait:
+        send_telegram_private("⏰ Waiting 2 days or more for a person:\n" + "\n".join(long_wait))
+    log.info("Team waiting list sent: %d waiting, %d for 2+ days", len(waiting), len(long_wait))
+
+
 def waiting_alerts(conn, days: int = WAITING_DAYS) -> tuple:
     """Customers still waiting on a person, as two lists of (user, ts, label,
     headline): those from the last `days` days, OLDEST first, and the older ones
@@ -22461,6 +22619,10 @@ def reminder_loop() -> None:
             sweep_stalled_staff_chats()
         except Exception:
             log.exception("Stalled staff chat sweep error")
+        try:
+            send_team_waiting_list()      # [owner 19 Nov 2026] 14:00 team list
+        except Exception:
+            log.exception("Team waiting list error")
         try:
             chase_unresolved_alerts()
         except Exception:
