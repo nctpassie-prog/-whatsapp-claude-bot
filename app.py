@@ -1237,6 +1237,42 @@ def _same_job(old_need: str, new_need: str) -> bool:
     return not (a and b) or bool(a & b)
 
 
+# [19 Nov 2026] the bot's own question "you'd prefer Thursday 19 November instead of Wednesday?" answered yes is a
+# move too (h …794: "I asked for Thursday" / "Yes" - neither has a move word; Wednesday's row stayed)
+_BOT_MOVE_OFFER_RE = re.compile(r"\binstead\s+of\s+(?:your\s+|the\s+)?(?:booking\s+(?:on|for)\s+)?(?:" + _DAY_WORDS + r")\b",
+                                re.IGNORECASE)
+
+
+def _bot_offered_move(user: str, old_date: str = "", new_date: str = "") -> bool:
+    """The bot's own recent message offered the NEW day "instead of" the OLD one. With the dates given (review
+    19 Nov), the part after "instead of" must name the old day and the message must name the new day - so "Thursday
+    instead of Wednesday?" answered "no, Friday" never takes Wednesday's row."""
+    def names(iso):
+        try:
+            d = date.fromisoformat(iso)
+        except Exception:
+            return None
+        return re.compile(r"\b(?:" + d.strftime("%A")[:3] + r"[a-z]*|" + str(d.day) + r"(?:st|nd|rd|th)?)\b",
+                          re.IGNORECASE)
+    try:
+        with closing(db()) as conn:
+            rows = conn.execute("SELECT content FROM messages WHERE wa_user = ? AND role = 'assistant'"
+                                " AND COALESCE(ts, 0) >= ? ORDER BY id DESC LIMIT 3",
+                                (user, time.time() - 6 * 3600)).fetchall()
+        old_rx, new_rx = names(old_date), names(new_date)
+        for (txt,) in rows:
+            m = _BOT_MOVE_OFFER_RE.search(txt or "")
+            if not m:
+                continue
+            if not (old_date or new_date):
+                return True
+            if old_rx and new_rx and old_rx.search(txt[m.start():m.end() + 40]) and new_rx.search(txt[:m.start()]):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def auto_cancel_moved_booking(user: str, booking: dict, freed: list = None) -> str:
     """The old day of a chat MOVE, cancelled - or '' (nothing done, the two-bookings check then runs as before).
     `freed`: days this reply's own CANCEL already deleted - then the move is done and nothing more goes."""
@@ -1248,7 +1284,8 @@ def auto_cancel_moved_booking(user: str, booking: dict, freed: list = None) -> s
         digits = "".join(c for c in str(user or "") if c.isdigit())
         if not reg or not new_date or len(digits) < 9:
             return ""
-        if not any(_MOVE_INTENT_RE.search(m or "") for m in _recent_customer_messages(user, limit=6, hours=6)):
+        said_move = any(_MOVE_INTENT_RE.search(m or "") for m in _recent_customer_messages(user, limit=6, hours=6))
+        if not (said_move or _bot_offered_move(user)):
             return ""
         today = now_local().date().isoformat()
         with closing(db()) as conn:
@@ -1259,6 +1296,8 @@ def auto_cancel_moved_booking(user: str, booking: dict, freed: list = None) -> s
         if len(rows) != 1 or not _same_job(rows[0][2], (booking or {}).get("need", "")):
             return ""
         old_id, old_date = rows[0][0], rows[0][1]
+        if not said_move and not _bot_offered_move(user, old_date, new_date):
+            return ""      # [19 Nov review] the bot's offer was not this old day -> this new day
         res = cancel_booking(user, {"reg": reg, "date": old_date}, date_strict=True)
         if (res or {}).get("cancelled") != 1:
             return ""
@@ -3550,15 +3589,22 @@ def open_alert_for_ack(user: str) -> bool:
 # lone "-->", "<3" and an e-mail in brackets stay.
 _MARKUP_TAGS = (r"(?:thought|thinking|reasoning|response|answer|reply|output|assistant|user|system|message|final"
                 r"|text|p|br|hr|b|i|u|em|strong|div|span|html|body|ul|ol|li)")
-_MARKUP_DEBRIS_RE = re.compile(r"<?/?!?\[CDATA\[?|\]\]>|<!--[\s\S]{0,400}?-->|</?" + _MARKUP_TAGS + r"\b[^<>\n]{0,40}?/?>",
+_MARKUP_DEBRIS_RE = re.compile(r"<?/?!?\[CDATA\[?|\]\]>|<!--[\s\S]{0,400}?-->|</?" + _MARKUP_TAGS + r"\b[^<>\n]{0,40}?/?>"
+                               # [19 Nov 2026] a closing tag with no ">" ("</thought" alone went to g …284)
+                               r"|</" + _MARKUP_TAGS + r"\b(?=[\s.,!?]|$)",
                                re.IGNORECASE)
 _PICTOGRAPH_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
+
+
+# [19 Nov 2026] the team's COMEBACK label is for the diary, never for the customer ("Just to confirm: your car,
+# COMEBACK — suspension bushings check" went to g …330); capitals only, as the prompt writes it
+_INTERNAL_LABEL_RE = re.compile(r"\bCOMEBACK\s*[\u2014\u2013:-]+\s*")
 
 
 def strip_markup_debris(text: str) -> str:
     """The text without markup debris ('</![CDATA[', ']]>', '</thought>', '<br/>'); as it was if it has none."""
     t = text or ""
-    out = _MARKUP_DEBRIS_RE.sub("", t)
+    out = _INTERNAL_LABEL_RE.sub("", _MARKUP_DEBRIS_RE.sub("", t))
     if out == t:
         return t
     out = re.sub(r"(?<=\S)[ \t]{2,}", " ", out)
@@ -12843,6 +12889,40 @@ def staff_said_ready(user: str, days: int = 3) -> bool:
         return True     # cannot tell: leave the reply as the model wrote it
 
 
+_ASKS_READY_RE = re.compile(
+    r"\b(?:ready|done|finished|collect\w*|pick\w*\s+(?:it\s+)?up|left|dropped|drop(?:ped)?\s+off|status|update)\b"
+    r"|готов|забрат|оставил|gata|ridica|paruošt|atsiimt", re.IGNORECASE)
+
+
+def _car_maybe_with_us(user: str) -> bool:
+    """[19 Nov 2026] Could this customer have a car in the workshop now - a booking of theirs from the last three
+    weeks up to today, or a colleague writing to them this week? Without either, a "ready" in the reply is not about
+    a car of theirs ("Thanks Mark!" to a reg for a new booking, g …524; "what day suits you" h …770) and the
+    'I can't see the workshop' line must not replace it. Unsure counts as yes (the guard runs, as before)."""
+    try:
+        digits = "".join(c for c in str(user or "") if c.isdigit())
+        if len(digits) < 9:
+            return True
+        # a customer asking whether it is ready / when to collect may have walked in with it (headlights take a
+        # headlight with no appointment): the guard stays on
+        if any(_ASKS_READY_RE.search(m or "") for m in _recent_customer_messages(user, limit=3, hours=24)):
+            return True
+        today = now_local().date()
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM bookings WHERE date >= ? AND date <= ?"
+                " AND REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ? LIMIT 1",
+                ((today - timedelta(days=21)).isoformat(), today.isoformat(), "%" + digits[-9:])).fetchone()
+            if row:
+                return True
+            row = conn.execute("SELECT 1 FROM messages WHERE wa_user = ? AND role = 'staff' AND ts >= ? LIMIT 1",
+                               (user, time.time() - 7 * 86400)).fetchone()
+        return bool(row)
+    except Exception:
+        log.exception("_car_maybe_with_us failed for %s", user)
+        return True
+
+
 def no_invented_ready(user: str, answer: str) -> str:
     """Item 6: a "your car is ready" no colleague gave becomes the honest hold line, and a
     person is asked (the customer may be on the way to collect)."""
@@ -12852,7 +12932,7 @@ def no_invented_ready(user: str, answer: str) -> str:
         parts0 = _CLAIM_SENT_SPLIT_RE.split(answer or "")
         hits = [i for i in _claim_sentences(answer, _READY_CLAIM_RE)
                 if not _READY_NOT_CAR_RE.search(parts0[i])]
-        if not hits or staff_said_ready(user):
+        if not hits or staff_said_ready(user) or not _car_maybe_with_us(user):
             return answer
         parts = _CLAIM_SENT_SPLIT_RE.split(answer)
         lang = _guess_lang_code(answer)
