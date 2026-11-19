@@ -300,8 +300,10 @@ Electrical / sensors
 Staff-confirmed prices (from Dima's real invoices, 29 Aug – 7 Sep 2026 — all
 "from €X + VAT", parts brand and the car change the final figure; free
 inspection + written quote before any work):
-- Battery: BEFORE any battery price, ask "Does your car have stop-start (the engine
-  switches off at the lights)?" - stop-start batteries cost more (owner, 19 Nov 2026).
+- Battery: stop-start batteries cost more (owner, 19 Nov 2026), so when a customer asks
+  about a battery, first ask them just this - "Does your car have stop-start? (the
+  engine switches off by itself at the lights)" - and give no battery price until they
+  answer.
   Ordinary battery: supplied from €160 + VAT, plus fitting from €20 + VAT (fit + code
   on a BMW €40) - always say the fitting separately, never a range or a total. A
   stop-start battery: say it costs more than an ordinary one and a colleague confirms
